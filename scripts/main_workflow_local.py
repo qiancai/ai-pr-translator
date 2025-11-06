@@ -3,7 +3,7 @@ Main Entry Point
 Orchestrates the entire auto-sync workflow
 """
 
-SOURCE_PR_URL = "https://github.com/pingcap/docs/pull/21815"
+SOURCE_PR_URL = "https://github.com/pingcap/docs-cn/pull/20703"
 AI_PROVIDER = "gemini"  # Options: "deepseek", "gemini"
 
 import sys
@@ -28,6 +28,7 @@ from file_deleter import process_deleted_files
 from file_updater import process_files_in_batches, process_added_sections, process_modified_sections, process_deleted_sections
 from toc_processor import process_toc_files
 from section_matcher import match_source_diff_to_target
+from image_processor import process_all_images
 
 # extract the repo owner from the SOURCE_PR_URL
 REPO_OWNER = SOURCE_PR_URL.split("/")[3]
@@ -56,7 +57,7 @@ AI_MAX_TOKENS = PROVIDER_MAX_TOKENS.get(AI_PROVIDER, DEFAULT_MAX_TOKENS)  # Set 
 
 # Special file configuration
 SPECIAL_FILES = ["TOC.md"]
-IGNORE_FILES = ["faq/ddl-faq.md","command-line-flags-for-tidb-configuration.md","pd-configuration-file.md"]
+IGNORE_FILES = ["follower-read.md", "TOC-tidb-cloud.md"]
 
 # Repository configuration
 REPO_CONFIGS = {
@@ -574,7 +575,7 @@ def main():
     
     # Step 2: Analyze source changes with operation categorization
     print(f"\n📊 Step 2: Analyzing source changes...")
-    added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files = analyze_source_changes(
+    added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, added_images, modified_images, deleted_images = analyze_source_changes(
         pr_url, github_client, 
         special_files=SPECIAL_FILES, 
         ignore_files=IGNORE_FILES, 
@@ -658,12 +659,24 @@ def main():
             else:
                 print(f"   ⚠️  Unknown file processing type: {file_type} for {source_file_path}, skipping...")
     
+    # Step 3.5: Process images (added, modified, deleted)
+    if added_images or modified_images or deleted_images:
+        print(f"\n🖼️  Step 3.5: Processing images...")
+        process_all_images(added_images, modified_images, deleted_images, pr_url, github_client, repo_config)
+        print(f"   ✅ Images processed")
+    
     # Final summary
-    print(f"📊 Summary:")
+    print(f"\n" + "="*80)
+    print(f"📊 Final Summary:")
+    print(f"="*80)
     print(f"   📄 Added files: {len(added_files)} processed")
     print(f"   🗑️  Deleted files: {len(deleted_files)} processed")
     print(f"   📋 TOC files: {len(toc_files)} processed")
     print(f"   📝 Modified files: {len(modified_sections)} processed")
+    print(f"   🖼️  Added images: {len(added_images)} processed")
+    print(f"   🖼️  Modified images: {len(modified_images)} processed")
+    print(f"   🖼️  Deleted images: {len(deleted_images)} processed")
+    print(f"="*80)
 
 if __name__ == "__main__":
     main()

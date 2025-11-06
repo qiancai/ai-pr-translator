@@ -982,6 +982,7 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
     import os
     import json
     from toc_processor import process_toc_operations
+    from image_processor import is_image_file
     
     owner, repo, pr_number = parse_pr_url(pr_url)
     repository = github_client.get_repo(f"{owner}/{repo}")
@@ -992,11 +993,15 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
     
     print(f"📋 Processing PR #{pr_number}: {pr.title}")
     
-    # Get markdown files
+    # Get all files
     files = pr.get_files()
+    
+    # Separate markdown files and image files
     markdown_files = [f for f in files if f.filename.endswith('.md')]
+    image_files = [f for f in files if is_image_file(f.filename)]
     
     print(f"📄 Found {len(markdown_files)} markdown files")
+    print(f"🖼️  Found {len(image_files)} image files")
     
     # Return dictionaries for different operation types
     added_sections = {}      # New sections that were added
@@ -1006,6 +1011,11 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
     deleted_files = []       # Completely deleted files
     ignored_files = []       # Files that were ignored
     toc_files = {}           # Special TOC files requiring special processing
+    
+    # Image-related returns
+    added_images = []        # New image files that were added
+    modified_images = []     # Image files that were modified
+    deleted_images = []      # Image files that were deleted
     
     for file in markdown_files:
         print(f"\n🔍 Analyzing {file.filename}")
@@ -1434,14 +1444,45 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
                     'current_hierarchy': all_hierarchy_dict
                 }
     
+    # Process image files
+    print(f"\n🖼️  Analyzing image files...")
+    for file in image_files:
+        print(f"\n🔍 Analyzing image: {file.filename}")
+        
+        # Check if this file should be ignored
+        if file.filename in ignore_files:
+            print(f"   ⏭️  Skipping ignored image: {file.filename}")
+            ignored_files.append(file.filename)
+            continue
+        
+        # Categorize image operations based on file status
+        if file.status == 'added':
+            print(f"   ➕ Detected new image: {file.filename}")
+            added_images.append(file.filename)
+        elif file.status == 'removed':
+            print(f"   🗑️  Detected deleted image: {file.filename}")
+            deleted_images.append(file.filename)
+        elif file.status == 'modified':
+            print(f"   🔄 Detected modified image: {file.filename}")
+            modified_images.append(file.filename)
+        elif file.status == 'renamed':
+            # Renamed images are treated as delete old + add new
+            print(f"   🔄 Detected renamed image: {file.previous_filename} -> {file.filename}")
+            if hasattr(file, 'previous_filename') and file.previous_filename:
+                deleted_images.append(file.previous_filename)
+            added_images.append(file.filename)
+    
     print(f"\n📊 Summary:")
     #print(f"   ✏️  Modified files: {} files") 
     print(f"   📄 Added files: {len(added_files)} files")
     print(f"   🗑️  Deleted files: {len(deleted_files)} files")
     print(f"   📋 TOC files: {len(toc_files)} files")
+    print(f"   🖼️  Added images: {len(added_images)} images")
+    print(f"   🖼️  Modified images: {len(modified_images)} images")
+    print(f"   🖼️  Deleted images: {len(deleted_images)} images")
     if ignored_files:
         print(f"   ⏭️  Ignored files: {len(ignored_files)} files")
         for ignored_file in ignored_files:
             print(f"      - {ignored_file}")
     
-    return added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files
+    return added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, added_images, modified_images, deleted_images

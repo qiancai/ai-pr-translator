@@ -19,6 +19,7 @@ except ImportError:
 
 # Import all modules
 from pr_analyzer import analyze_source_changes, get_repo_config, get_target_hierarchy_and_content, parse_pr_url
+from image_processor import process_all_images
 from file_adder import process_added_files
 from file_deleter import process_deleted_files
 from file_updater import process_files_in_batches, process_added_sections, process_modified_sections, process_deleted_sections
@@ -595,7 +596,7 @@ def main():
     
     # Step 2: Analyze source changes with operation categorization
     print(f"\n📊 Step 2: Analyzing source changes...")
-    added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files = analyze_source_changes(
+    added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, added_images, modified_images, deleted_images = analyze_source_changes(
         SOURCE_PR_URL, github_client, 
         special_files=SPECIAL_FILES, 
         ignore_files=IGNORE_FILES, 
@@ -677,12 +678,24 @@ def main():
             else:
                 print(f"   ⚠️  Unknown file processing type: {file_type} for {source_file_path}, skipping...")
     
+    # Step 3.5: Process images (added, modified, deleted)
+    if added_images or modified_images or deleted_images:
+        print(f"\n🖼️  Step 3.5: Processing images...")
+        process_all_images(added_images, modified_images, deleted_images, SOURCE_PR_URL, github_client, repo_config)
+        print(f"   ✅ Images processed")
+    
     # Final summary
-    print(f"📊 Summary:")
+    print(f"\n" + "="*80)
+    print(f"📊 Final Summary:")
+    print(f"="*80)
     print(f"   📄 Added files: {len(added_files)} processed")
     print(f"   🗑️  Deleted files: {len(deleted_files)} processed")
     print(f"   📋 TOC files: {len(toc_files)} processed")
     print(f"   📝 Modified files: {len(modified_sections)} processed")
+    print(f"   🖼️  Added images: {len(added_images)} processed")
+    print(f"   🖼️  Modified images: {len(modified_images)} processed")
+    print(f"   🖼️  Deleted images: {len(deleted_images)} processed")
+    print(f"="*80)
     print(f"🎉 Workflow completed successfully!")
 
 if __name__ == "__main__":
