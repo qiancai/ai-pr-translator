@@ -323,11 +323,11 @@ def get_corresponding_sections(source_sections, target_sections, ai_client, sour
     target_text = "\n".join(target_sections)
     number_of_sections = len(source_sections)
     
-    prompt = f"""I am aligning the {source_language} and {target_language} documentation for TiDB. I have modified the following {number_of_sections} sections in the {source_language} file:
+    prompt = f"""I am aligning the {source_language} and {target_language} documentation for TiDB. I have modified the following {number_of_sections} section(s) in the {source_language} file:
 
 {source_text}
 
-Here is the section structure of the corresponding {target_language} file. Please select the corresponding {number_of_sections} sections in {target_language} from the following list that I should modify. Do not output any other text, return the Markdown code block enclosed in three backticks.
+Here is the section structure of the corresponding {target_language} file. Please select the corresponding {number_of_sections} section(s) in {target_language} from the following list that I should modify. Do not output any other text, ensure the number of sections you return is exactly the same as the number of sections I provided, and return the result in a Markdown code block enclosed in three backticks.
 
 {target_text}"""
 
