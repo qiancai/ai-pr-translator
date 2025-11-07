@@ -48,7 +48,7 @@ AI_MAX_TOKENS = 20000  # Maximum tokens for AI translation requests
 
 # Special file configuration
 SPECIAL_FILES = ["TOC.md"]
-IGNORE_FILES = ["faq/ddl-faq.md","command-line-flags-for-tidb-configuration.md","pd-configuration-file.md"]
+IGNORE_FILES = ["TOC-tidb-cloud.md","TOC-tidb-cloud-starter.md","TOC-tidb-cloud-essential.md","TOC-tidb-cloud-premium.md"]
 
 # Repository configuration for workflow
 def get_workflow_repo_configs():

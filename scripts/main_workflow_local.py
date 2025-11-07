@@ -3,8 +3,10 @@ Main Entry Point
 Orchestrates the entire auto-sync workflow
 """
 
-SOURCE_PR_URL = "https://github.com/pingcap/docs-cn/pull/20703"
+SOURCE_PR_URL = "https://github.com/pingcap/docs-cn/pull/21036"
 AI_PROVIDER = "gemini"  # Options: "deepseek", "gemini"
+zh_doc_local_path = "/Users/grcai/Documents/GitHub/docs-cn"
+en_doc_local_path = "/Users/grcai/Documents/GitHub/docs"
 
 import sys
 import os
@@ -57,19 +59,19 @@ AI_MAX_TOKENS = PROVIDER_MAX_TOKENS.get(AI_PROVIDER, DEFAULT_MAX_TOKENS)  # Set 
 
 # Special file configuration
 SPECIAL_FILES = ["TOC.md"]
-IGNORE_FILES = ["follower-read.md", "TOC-tidb-cloud.md"]
+IGNORE_FILES = ["TOC-tidb-cloud.md","TOC-tidb-cloud-starter.md","TOC-tidb-cloud-essential.md","TOC-tidb-cloud-premium.md"]
 
 # Repository configuration
 REPO_CONFIGS = {
     f"{REPO_OWNER}/docs": {
         "target_repo": f"{REPO_OWNER}/docs-cn",
-        "target_local_path": "/Users/grcai/Documents/GitHub/docs-cn",
+        "target_local_path": zh_doc_local_path,
         "source_language": "English",
         "target_language": "Chinese"
     },
     f"{REPO_OWNER}/docs-cn": {
         "target_repo": f"{REPO_OWNER}/docs",
-        "target_local_path": "/Users/grcai/Documents/GitHub/docs",
+        "target_local_path": en_doc_local_path,
         "source_language": "Chinese",
         "target_language": "English"
     }
