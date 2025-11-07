@@ -1517,6 +1517,43 @@ def update_target_document_sections(all_sections, target_file_path):
                     
                     thread_safe_print(f"   ✅ Appended {len(new_lines)} lines to end of document")
                 
+            elif target_hierarchy == "intro_section":
+                # Intro section special handling: replace from start to first ##
+                thread_safe_print(f"   📄 Intro section mode: replacing from start to first level-2 header")
+                
+                # Find the first level-2 heading position (##)
+                first_level2_line = section_data.get('intro_section_end_line')
+                
+                if first_level2_line is None:
+                    # Fallback: manually find first ## if not provided
+                    first_level2_line = 0
+                    for i, line in enumerate(target_lines):
+                        if line.strip().startswith('## '):
+                            first_level2_line = i
+                            break
+                    if first_level2_line == 0:
+                        first_level2_line = len(target_lines)
+                else:
+                    # Convert from 1-based to 0-based index
+                    first_level2_line = first_level2_line - 1 if first_level2_line > 0 else len(target_lines)
+                
+                thread_safe_print(f"   📍 Intro section range: line 1 to {first_level2_line}")
+                
+                # Split new content by lines, preserving original structure
+                new_lines = target_new_content.splitlines(keepends=True)
+                
+                # Ensure content ends with proper newline
+                if target_new_content.endswith('\n') and not new_lines[-1].endswith('\n\n'):
+                    new_lines.append('\n')
+                elif target_new_content and not target_new_content.endswith('\n'):
+                    if new_lines and not new_lines[-1].endswith('\n'):
+                        new_lines[-1] += '\n'
+                
+                # Replace intro section
+                target_lines[0:first_level2_line] = new_lines
+                
+                thread_safe_print(f"   ✅ Replaced {first_level2_line} lines of intro section with {len(new_lines)} lines")
+                
             elif target_hierarchy == "frontmatter":
                 # Frontmatter special handling: directly replace front lines
                 thread_safe_print(f"   📄 Frontmatter mode: directly replacing document beginning")

@@ -599,14 +599,18 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
     all_matched_sections = OrderedDict()
     
     # Categorize sections for processing strategy but maintain order
+    intro_section_sections = OrderedDict()  # New category for intro sections
     direct_match_sections = OrderedDict()
     ai_match_sections = OrderedDict()
     added_sections = OrderedDict()
     bottom_sections = OrderedDict()  # New category for bottom sections
     
     for key, hierarchy in source_hierarchies.items():
+        # Check if this is an intro section (highest priority)
+        if hierarchy == "intro_section" or key == "intro_section":
+            intro_section_sections[key] = hierarchy
         # Check if this is a bottom section (no matching needed)
-        if hierarchy.startswith('bottom-'):
+        elif hierarchy.startswith('bottom-'):
             bottom_sections[key] = hierarchy
         # Check if this is an added section
         elif key.startswith('added_'):
@@ -624,6 +628,7 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
                 ai_match_sections[key] = hierarchy
     
     thread_safe_print(f"📊 Section categorization:")
+    thread_safe_print(f"   📄 Intro section: {len(intro_section_sections)} section(s)")
     thread_safe_print(f"   🎯 Direct matching: {len(direct_match_sections)} sections")
     thread_safe_print(f"   🤖 AI matching: {len(ai_match_sections)} sections")
     thread_safe_print(f"   ➕ Added sections: {len(added_sections)} sections")
@@ -636,7 +641,24 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
         thread_safe_print(f"   🔍 Processing {key}: {hierarchy}")
         
         # Determine processing strategy based on section type and content
-        if hierarchy.startswith('bottom-'):
+        if hierarchy == "intro_section" or key == "intro_section":
+            # Intro section - match to target's intro section (from start to first ##)
+            thread_safe_print(f"      📄 Intro section - matching to target intro section")
+            # Find the first level-2 header in target
+            first_level2_line = 0
+            for i, line in enumerate(target_lines, 1):
+                if line.strip().startswith('## '):
+                    first_level2_line = i
+                    break
+            if first_level2_line == 0:
+                first_level2_line = len(target_lines) + 1
+            
+            result = {
+                "target_line": "1",  # Intro section starts at line 1
+                "target_hierarchy": "intro_section",
+                "intro_section_end_line": first_level2_line  # Store where intro section ends
+            }
+        elif hierarchy.startswith('bottom-'):
             # Bottom section - no matching needed, append to end
             thread_safe_print(f"      🔚 Bottom section - append to end of document")
             result = {
@@ -660,7 +682,12 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
             # Extract target content from target_lines
             target_line = result.get('target_line', 'unknown')
             target_content = ""
-            if target_line != 'unknown' and target_line != '0':
+            
+            # Special handling for intro section
+            if hierarchy == "intro_section" or key == "intro_section":
+                # Extract intro section content from target
+                target_content, _ = extract_intro_section_content_from_lines(target_lines)
+            elif target_line != 'unknown' and target_line != '0':
                 try:
                     target_line_num = int(target_line)
                     # For ALL operations, only extract direct content (no sub-sections)
@@ -944,6 +971,29 @@ def extract_frontmatter_content(target_lines):
         frontmatter_lines.append(line.rstrip())
     
     return '\n'.join(frontmatter_lines)
+
+
+def extract_intro_section_content_from_lines(target_lines):
+    """
+    Extract intro section content from target lines (from start to first ##).
+    Returns: (intro_content, first_level2_line)
+    """
+    intro_lines = []
+    first_level2_line = 0
+    
+    for i, line in enumerate(target_lines, 1):
+        line_stripped = line.strip()
+        if line_stripped.startswith('## '):
+            first_level2_line = i
+            break
+        intro_lines.append(line.rstrip())
+    
+    if first_level2_line == 0:
+        first_level2_line = len(target_lines) + 1
+    
+    intro_content = '\n'.join(intro_lines)
+    return intro_content, first_level2_line
+
 
 def find_section_end_line(section_start_line, target_hierarchy, target_lines):
     """Find the end line of a section to determine insertion point (from auto-sync-pr-changes.py)"""
