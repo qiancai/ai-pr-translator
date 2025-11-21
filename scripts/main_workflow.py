@@ -41,7 +41,7 @@ GEMINI_MODEL_NAME = "gemini-2.0-flash"
 
 # Processing limit configuration
 MAX_NON_SYSTEM_SECTIONS_FOR_AI = 120
-SOURCE_TOKEN_LIMIT = 5000  # Maximum tokens for source new_content before skipping file processing
+SOURCE_TOKEN_LIMIT = 50000  # Maximum tokens for source new_content before skipping file processing
 
 # AI configuration
 AI_MAX_TOKENS = 20000  # Maximum tokens for AI translation requests
