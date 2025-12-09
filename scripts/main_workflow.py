@@ -43,8 +43,10 @@ GEMINI_MODEL_NAME = "gemini-2.0-flash"
 MAX_NON_SYSTEM_SECTIONS_FOR_AI = 120
 SOURCE_TOKEN_LIMIT = 50000  # Maximum tokens for source new_content before skipping file processing
 
-# AI configuration
-AI_MAX_TOKENS = 20000  # Maximum tokens for AI translation requests
+# AI configuration - Provider-specific limits
+AI_MAX_TOKENS_DEEPSEEK = 8192   # DeepSeek maximum output tokens
+AI_MAX_TOKENS_GEMINI = 8192     # Gemini 2.0 Flash maximum output tokens (can go higher but 8K is safe)
+AI_MAX_TOKENS = 8192            # Default maximum tokens for AI translation requests
 
 # Special file configuration
 SPECIAL_FILES = ["TOC.md"]
@@ -153,6 +155,7 @@ class UnifiedAIClient:
             from openai import OpenAI
             self.client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
             self.model = "deepseek-chat"
+            self.max_tokens = AI_MAX_TOKENS_DEEPSEEK
         elif provider == "gemini":
             if not GEMINI_AVAILABLE:
                 raise ImportError("google-generativeai package not installed. Run: pip install google-generativeai")
@@ -160,11 +163,18 @@ class UnifiedAIClient:
                 raise ValueError("GEMINI_API_TOKEN environment variable must be set")
             genai.configure(api_key=GEMINI_API_KEY)
             self.model = GEMINI_MODEL_NAME
+            self.max_tokens = AI_MAX_TOKENS_GEMINI
         else:
             raise ValueError(f"Unsupported AI provider: {provider}")
     
-    def chat_completion(self, messages, temperature=0.1, max_tokens=20000):
+    def chat_completion(self, messages, temperature=0.1, max_tokens=None):
         """Unified chat completion interface"""
+        # Use provider-specific max_tokens if not explicitly provided
+        if max_tokens is None:
+            max_tokens = self.max_tokens
+        # Ensure max_tokens doesn't exceed provider limit
+        max_tokens = min(max_tokens, self.max_tokens)
+        
         if self.provider == "deepseek":
             response = self.client.chat.completions.create(
                 model=self.model,
