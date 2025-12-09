@@ -334,8 +334,8 @@ Please select the corresponding {number_of_sections} section(s) in {target_langu
 
 ⚠️ Strict rules:
 1. Return **only** the exact same number ({number_of_sections}) of section titles that best match both the given {source_language} sections and structures.
-2. Do **not** output any explanations, comments, summaries, or extra lines.
-3. Return your answer **only** as plain section titles, each on its own line.
+2. Return only the matched section titles in the original format (keeping # prefix in the title), each in its own line.
+3. Do **not** output any explanations, comments, summaries, or extra lines.
 4. Wrap your answer in a Markdown code block enclosed in three backticks.
 
 {target_text}"""
