@@ -37,7 +37,7 @@ TARGET_REPO_PATH = os.getenv("TARGET_REPO_PATH")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_TOKEN")
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 GEMINI_API_KEY = os.getenv("GEMINI_API_TOKEN")
-GEMINI_MODEL_NAME = "gemini-2.0-flash"
+GEMINI_MODEL_NAME = "gemini-2.5-flash"
 
 # Processing limit configuration
 MAX_NON_SYSTEM_SECTIONS_FOR_AI = 120
@@ -45,7 +45,7 @@ SOURCE_TOKEN_LIMIT = 50000  # Maximum tokens for source new_content before skipp
 
 # AI configuration - Provider-specific limits
 AI_MAX_TOKENS_DEEPSEEK = 8192   # DeepSeek maximum output tokens
-AI_MAX_TOKENS_GEMINI = 8192     # Gemini 2.0 Flash maximum output tokens (can go higher but 8K is safe)
+AI_MAX_TOKENS_GEMINI = 8192     # Gemini maximum output tokens (can go higher but 8K is safe)
 AI_MAX_TOKENS = 8192            # Default maximum tokens for AI translation requests
 
 # Special file configuration

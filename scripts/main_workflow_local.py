@@ -3,7 +3,7 @@ Main Entry Point
 Orchestrates the entire auto-sync workflow
 """
 
-SOURCE_PR_URL = "https://github.com/pingcap/docs-cn/pull/21036"
+SOURCE_PR_URL = "https://github.com/pingcap/docs/pull/22126"
 AI_PROVIDER = "gemini"  # Options: "deepseek", "gemini"
 zh_doc_local_path = "/Users/grcai/Documents/GitHub/docs-cn"
 en_doc_local_path = "/Users/grcai/Documents/GitHub/docs"
@@ -43,7 +43,7 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_TOKEN")
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 GEMINI_API_KEY = os.getenv("GEMINI_API_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GEMINI_MODEL_NAME = "gemini-2.0-flash"
+GEMINI_MODEL_NAME = "gemini-2.5-flash"
 
 # Processing limit configuration
 MAX_NON_SYSTEM_SECTIONS_FOR_AI = 120
@@ -51,7 +51,7 @@ SOURCE_TOKEN_LIMIT = 50000  # Maximum tokens for source new_content before skipp
 
 # AI configuration - Provider-specific limits
 AI_MAX_TOKENS_DEEPSEEK = 8192   # DeepSeek maximum output tokens (hard limit)
-AI_MAX_TOKENS_GEMINI = 8192     # Gemini 2.0 Flash maximum output tokens (can go higher but 8K is safe)
+AI_MAX_TOKENS_GEMINI = 8192     # Gemini maximum output tokens (can go higher but 8K is safe)
 PROVIDER_MAX_TOKENS = {
     "deepseek": AI_MAX_TOKENS_DEEPSEEK,
     "gemini": AI_MAX_TOKENS_GEMINI
