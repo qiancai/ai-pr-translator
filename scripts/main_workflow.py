@@ -8,6 +8,7 @@ import os
 import json
 import threading
 import tiktoken
+import time
 from github import Github, Auth
 
 # Conditional import for Gemini
@@ -37,7 +38,7 @@ TARGET_REPO_PATH = os.getenv("TARGET_REPO_PATH")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_TOKEN")
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 GEMINI_API_KEY = os.getenv("GEMINI_API_TOKEN")
-GEMINI_MODEL_NAME = "gemini-2.5-flash"
+GEMINI_MODEL_NAME = "gemini-2.5-flash-lite"
 
 # Processing limit configuration
 MAX_NON_SYSTEM_SECTIONS_FOR_AI = 120
@@ -97,6 +98,11 @@ print_lock = threading.Lock()
 def thread_safe_print(*args, **kwargs):
     with print_lock:
         print(*args, **kwargs)
+
+# Simple rate limiting for Gemini free tier (5 RPM)
+gemini_call_count = 0
+GEMINI_RATE_LIMIT_CALLS = 10  # Number of calls before sleeping
+GEMINI_RATE_LIMIT_SLEEP = 30  # Seconds to sleep after reaching limit
 
 def ensure_temp_output_dir():
     """Ensure the temp_output directory exists"""
@@ -184,10 +190,18 @@ class UnifiedAIClient:
             )
             return response.choices[0].message.content.strip()
         elif self.provider == "gemini":
+            global gemini_call_count
             try:
+                # Simple rate limiting: sleep after every N calls
+                gemini_call_count += 1
+                if gemini_call_count > GEMINI_RATE_LIMIT_CALLS:
+                    thread_safe_print(f"   ⏳ Rate limit: {GEMINI_RATE_LIMIT_CALLS} calls reached, sleeping {GEMINI_RATE_LIMIT_SLEEP}s...")
+                    time.sleep(GEMINI_RATE_LIMIT_SLEEP)
+                    gemini_call_count = 1  # Reset counter
+                
                 # Convert OpenAI-style messages to Gemini format
                 prompt = self._convert_messages_to_prompt(messages)
-                thread_safe_print(f"   🔄 Calling Gemini API...")
+                thread_safe_print(f"   🔄 Calling Gemini API ({gemini_call_count}/{GEMINI_RATE_LIMIT_CALLS})...")
                 
                 # Use the correct Gemini API call format
                 model = genai.GenerativeModel(self.model)
