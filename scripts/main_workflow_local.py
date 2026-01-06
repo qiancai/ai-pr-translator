@@ -13,6 +13,9 @@ import os
 import json
 import threading
 import tiktoken
+import time
+import re
+from collections import deque
 from github import Github
 #from google import genai
 
@@ -43,11 +46,18 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_TOKEN")
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 GEMINI_API_KEY = os.getenv("GEMINI_API_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GEMINI_MODEL_NAME = "gemini-2.5-flash"
+GEMINI_MODEL_NAME = "gemini-3-flash"
 
 # Processing limit configuration
 MAX_NON_SYSTEM_SECTIONS_FOR_AI = 120
 SOURCE_TOKEN_LIMIT = 50000  # Maximum tokens for source new_content before skipping file processing
+
+# Rate limiting configuration for Gemini free tier
+# See: https://ai.google.dev/gemini-api/docs/rate-limits
+GEMINI_FREE_TIER_RPM = 5  # Requests per minute limit
+GEMINI_FREE_TIER_RPD = 20  # Requests per day limit (optional tracking)
+RATE_LIMIT_RETRY_MAX = 5  # Maximum retry attempts for rate limit errors
+RATE_LIMIT_RETRY_BASE_DELAY = 15  # Base delay in seconds for retry
 
 # AI configuration - Provider-specific limits
 AI_MAX_TOKENS_DEEPSEEK = 8192   # DeepSeek maximum output tokens (hard limit)
@@ -84,6 +94,104 @@ print_lock = threading.Lock()
 def thread_safe_print(*args, **kwargs):
     with print_lock:
         print(*args, **kwargs)
+
+
+class RateLimiter:
+    """
+    Rate limiter for API calls with sliding window tracking.
+    Supports proactive waiting and automatic retry with exponential backoff.
+    """
+    
+    def __init__(self, requests_per_minute=5, requests_per_day=None):
+        self.requests_per_minute = requests_per_minute
+        self.requests_per_day = requests_per_day
+        self.request_timestamps = deque()  # Timestamps of recent requests (sliding window)
+        self.daily_request_count = 0
+        self.daily_reset_time = time.time()
+        self.lock = threading.Lock()
+    
+    def _cleanup_old_timestamps(self):
+        """Remove timestamps older than 1 minute"""
+        current_time = time.time()
+        cutoff_time = current_time - 60  # 1 minute window
+        
+        while self.request_timestamps and self.request_timestamps[0] < cutoff_time:
+            self.request_timestamps.popleft()
+    
+    def _reset_daily_if_needed(self):
+        """Reset daily counter if a new day has started"""
+        current_time = time.time()
+        # Reset if more than 24 hours have passed
+        if current_time - self.daily_reset_time >= 86400:  # 24 hours in seconds
+            self.daily_request_count = 0
+            self.daily_reset_time = current_time
+    
+    def wait_if_needed(self):
+        """
+        Check rate limit and wait if necessary before making a request.
+        Returns the wait time in seconds (0 if no wait needed).
+        """
+        with self.lock:
+            self._cleanup_old_timestamps()
+            self._reset_daily_if_needed()
+            
+            current_requests = len(self.request_timestamps)
+            
+            # Check if we're at the limit
+            if current_requests >= self.requests_per_minute:
+                # Calculate how long to wait
+                oldest_request = self.request_timestamps[0]
+                wait_time = 60 - (time.time() - oldest_request) + 1  # +1 second buffer
+                
+                if wait_time > 0:
+                    thread_safe_print(f"   ⏳ Rate limit: {current_requests}/{self.requests_per_minute} RPM reached")
+                    thread_safe_print(f"   ⏳ Waiting {wait_time:.1f} seconds before next request...")
+                    return wait_time
+            
+            # Check daily limit if configured
+            if self.requests_per_day and self.daily_request_count >= self.requests_per_day:
+                thread_safe_print(f"   ❌ Daily rate limit reached: {self.daily_request_count}/{self.requests_per_day} RPD")
+                thread_safe_print(f"   ❌ Please wait until tomorrow or upgrade your API plan")
+                return -1  # Signal that daily limit is reached
+            
+            return 0
+    
+    def record_request(self):
+        """Record a successful request timestamp"""
+        with self.lock:
+            current_time = time.time()
+            self.request_timestamps.append(current_time)
+            self.daily_request_count += 1
+            
+            thread_safe_print(f"   📊 Rate limit status: {len(self.request_timestamps)}/{self.requests_per_minute} RPM, "
+                            f"{self.daily_request_count}/{self.requests_per_day or '∞'} RPD")
+    
+    def get_status(self):
+        """Get current rate limit status"""
+        with self.lock:
+            self._cleanup_old_timestamps()
+            return {
+                'current_rpm': len(self.request_timestamps),
+                'max_rpm': self.requests_per_minute,
+                'current_rpd': self.daily_request_count,
+                'max_rpd': self.requests_per_day
+            }
+
+
+# Global rate limiter instance for Gemini (will be initialized when needed)
+gemini_rate_limiter = None
+
+
+def get_gemini_rate_limiter():
+    """Get or create the global Gemini rate limiter"""
+    global gemini_rate_limiter
+    if gemini_rate_limiter is None:
+        gemini_rate_limiter = RateLimiter(
+            requests_per_minute=GEMINI_FREE_TIER_RPM,
+            requests_per_day=GEMINI_FREE_TIER_RPD
+        )
+    return gemini_rate_limiter
+
 
 def ensure_temp_output_dir():
     """Ensure the temp_output directory exists"""
@@ -155,7 +263,7 @@ class UnifiedAIClient:
             raise ValueError(f"Unsupported AI provider: {provider}")
     
     def chat_completion(self, messages, temperature=0.1, max_tokens=None):
-        """Unified chat completion interface"""
+        """Unified chat completion interface with rate limiting and retry logic"""
         # Use provider-specific max_tokens if not explicitly provided
         if max_tokens is None:
             max_tokens = self.max_tokens
@@ -171,16 +279,37 @@ class UnifiedAIClient:
             )
             return response.choices[0].message.content.strip()
         elif self.provider == "gemini":
+            return self._gemini_chat_with_rate_limit(messages, temperature, max_tokens)
+    
+    def _gemini_chat_with_rate_limit(self, messages, temperature, max_tokens):
+        """Gemini API call with rate limiting and automatic retry"""
+        rate_limiter = get_gemini_rate_limiter()
+        
+        # Retry loop with exponential backoff
+        for attempt in range(RATE_LIMIT_RETRY_MAX):
             try:
+                # Check rate limit and wait if needed (proactive)
+                wait_time = rate_limiter.wait_if_needed()
+                
+                if wait_time == -1:
+                    # Daily limit reached, cannot proceed
+                    raise Exception("Daily rate limit (RPD) exceeded. Please wait until tomorrow or upgrade your plan.")
+                
+                if wait_time > 0:
+                    time.sleep(wait_time)
+                
                 # Convert OpenAI-style messages to Gemini format
                 prompt = self._convert_messages_to_prompt(messages)
-                thread_safe_print(f"   🔄 Calling Gemini API...")
+                thread_safe_print(f"   🔄 Calling Gemini API (attempt {attempt + 1}/{RATE_LIMIT_RETRY_MAX})...")
                 
                 # Use the correct Gemini API call format (based on your reference file)
                 response = self.client.models.generate_content(
                     model=self.model, 
                     contents=prompt
                 )
+                
+                # Record successful request
+                rate_limiter.record_request()
                 
                 if response and response.text:
                     thread_safe_print(f"   ✅ Gemini response received")
@@ -190,10 +319,38 @@ class UnifiedAIClient:
                     return "No response from Gemini"
                     
             except Exception as e:
-                thread_safe_print(f"   ❌ Gemini API error: {str(e)}")
-                # Fallback: suggest switching to DeepSeek
-                thread_safe_print(f"   💡 Consider switching to DeepSeek in main.py: AI_PROVIDER = 'deepseek'")
-                raise e
+                error_str = str(e)
+                
+                # Check if it's a rate limit error (429)
+                if "429" in error_str or "quota" in error_str.lower() or "rate" in error_str.lower():
+                    # Parse retry time from error message if available
+                    retry_delay = RATE_LIMIT_RETRY_BASE_DELAY
+                    
+                    # Try to extract wait time from error message
+                    retry_match = re.search(r'retry in (\d+\.?\d*)', error_str.lower())
+                    if retry_match:
+                        retry_delay = float(retry_match.group(1)) + 1  # Add 1 second buffer
+                    else:
+                        # Exponential backoff: base_delay * 2^attempt
+                        retry_delay = RATE_LIMIT_RETRY_BASE_DELAY * (2 ** attempt)
+                    
+                    thread_safe_print(f"   ⚠️  Rate limit hit (attempt {attempt + 1}/{RATE_LIMIT_RETRY_MAX})")
+                    thread_safe_print(f"   ⏳ Waiting {retry_delay:.1f} seconds before retry...")
+                    
+                    if attempt < RATE_LIMIT_RETRY_MAX - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        thread_safe_print(f"   ❌ Max retries ({RATE_LIMIT_RETRY_MAX}) exceeded for rate limit")
+                        raise e
+                else:
+                    # Non-rate-limit error, don't retry
+                    thread_safe_print(f"   ❌ Gemini API error: {error_str}")
+                    thread_safe_print(f"   💡 Consider switching to DeepSeek: AI_PROVIDER = 'deepseek'")
+                    raise e
+        
+        # Should not reach here, but just in case
+        raise Exception("Gemini API call failed after all retries")
     
     def _convert_messages_to_prompt(self, messages):
         """Convert OpenAI-style messages to a single prompt for Gemini"""
