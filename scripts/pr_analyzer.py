@@ -1361,12 +1361,10 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
                             should_include = False
                             print(f"   ⚠️  Skipping change at line {changed_line} (likely line shift: {distance_to_deletion} lines from deletion, {distance_to_section} from section)")
                             break
-                
-                if should_include and changed_line - containing_section <= 30:
+
+                if should_include: # filtering legitimate changes in large sections or at section ends
                     content_affected_sections.add(containing_section)
-                    print(f"   📝 Content change at line {changed_line} affects section at line {containing_section}")
-                elif should_include:
-                    print(f"   ⚠️  Skipping distant change at line {changed_line} from section {containing_section}")
+                    print(f"   📝 Content change at line {changed_line} affects section at line {containing_section} (distance: {distance_to_section})")
         
         # Add content-modified sections to the modified set, but exclude sections that are already marked as added or deleted
         for line_num in content_affected_sections:
