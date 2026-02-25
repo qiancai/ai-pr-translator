@@ -181,7 +181,7 @@ Task: Update the target sections in {target_language} according to the diff in {
 
 Instructions:
 1. Carefully analyze the PR diff to identify exactly which source lines and words changed.
-2. Apply only the corresponding minimal edits to the target sections. Keep unchanged target lines byte-for-byte identical (same wording, punctuation, spacing, indentation, list markers, and line breaks).
+2. For lines changed in the diff, apply the corresponding minimal edits to the target lines in {target_language} according to the diff. For lines not changed in the diff, keep the corresponding target lines byte-for-byte identical (same wording, punctuation, spacing, indentation, list markers, and line breaks).
 3. Never rewrite style, improve wording, or rephrase unaffected content.
 4. Keep the JSON structure unchanged, only modify section content where required by the diff.
 5. Ensure updated target content is logically consistent with the source diff. If uncertain, prefer leaving a line unchanged rather than rewriting.
