@@ -17,6 +17,14 @@ def thread_safe_print(*args, **kwargs):
     with print_lock:
         print(*args, **kwargs)
 
+def is_markdown_heading(line):
+    """True only for real markdown headings at column 0."""
+    if not line or not isinstance(line, str):
+        return False
+    if line != line.lstrip():
+        return False
+    return re.match(r'^#{1,10}\s+\S', line) is not None
+
 def clean_title_for_matching(title):
     """Clean title for matching by removing markdown formatting and span elements"""
     if not title:
@@ -143,9 +151,9 @@ def find_direct_matches_for_special_files(source_sections, target_hierarchy, tar
     
     # Build target headers with hierarchy paths
     target_headers = {}
-    for line_num, line in enumerate(target_lines, 1):
-        line = line.strip()
-        if line.startswith('#'):
+    for line_num, raw_line in enumerate(target_lines, 1):
+        line = raw_line.strip()
+        if is_markdown_heading(raw_line):
             match = re.match(r'^(#{1,10})\s+(.+)', line)
             if match:
                 level = len(match.group(1))
@@ -906,8 +914,9 @@ def extract_target_section_content(target_line_num, target_lines):
     start_line = target_line_num - 1  # Convert to 0-based index
     
     # Find the end of the section by looking for the next header
-    current_line = target_lines[start_line].strip()
-    if not current_line.startswith('#'):
+    raw_current_line = target_lines[start_line]
+    current_line = raw_current_line.strip()
+    if not is_markdown_heading(raw_current_line):
         return current_line
     
     current_level = len(current_line.split()[0])  # Count # characters
@@ -915,11 +924,22 @@ def extract_target_section_content(target_line_num, target_lines):
     
     # For top-level headers (# level 1), stop at first sublevel (## level 2)
     # For other headers, stop at same or higher level
+    in_code_block = False
+    code_block_delimiter = None
     if current_level == 1:
         # Top-level header: stop at first ## (level 2) or higher
         for i in range(start_line + 1, len(target_lines)):
-            line = target_lines[i].strip()
-            if line.startswith('#'):
+            raw_line = target_lines[i]
+            line = raw_line.strip()
+            if line.startswith('```') or line.startswith('~~~'):
+                if not in_code_block:
+                    in_code_block = True
+                    code_block_delimiter = line[:3]
+                elif line.startswith(code_block_delimiter):
+                    in_code_block = False
+                    code_block_delimiter = None
+                continue
+            if not in_code_block and is_markdown_heading(raw_line):
                 line_level = len(line.split()[0])
                 if line_level >= 2:  # Stop at ## or higher level
                     end_line = i
@@ -927,8 +947,17 @@ def extract_target_section_content(target_line_num, target_lines):
     else:
         # Sub-level header: stop at same or higher level (traditional behavior)
         for i in range(start_line + 1, len(target_lines)):
-            line = target_lines[i].strip()
-            if line.startswith('#'):
+            raw_line = target_lines[i]
+            line = raw_line.strip()
+            if line.startswith('```') or line.startswith('~~~'):
+                if not in_code_block:
+                    in_code_block = True
+                    code_block_delimiter = line[:3]
+                elif line.startswith(code_block_delimiter):
+                    in_code_block = False
+                    code_block_delimiter = None
+                continue
+            if not in_code_block and is_markdown_heading(raw_line):
                 line_level = len(line.split()[0])
                 if line_level <= current_level:
                     end_line = i
@@ -946,8 +975,9 @@ def extract_section_direct_content(target_line_num, target_lines):
     start_line = target_line_num - 1  # Convert to 0-based index
     
     # Find the end of the section by looking for the next header
-    current_line = target_lines[start_line].strip()
-    if not current_line.startswith('#'):
+    raw_current_line = target_lines[start_line]
+    current_line = raw_current_line.strip()
+    if not is_markdown_heading(raw_current_line):
         return current_line
     
     current_level = len(current_line.split()[0])  # Count # characters
@@ -955,9 +985,20 @@ def extract_section_direct_content(target_line_num, target_lines):
     
     # Only extract until the first header (any level)
     # This means we stop at ANY header - whether it's a sub-section OR same/higher level
+    in_code_block = False
+    code_block_delimiter = None
     for i in range(start_line + 1, len(target_lines)):
-        line = target_lines[i].strip()
-        if line.startswith('#'):
+        raw_line = target_lines[i]
+        line = raw_line.strip()
+        if line.startswith('```') or line.startswith('~~~'):
+            if not in_code_block:
+                in_code_block = True
+                code_block_delimiter = line[:3]
+            elif line.startswith(code_block_delimiter):
+                in_code_block = False
+                code_block_delimiter = None
+            continue
+        if not in_code_block and is_markdown_heading(raw_line):
             # Stop at ANY header to get only direct content
             end_line = i
             break
@@ -1008,8 +1049,9 @@ def find_section_end_line(section_start_line, target_hierarchy, target_lines):
     """Find the end line of a section to determine insertion point (from auto-sync-pr-changes.py)"""
     
     # Get the current section's level
-    current_section_line = target_lines[section_start_line - 1].strip()
-    current_level = len(current_section_line.split()[0]) if current_section_line.startswith('#') else 5
+    raw_current_section_line = target_lines[section_start_line - 1]
+    current_section_line = raw_current_section_line.strip()
+    current_level = len(current_section_line.split()[0]) if is_markdown_heading(raw_current_section_line) else 5
     
     # Find the next section at the same level or higher (lower number)
     next_section_line = None
@@ -1017,8 +1059,9 @@ def find_section_end_line(section_start_line, target_hierarchy, target_lines):
         line_num = int(line_num_str)
         if line_num > section_start_line:
             # Check the level of this section
-            section_line = target_lines[line_num - 1].strip()
-            if section_line.startswith('#'):
+            raw_section_line = target_lines[line_num - 1]
+            section_line = raw_section_line.strip()
+            if is_markdown_heading(raw_section_line):
                 section_level = len(section_line.split()[0])
                 if section_level <= current_level:
                     next_section_line = line_num

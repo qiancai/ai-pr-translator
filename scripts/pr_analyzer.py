@@ -18,6 +18,14 @@ def thread_safe_print(*args, **kwargs):
     with print_lock:
         print(*args, **kwargs)
 
+def is_markdown_heading(line):
+    """Return True only for real markdown headings at column 0."""
+    if not line or not isinstance(line, str):
+        return False
+    if line != line.lstrip():
+        return False
+    return re.match(r'^#{1,10}\s+\S', line) is not None
+
 
 def parse_pr_url(pr_url):
     """Parse PR URL to get repo info"""
@@ -258,7 +266,7 @@ def build_hierarchy_dict(file_content):
             continue
         
         # Process headers only if not in code block
-        if line.startswith('#'):
+        if is_markdown_heading(original_line):
             match = re.match(r'^(#{1,10})\s+(.+)', line)
             if match:
                 level = len(match.group(1))
@@ -408,21 +416,37 @@ def extract_section_content(lines, start_line, hierarchy_dict):
     section_content = []
     
     # Find the header at start_line
-    current_line = lines[start_index].strip()
-    if not current_line.startswith('#'):
+    raw_current_line = lines[start_index]
+    current_line = raw_current_line.strip()
+    if not is_markdown_heading(raw_current_line):
         return ""
     
     # Get the level of current header
     current_level = len(current_line.split()[0])  # Count # characters
     section_content.append(current_line)
     
+    # Track fenced code blocks so '#' inside code does not terminate section extraction.
+    in_code_block = False
+    code_block_delimiter = None
+
     # Special handling for top-level titles (level 1)
     if current_level == 1:
         # For top-level titles, only extract content until the first next-level header (##)
         for i in range(start_index + 1, len(lines)):
-            line = lines[i].strip()
-            
-            if line.startswith('#'):
+            raw_line = lines[i]
+            line = raw_line.strip()
+
+            if line.startswith('```') or line.startswith('~~~'):
+                if not in_code_block:
+                    in_code_block = True
+                    code_block_delimiter = line[:3]
+                elif line.startswith(code_block_delimiter):
+                    in_code_block = False
+                    code_block_delimiter = None
+                section_content.append(raw_line.rstrip())
+                continue
+
+            if not in_code_block and is_markdown_heading(raw_line):
                 # Check if this is a header of next level (##, ###, etc.)
                 line_level = len(line.split()[0]) if line.split() else 0
                 if line_level > current_level:
@@ -432,14 +456,25 @@ def extract_section_content(lines, start_line, hierarchy_dict):
                     # Found same or higher level header, also stop
                     break
             
-            section_content.append(lines[i].rstrip())  # Keep original line without trailing whitespace
+            section_content.append(raw_line.rstrip())  # Keep original line without trailing whitespace
     else:
         # For non-top-level titles, use the original logic
         # Extract content until we hit the next header of same or higher level
         for i in range(start_index + 1, len(lines)):
-            line = lines[i].strip()
-            
-            if line.startswith('#'):
+            raw_line = lines[i]
+            line = raw_line.strip()
+
+            if line.startswith('```') or line.startswith('~~~'):
+                if not in_code_block:
+                    in_code_block = True
+                    code_block_delimiter = line[:3]
+                elif line.startswith(code_block_delimiter):
+                    in_code_block = False
+                    code_block_delimiter = None
+                section_content.append(raw_line.rstrip())
+                continue
+
+            if not in_code_block and is_markdown_heading(raw_line):
                 # Check if this is a header of same or higher level
                 line_level = len(line.split()[0]) if line.split() else 0
                 if line_level <= current_level:
@@ -447,7 +482,7 @@ def extract_section_content(lines, start_line, hierarchy_dict):
                     # Each section should be extracted individually
                     break
             
-            section_content.append(lines[i].rstrip())  # Keep original line without trailing whitespace
+            section_content.append(raw_line.rstrip())  # Keep original line without trailing whitespace
     
     return '\n'.join(section_content)
 
@@ -460,21 +495,36 @@ def extract_section_direct_content(lines, start_line):
     section_content = []
     
     # Find the header at start_line
-    current_line = lines[start_index].strip()
-    if not current_line.startswith('#'):
+    raw_current_line = lines[start_index]
+    current_line = raw_current_line.strip()
+    if not is_markdown_heading(raw_current_line):
         return ""
     
     # Add the header line
     section_content.append(current_line)
     
-    # Only extract until the first header (any level)
-    # This means we stop at ANY header - whether it's a sub-section OR same/higher level
+    # Only extract until the first markdown header (any level), excluding headers inside code blocks.
+    in_code_block = False
+    code_block_delimiter = None
+
     for i in range(start_index + 1, len(lines)):
-        line = lines[i].strip()
-        if line.startswith('#'):
+        raw_line = lines[i]
+        line = raw_line.strip()
+
+        if line.startswith('```') or line.startswith('~~~'):
+            if not in_code_block:
+                in_code_block = True
+                code_block_delimiter = line[:3]
+            elif line.startswith(code_block_delimiter):
+                in_code_block = False
+                code_block_delimiter = None
+            section_content.append(raw_line.rstrip())
+            continue
+
+        if not in_code_block and is_markdown_heading(raw_line):
             # Stop at ANY header to get only direct content
             break
-        section_content.append(lines[i].rstrip())
+        section_content.append(raw_line.rstrip())
     
     return '\n'.join(section_content)
 
@@ -898,6 +948,20 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
         # If exact match not found, return empty string
         print(f"   ⚠️  Could not find matching hierarchy in base file: {original_hierarchy}")
         return ""
+
+    # Full-section fallback for nested/sub-section edits that direct-content extraction can miss
+    def extract_old_full_content_by_hierarchy(original_hierarchy, base_hierarchy_dict, base_file_content):
+        """Extract old content by hierarchy including sub-sections"""
+        if original_hierarchy == "frontmatter":
+            return extract_frontmatter_content(base_file_content.split('\n'))
+
+        for base_line_num, base_hierarchy in base_hierarchy_dict.items():
+            if base_hierarchy == original_hierarchy:
+                if base_line_num == 0:
+                    return extract_frontmatter_content(base_file_content.split('\n'))
+                return extract_section_content(base_file_content.split('\n'), base_line_num, base_hierarchy_dict)
+
+        return ""
     
     # Helper function to build complete hierarchy for a section using base file info
     def build_complete_original_hierarchy(line_num, current_hierarchy, base_hierarchy_dict, operations):
@@ -921,8 +985,8 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
                 
                 # For nested sections, build the complete hierarchy using original content
                 # Find the hierarchy path using base hierarchy dict and replace the leaf with original
-                if line_num_str in base_hierarchy_dict:
-                    base_hierarchy = base_hierarchy_dict[line_num_str]
+                if line_num in base_hierarchy_dict:
+                    base_hierarchy = base_hierarchy_dict[line_num]
                     if ' > ' in base_hierarchy:
                         # Replace the leaf (last part) with original content
                         hierarchy_parts = base_hierarchy.split(' > ')
@@ -954,11 +1018,19 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
         # Use hierarchy-based lookup for old content instead of line number
         old_content = extract_old_content_by_hierarchy(original_hierarchy, base_hierarchy_dict, base_file_content)
         
-        # Only include if content actually changed
+        # Only include if content actually changed.
+        # Fallback to full-section comparison to catch nested-content edits.
+        if new_content == old_content:
+            new_full_content = extract_section_content(file_content.split('\n'), line_num, all_hierarchy_dict)
+            old_full_content = extract_old_full_content_by_hierarchy(original_hierarchy, base_hierarchy_dict, base_file_content)
+            if new_full_content != old_full_content:
+                new_content = new_full_content
+                old_content = old_full_content
+
         if new_content != old_content:
             # Check if this is a bottom modified section (no next section in base file)
             is_bottom_modified = False
-            if line_num_str in base_hierarchy_dict:
+            if line_num in base_hierarchy_dict:
                 # Get all sections in base file sorted by line number
                 base_sections = sorted([(int(ln), hier) for ln, hier in base_hierarchy_dict.items() if ln != "0"])
                 
@@ -1253,7 +1325,7 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
                 continue
             
             # Process headers only if not in code block
-            if line.startswith('#'):
+            if is_markdown_heading(original_line):
                 match = re.match(r'^(#{1,10})\s+(.+)', line)
                 if match:
                     level = len(match.group(1))
@@ -1267,9 +1339,11 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
         # Build complete hierarchy from HEAD (after changes)
         all_hierarchy_dict = build_hierarchy_dict(file_content)
         
-        # For deletion detection, we also need the base file hierarchy
+        # For deletion/modification detection, compare against the PR base commit.
+        # Using default_branch here can produce false negatives on release-branch PRs.
         try:
-            base_file_content = repository.get_contents(file.filename, ref=f"{repository.default_branch}").decoded_content.decode('utf-8')
+            base_ref = getattr(pr.base, "sha", None) or getattr(pr.base, "ref", None) or repository.default_branch
+            base_file_content = repository.get_contents(file.filename, ref=base_ref).decoded_content.decode('utf-8')
             base_hierarchy_dict = build_hierarchy_dict(base_file_content)
         except Exception as e:
             print(f"   ⚠️  Could not get base file content: {e}")

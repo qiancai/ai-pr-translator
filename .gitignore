@@ -1,1 +1,4 @@
 gh-util.user.js
+*.pyc
+.DS_Store
+.DS_Store

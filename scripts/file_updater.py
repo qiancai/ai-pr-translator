@@ -6,6 +6,7 @@ Handles processing and translation of updated files and sections
 import os
 import re
 import json
+import difflib
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from github import Github
@@ -17,6 +18,121 @@ print_lock = threading.Lock()
 def thread_safe_print(*args, **kwargs):
     with print_lock:
         print(*args, **kwargs)
+
+def is_markdown_heading(line):
+    """Return True only for real markdown headings at column 0."""
+    if not line or not isinstance(line, str):
+        return False
+    if line != line.lstrip():
+        return False
+    return re.match(r'^#{1,10}\s+\S', line) is not None
+
+def count_changed_lines(old_text, new_text):
+    """Count changed lines between two text blocks."""
+    old_lines = old_text.splitlines()
+    new_lines = new_text.splitlines()
+    matcher = difflib.SequenceMatcher(None, old_lines, new_lines)
+    changed = 0
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag != 'equal':
+            changed += max(i2 - i1, j2 - j1)
+    return changed
+
+def count_changed_diff_lines(pr_diff):
+    """Count changed non-header diff lines in unified diff text."""
+    if not pr_diff:
+        return 0
+    count = 0
+    for line in pr_diff.splitlines():
+        if line.startswith('+++') or line.startswith('---') or line.startswith('@@') or line.startswith('File:'):
+            continue
+        if line.startswith('+') or line.startswith('-'):
+            count += 1
+    return count
+
+def extract_literal_replacements_from_pr_diff(pr_diff):
+    """Extract deterministic literal replacements from adjacent -/+ diff lines."""
+    replacements = []
+    if not pr_diff:
+        return replacements
+
+    lines = pr_diff.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith('-') and not line.startswith('---'):
+            old_line = line[1:]
+            j = i + 1
+            while j < len(lines) and lines[j].startswith('+') and not lines[j].startswith('+++'):
+                new_line = lines[j][1:]
+                if old_line != new_line:
+                    old_links = re.findall(r'\[([^\]]+)\]\(([^)]+)\)', old_line)
+                    new_links = re.findall(r'\[([^\]]+)\]\(([^)]+)\)', new_line)
+
+                    # Prefer markdown-link text updates when URL stays the same.
+                    for old_text, old_url in old_links:
+                        for new_text, new_url in new_links:
+                            if old_url == new_url and old_text != new_text:
+                                replacements.append((f'[{old_text}]({old_url})', f'[{new_text}]({new_url})'))
+                                replacements.append((old_text, new_text))
+
+                    # Fallback full-line replacement for exact match scenarios.
+                    replacements.append((old_line, new_line))
+                j += 1
+            i = j
+            continue
+        i += 1
+
+    # Keep order but deduplicate
+    deduped = []
+    seen = set()
+    for old, new in replacements:
+        if old and new and old != new and (old, new) not in seen:
+            deduped.append((old, new))
+            seen.add((old, new))
+    return deduped
+
+def apply_literal_replacements(text, replacements):
+    """Apply deterministic literal replacements in order."""
+    updated = text
+    for old, new in replacements:
+        if old in updated:
+            updated = updated.replace(old, new)
+    return updated
+
+def enforce_minimal_target_updates(target_sections, updated_sections, pr_diff):
+    """Guardrail: prevent large style rewrites for small source diffs."""
+    if not updated_sections:
+        return updated_sections
+
+    diff_changed_lines = count_changed_diff_lines(pr_diff)
+    # Small source diff should produce small target edits.
+    # Keep a little buffer for language expansion.
+    max_allowed = max(2, diff_changed_lines * 3)
+    replacements = extract_literal_replacements_from_pr_diff(pr_diff)
+
+    guarded = {}
+    for key, updated_text in updated_sections.items():
+        original_text = target_sections.get(key, "")
+        if not original_text:
+            guarded[key] = updated_text
+            continue
+
+        changed = count_changed_lines(original_text, updated_text)
+        if changed <= max_allowed:
+            guarded[key] = updated_text
+            continue
+
+        # AI changed too much; apply deterministic replacements instead.
+        deterministic = apply_literal_replacements(original_text, replacements)
+        if deterministic != original_text:
+            thread_safe_print(f"   🛡️  Minimal-change guard applied for {key}: {changed} changed lines -> deterministic patch")
+            guarded[key] = deterministic
+        else:
+            thread_safe_print(f"   🛡️  Minimal-change guard kept original for {key}: {changed} changed lines exceeds limit {max_allowed}")
+            guarded[key] = original_text
+
+    return guarded
 
 def get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_dict, ai_client, source_language, target_language, target_file_name=None):
     """Use AI to update target sections based on source old content, PR diff, and target sections"""
@@ -64,11 +180,11 @@ def get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_di
 Task: Update the target sections in {target_language} according to the diff in {source_language}.
 
 Instructions:
-1. Carefully analyze the PR diff to understand what changes were made (additions, deletions, modifications)
-2. Find the corresponding positions in the {target_language} sections and make the same changes. Do not change any content that is not modified in the diff, especially the format.
-3. Keep the JSON structure unchanged, only modify the section content
-4. Ensure the updated {target_language} content is logically consistent with the {source_language} changes
-5. Maintain proper technical writing style and terminology in {target_language}. If a sentence in the diff is unchanged in content but only reordered in {source_language}, reuse its existing translation in {target_language}.
+1. Carefully analyze the PR diff to identify exactly which source lines and words changed.
+2. Apply only the corresponding minimal edits to the target sections. Keep unchanged target lines byte-for-byte identical (same wording, punctuation, spacing, indentation, list markers, and line breaks).
+3. Never rewrite style, improve wording, or rephrase unaffected content.
+4. Keep the JSON structure unchanged, only modify section content where required by the diff.
+5. Ensure updated target content is logically consistent with the source diff. If uncertain, prefer leaving a line unchanged rather than rewriting.
 
 Please return the complete updated JSON in the same format as target sections, without any additional explanatory text."""
 
@@ -139,6 +255,7 @@ Please return the complete updated JSON in the same format as target sections, w
         thread_safe_print(f"   📋 AI response (first 500 chars): {ai_response[:500]}...")
         
         result = parse_updated_sections(ai_response)
+        result = enforce_minimal_target_updates(target_sections, result, pr_diff)
         thread_safe_print(f"   📊 Parsed {len(result)} sections from AI response")
         
         # Save AI results to file with target file prefix
@@ -437,16 +554,31 @@ def find_section_boundaries(lines, hierarchy_dict):
             continue
             
         # Get current section level
-        current_line = lines[start_line].strip()
-        if not current_line.startswith('#'):
+        raw_current_line = lines[start_line]
+        current_line = raw_current_line.strip()
+        if not is_markdown_heading(raw_current_line):
             continue
             
         current_level = len(current_line.split()[0])  # Count # characters
         
-        # Look for next section at same or higher level
+        # Look for next section at same or higher level.
+        # Ignore markdown-like headers inside fenced code blocks.
+        in_code_block = False
+        code_block_delimiter = None
         for j in range(start_line + 1, len(lines)):
-            line = lines[j].strip()
-            if line.startswith('#'):
+            raw_line = lines[j]
+            line = raw_line.strip()
+
+            if line.startswith('```') or line.startswith('~~~'):
+                if not in_code_block:
+                    in_code_block = True
+                    code_block_delimiter = line[:3]
+                elif line.startswith(code_block_delimiter):
+                    in_code_block = False
+                    code_block_delimiter = None
+                continue
+
+            if not in_code_block and is_markdown_heading(raw_line):
                 line_level = len(line.split()[0]) if line.split() else 0
                 if line_level <= current_level:
                     end_line = j
@@ -783,13 +915,15 @@ def delete_sections_from_document(file_path, sections_to_delete, target_local_pa
             section_end = len(lines) - 1  # Default to end of file
             
             # Look for next header at same or higher level
-            current_line = lines[section_start].strip()
-            if current_line.startswith('#'):
+            raw_current_line = lines[section_start]
+            current_line = raw_current_line.strip()
+            if is_markdown_heading(raw_current_line):
                 current_level = len(current_line.split('#')[1:])  # Count # characters
                 
                 for i in range(section_start + 1, len(lines)):
-                    line = lines[i].strip()
-                    if line.startswith('#'):
+                    raw_line = lines[i]
+                    line = raw_line.strip()
+                    if is_markdown_heading(raw_line):
                         line_level = len(line.split('#')[1:])
                         if line_level <= current_level:
                             section_end = i - 1
@@ -1687,36 +1821,71 @@ def find_section_end_for_update(lines, start_line, target_hierarchy):
                     return i + 1
         # If not standard frontmatter format, find first top-level heading
         for i in range(start_line + 1, len(lines)):
-            if lines[i].strip().startswith('# '):
+            if is_markdown_heading(lines[i]) and lines[i].startswith('# '):
                 thread_safe_print(f"     📍 Frontmatter ends at line {i} (before first top-level heading)")
                 return i
         # If no top-level heading found, process entire file
         return len(lines)
     
-    if current_line.startswith('#'):
+    if is_markdown_heading(lines[start_line]):
         # Use file_updater.py method to calculate heading level
         current_level = len(current_line.split()[0]) if current_line.split() else 0
         thread_safe_print(f"     🔍 Current heading level: {current_level} (heading: {current_line[:50]}...)")
         
         # Special handling for top-level headings: only process until first second-level heading
+        in_code_block = False
+        code_block_delimiter = None
         if current_level == 1:
             for i in range(start_line + 1, len(lines)):
-                line = lines[i].strip()
-                if line.startswith('##'):  # Find first second-level heading
+                raw_line = lines[i]
+                line = raw_line.strip()
+
+                if line.startswith('```') or line.startswith('~~~'):
+                    if not in_code_block:
+                        in_code_block = True
+                        code_block_delimiter = line[:3]
+                    elif line.startswith(code_block_delimiter):
+                        in_code_block = False
+                        code_block_delimiter = None
+                    continue
+
+                if not in_code_block and is_markdown_heading(raw_line) and line.startswith('##'):  # Find first second-level heading
                     thread_safe_print(f"     📍 Top-level heading ends at line {i} (before first second-level heading)")
                     return i
             # If no second-level heading found, look for next top-level heading
             for i in range(start_line + 1, len(lines)):
-                line = lines[i].strip()
-                if line.startswith('#') and not line.startswith('##'):
+                raw_line = lines[i]
+                line = raw_line.strip()
+
+                if line.startswith('```') or line.startswith('~~~'):
+                    if not in_code_block:
+                        in_code_block = True
+                        code_block_delimiter = line[:3]
+                    elif line.startswith(code_block_delimiter):
+                        in_code_block = False
+                        code_block_delimiter = None
+                    continue
+
+                if not in_code_block and is_markdown_heading(raw_line) and line.startswith('#') and not line.startswith('##'):
                     thread_safe_print(f"     📍 Top-level heading ends at line {i} (before next top-level heading)")
                     return i
         else:
             # For other level headings, stop at ANY header to get only direct content
             # This prevents including sub-sections in the update range
             for i in range(start_line + 1, len(lines)):
-                line = lines[i].strip()
-                if line.startswith('#'):
+                raw_line = lines[i]
+                line = raw_line.strip()
+
+                if line.startswith('```') or line.startswith('~~~'):
+                    if not in_code_block:
+                        in_code_block = True
+                        code_block_delimiter = line[:3]
+                    elif line.startswith(code_block_delimiter):
+                        in_code_block = False
+                        code_block_delimiter = None
+                    continue
+
+                if not in_code_block and is_markdown_heading(raw_line):
                     # Stop at ANY header to get only direct content
                     thread_safe_print(f"     📍 Found header at line {i}: {line[:30]}... (stopping for direct content only)")
                     return i
