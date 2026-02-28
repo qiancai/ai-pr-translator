@@ -730,11 +730,30 @@ def find_sections_by_operation_type(lines, operations, all_headers, base_hierarc
     return sections
 
 
-def get_target_hierarchy_and_content(file_path, github_client, target_repo):
+def get_target_hierarchy_and_content(
+    file_path,
+    github_client,
+    target_repo,
+    target_local_path=None,
+    prefer_local_target_for_read=False,
+):
     """Get target hierarchy and content"""
+    if prefer_local_target_for_read and target_local_path:
+        local_file_path = os.path.join(target_local_path, file_path)
+        if os.path.exists(local_file_path):
+            try:
+                with open(local_file_path, 'r', encoding='utf-8') as f:
+                    file_content = f.read()
+                lines = file_content.split('\n')
+                hierarchy = build_hierarchy_dict(file_content)
+                return hierarchy, lines
+            except Exception as e:
+                print(f"   ⚠️  Error reading local target file {local_file_path}: {e}")
+
     try:
         repository = github_client.get_repo(target_repo)
-        file_content = repository.get_contents(file_path, ref="master").decoded_content.decode('utf-8')
+        target_ref = repository.default_branch
+        file_content = repository.get_contents(file_path, ref=target_ref).decoded_content.decode('utf-8')
         lines = file_content.split('\n')
         
         # Build hierarchy using same method
@@ -817,6 +836,63 @@ def clean_title_for_matching(title):
     title = title.strip()
     
     return title
+
+
+def trim_content_before_tabs_panel(content):
+    """Trim section content at the first TabsPanel line."""
+    if not isinstance(content, str) or not content:
+        return content, False
+
+    lines = content.split('\n')
+    for idx, line in enumerate(lines):
+        if "<TabsPanel" in line:
+            trimmed = "\n".join(lines[:idx]).rstrip()
+            return trimmed, True
+    return content, False
+
+
+def normalize_keywords_regular_source_diff(source_diff_dict):
+    """For keywords.md regular path, keep only non-TabsPanel content."""
+    normalized = {}
+    dropped = 0
+
+    for key, diff_info in source_diff_dict.items():
+        if not isinstance(diff_info, dict):
+            normalized[key] = diff_info
+            continue
+
+        updated = diff_info.copy()
+        old_content = updated.get('old_content')
+        new_content = updated.get('new_content')
+
+        old_trimmed, old_has_tabs = trim_content_before_tabs_panel(old_content)
+        new_trimmed, new_has_tabs = trim_content_before_tabs_panel(new_content)
+
+        updated['old_content'] = old_trimmed
+        updated['new_content'] = new_trimmed
+
+        if old_has_tabs or new_has_tabs:
+            # Tell downstream updater to replace only content before this marker.
+            updated['target_end_marker'] = '<TabsPanel'
+
+        op = updated.get('operation', '')
+        old_norm = (updated.get('old_content') or '').strip()
+        new_norm = (updated.get('new_content') or '').strip()
+
+        # Drop no-op entries after trimming to avoid empty/identical updates.
+        if op == 'modified' and old_norm == new_norm:
+            dropped += 1
+            continue
+        if op == 'added' and not new_norm:
+            dropped += 1
+            continue
+        if op == 'deleted' and not old_norm:
+            dropped += 1
+            continue
+
+        normalized[key] = updated
+
+    return normalized, dropped
 
 def find_previous_section_for_added(added_sections, hierarchy_dict):
     """Find the previous section hierarchy for each added section group"""
@@ -1176,6 +1252,7 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
     import os
     import json
     from toc_processor import process_toc_operations
+    from keword_processor import find_tabs_region, parse_letter_blocks, diff_changed_letters
     from image_processor import is_image_file
     
     owner, repo, pr_number = parse_pr_url(pr_url)
@@ -1205,6 +1282,7 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
     deleted_files = []       # Completely deleted files
     ignored_files = []       # Files that were ignored
     toc_files = {}           # Special TOC files requiring special processing
+    keyword_files = {}       # Special keyword files requiring keyword-specific processing
     
     # Image-related returns
     added_images = []        # New image files that were added
@@ -1245,54 +1323,183 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
             print(f"   ❌ Error getting content: {e}")
             continue
         
-        # Check if this is a TOC.md file requiring special processing
-        if os.path.basename(file.filename) in special_files:
-            print(f"   📋 Detected special file: {file.filename}")
+        basename = os.path.basename(file.filename)
+        operations = None
+        base_file_content_preloaded = None
+        keyword_regular_only = False
+
+        # Check if this is a special file requiring dedicated processing
+        if basename in special_files:
             
-            # Get target file content for comparison
-            try:
-                target_repository = github_client.get_repo(repo_config['target_repo'])
-                target_file_content = target_repository.get_contents(file.filename, ref="master").decoded_content.decode('utf-8')
-                target_lines = target_file_content.split('\n')
-            except Exception as e:
-                print(f"   ⚠️  Could not get target file content: {e}")
-                continue
-            
-            # Analyze diff operations for TOC.md
-            operations = analyze_diff_operations(file)
-            source_lines = file_content.split('\n')
-            
-            # Process with special TOC logic
-            toc_results = process_toc_operations(file.filename, operations, source_lines, target_lines, "")  # Local path will be determined later
-            
-            # Store TOC operations for later processing
-            if any([toc_results['added'], toc_results['modified'], toc_results['deleted']]):
-                # Combine all operations for processing
-                all_toc_operations = []
-                all_toc_operations.extend(toc_results['added'])
-                all_toc_operations.extend(toc_results['modified']) 
-                all_toc_operations.extend(toc_results['deleted'])
-                
-                # Add to special TOC processing queue (separate from regular sections)
-                toc_files[file.filename] = {
-                    'type': 'toc',
-                    'operations': all_toc_operations
+            # --- keywords.md: keyword-specific processor ---
+            if basename == "keywords.md":
+                print(f"   📋 Detected keyword file: {file.filename}")
+                operations = analyze_diff_operations(file)
+
+                source_head_lines = file_content.split('\n')
+                base_ref = getattr(pr.base, "sha", None) or getattr(pr.base, "ref", None) or repository.default_branch
+                try:
+                    base_file_content_preloaded = repository.get_contents(file.filename, ref=base_ref).decoded_content.decode('utf-8')
+                except Exception as e:
+                    print(f"   ⚠️  Could not get base keywords.md content: {e}")
+                    base_file_content_preloaded = file_content
+
+                source_base_lines = base_file_content_preloaded.split('\n')
+
+                head_tabs_region = find_tabs_region(source_head_lines)
+                base_tabs_region = find_tabs_region(source_base_lines)
+
+                head_blocks = parse_letter_blocks(source_head_lines, head_tabs_region)
+                base_blocks = parse_letter_blocks(source_base_lines, base_tabs_region)
+                changed_letters = diff_changed_letters(base_blocks, head_blocks)
+
+                tabs_changes = {}
+                if changed_letters:
+                    target_blocks = {}
+                    target_blocks_source = "none"
+                    prefer_local_target_for_read = bool(
+                        repo_config.get('prefer_local_target_for_read', False)
+                    )
+
+                    # For local workflow, prefer local target baseline;
+                    # for workflow entry, use remote baseline.
+                    target_local_root = repo_config.get('target_local_path')
+                    if prefer_local_target_for_read and target_local_root:
+                        local_target_file = os.path.join(target_local_root, file.filename)
+                        if os.path.exists(local_target_file):
+                            try:
+                                with open(local_target_file, 'r', encoding='utf-8') as f:
+                                    target_file_content = f.read()
+                                target_lines = target_file_content.split('\n')
+                                target_tabs_region = find_tabs_region(target_lines)
+                                target_blocks = parse_letter_blocks(target_lines, target_tabs_region)
+                                target_blocks_source = f"local:{local_target_file}"
+                            except Exception as e:
+                                print(f"   ⚠️  Could not read local target keyword file: {e}")
+
+                    # Fallback to remote target repo if local file is unavailable.
+                    if not target_blocks:
+                        try:
+                            target_repository = github_client.get_repo(repo_config['target_repo'])
+                            target_ref = target_repository.default_branch
+                            target_file_content = target_repository.get_contents(file.filename, ref=target_ref).decoded_content.decode('utf-8')
+                            target_lines = target_file_content.split('\n')
+                            target_tabs_region = find_tabs_region(target_lines)
+                            target_blocks = parse_letter_blocks(target_lines, target_tabs_region)
+                            target_blocks_source = f"remote:{repo_config['target_repo']}@{target_ref}"
+                        except Exception as e:
+                            print(f"   ⚠️  Could not get target keyword file content for tabs changes: {e}")
+                            target_blocks = {}
+
+                    print(f"   📌 Keyword target baseline source: {target_blocks_source}")
+
+                    for letter, change_data in changed_letters.items():
+                        tabs_changes[letter] = {
+                            "source_old_block": change_data.get("source_old_block"),
+                            "source_new_block": change_data.get("source_new_block"),
+                            "source_diff": change_data.get("source_diff", ""),
+                            "target_old_block": target_blocks.get(letter, {}).get("content")
+                        }
+
+                if tabs_changes:
+                    keyword_files[file.filename] = {
+                        "type": "keyword",
+                        "tabs_changes": tabs_changes
+                    }
+                    print(f"   📋 Keyword TabsPanel operations queued: {sorted(tabs_changes.keys())}")
+                else:
+                    print(f"   ℹ️  No TabsPanel letter changes found")
+
+                def line_in_tabs_region(line_number, region):
+                    if not region:
+                        return False
+                    if not line_number:
+                        return False
+                    # line_number is 1-based; region end_idx is 0-based exclusive.
+                    return (region["start_idx"] + 1) <= line_number <= region["end_idx"]
+
+                filtered_operations = {
+                    "added_lines": [
+                        line for line in operations["added_lines"]
+                        if not line_in_tabs_region(line.get("line_number"), head_tabs_region)
+                    ],
+                    "modified_lines": [
+                        line for line in operations["modified_lines"]
+                        if not line_in_tabs_region(line.get("line_number"), head_tabs_region)
+                    ],
+                    "deleted_lines": [
+                        line for line in operations["deleted_lines"]
+                        if not line_in_tabs_region(line.get("line_number"), base_tabs_region)
+                    ]
                 }
+
+                print(
+                    f"   🧹 Filtered non-tabs diff lines: "
+                    f"{len(filtered_operations['added_lines'])} added, "
+                    f"{len(filtered_operations['modified_lines'])} modified, "
+                    f"{len(filtered_operations['deleted_lines'])} deleted"
+                )
+
+                operations = filtered_operations
+                if not any([
+                    filtered_operations["added_lines"],
+                    filtered_operations["modified_lines"],
+                    filtered_operations["deleted_lines"]
+                ]):
+                    print(f"   ⏭️  No non-tabs changes in keywords.md, skipping regular section processing")
+                    continue
+
+                keyword_regular_only = True
+
+            if basename != "keywords.md":
+                # --- TOC.md: TOC-specific processor ---
+                print(f"   📋 Detected special file: {file.filename}")
                 
-                print(f"   📋 TOC operations queued for processing:")
-                if toc_results['added']:
-                    print(f"      ➕ Added: {len(toc_results['added'])} entries")
-                if toc_results['modified']:
-                    print(f"      ✏️  Modified: {len(toc_results['modified'])} entries") 
-                if toc_results['deleted']:
-                    print(f"      ❌ Deleted: {len(toc_results['deleted'])} entries")
-            else:
-                print(f"   ℹ️  No TOC operations found")
-            
-            continue  # Skip regular processing for TOC files
+                # Get target file content for comparison
+                try:
+                    target_repository = github_client.get_repo(repo_config['target_repo'])
+                    target_file_content = target_repository.get_contents(file.filename, ref="master").decoded_content.decode('utf-8')
+                    target_lines = target_file_content.split('\n')
+                except Exception as e:
+                    print(f"   ⚠️  Could not get target file content: {e}")
+                    continue
+                
+                # Analyze diff operations for TOC.md
+                operations = analyze_diff_operations(file)
+                source_lines = file_content.split('\n')
+                
+                # Process with special TOC logic
+                toc_results = process_toc_operations(file.filename, operations, source_lines, target_lines, "")  # Local path will be determined later
+                
+                # Store TOC operations for later processing
+                if any([toc_results['added'], toc_results['modified'], toc_results['deleted']]):
+                    # Combine all operations for processing
+                    all_toc_operations = []
+                    all_toc_operations.extend(toc_results['added'])
+                    all_toc_operations.extend(toc_results['modified']) 
+                    all_toc_operations.extend(toc_results['deleted'])
+                    
+                    # Add to special TOC processing queue (separate from regular sections)
+                    toc_files[file.filename] = {
+                        'type': 'toc',
+                        'operations': all_toc_operations
+                    }
+                    
+                    print(f"   📋 TOC operations queued for processing:")
+                    if toc_results['added']:
+                        print(f"      ➕ Added: {len(toc_results['added'])} entries")
+                    if toc_results['modified']:
+                        print(f"      ✏️  Modified: {len(toc_results['modified'])} entries") 
+                    if toc_results['deleted']:
+                        print(f"      ❌ Deleted: {len(toc_results['deleted'])} entries")
+                else:
+                    print(f"   ℹ️  No TOC operations found")
+                
+                continue  # Skip regular processing for special files
         
         # Analyze diff operations
-        operations = analyze_diff_operations(file)
+        if operations is None:
+            operations = analyze_diff_operations(file)
         print(f"   📝 Diff analysis: {len(operations['added_lines'])} added, {len(operations['modified_lines'])} modified, {len(operations['deleted_lines'])} deleted lines")
         
         lines = file_content.split('\n')
@@ -1342,8 +1549,11 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
         # For deletion/modification detection, compare against the PR base commit.
         # Using default_branch here can produce false negatives on release-branch PRs.
         try:
-            base_ref = getattr(pr.base, "sha", None) or getattr(pr.base, "ref", None) or repository.default_branch
-            base_file_content = repository.get_contents(file.filename, ref=base_ref).decoded_content.decode('utf-8')
+            if base_file_content_preloaded is not None:
+                base_file_content = base_file_content_preloaded
+            else:
+                base_ref = getattr(pr.base, "sha", None) or getattr(pr.base, "ref", None) or repository.default_branch
+                base_file_content = repository.get_contents(file.filename, ref=base_ref).decoded_content.decode('utf-8')
             base_hierarchy_dict = build_hierarchy_dict(base_file_content)
         except Exception as e:
             print(f"   ⚠️  Could not get base file content: {e}")
@@ -1479,6 +1689,16 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
             all_hierarchy_dict, base_hierarchy_dict, 
             operations, file_content, base_file_content
         )
+
+        if basename == "keywords.md" and keyword_regular_only:
+            source_diff_dict, dropped_entries = normalize_keywords_regular_source_diff(source_diff_dict)
+            print(
+                f"   🔧 keywords.md regular diff normalized: "
+                f"{len(source_diff_dict)} kept, {dropped_entries} dropped"
+            )
+            if not source_diff_dict:
+                print(f"   ⏭️  No non-tabs section content remains after normalization")
+                continue
         
         # Breakpoint: Output source_diff_dict to file for review with file prefix
         
@@ -1553,11 +1773,14 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
                     file_modified[str(line_num)] = original_hierarchy_dict[line_num]
             
             if file_modified:
-                modified_sections[file.filename] = {
+                modified_entry = {
                     'sections': file_modified,
                     'original_hierarchy': original_hierarchy_dict,
                     'current_hierarchy': all_hierarchy_dict
                 }
+                if basename == "keywords.md" and keyword_regular_only:
+                    modified_entry['keyword_regular_only'] = True
+                modified_sections[file.filename] = modified_entry
                 print(f"   ✏️  Found {len(file_modified)} modified sections")
         
         # Process deleted sections  
@@ -1603,11 +1826,14 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
                 modified_sections[file.filename]['sections'] = existing_sections
             else:
                 # Create new entry
-                modified_sections[file.filename] = {
+                modified_entry = {
                     'sections': legacy_modified,
                     'original_hierarchy': all_hierarchy_dict,
                     'current_hierarchy': all_hierarchy_dict
                 }
+                if basename == "keywords.md" and keyword_regular_only:
+                    modified_entry['keyword_regular_only'] = True
+                modified_sections[file.filename] = modified_entry
     
     # Process image files
     print(f"\n🖼️  Analyzing image files...")
@@ -1642,6 +1868,7 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
     print(f"   📄 Added files: {len(added_files)} files")
     print(f"   🗑️  Deleted files: {len(deleted_files)} files")
     print(f"   📋 TOC files: {len(toc_files)} files")
+    print(f"   📋 Keyword files: {len(keyword_files)} files")
     print(f"   🖼️  Added images: {len(added_images)} images")
     print(f"   🖼️  Modified images: {len(modified_images)} images")
     print(f"   🖼️  Deleted images: {len(deleted_images)} images")
@@ -1650,4 +1877,4 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
         for ignored_file in ignored_files:
             print(f"      - {ignored_file}")
     
-    return added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, added_images, modified_images, deleted_images
+    return added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images

@@ -25,6 +25,27 @@ def is_markdown_heading(line):
         return False
     return re.match(r'^#{1,10}\s+\S', line) is not None
 
+def extract_first_heading_from_content(content):
+    """Extract first markdown heading line from section content."""
+    if not content:
+        return None
+    for line in content.splitlines():
+        if is_markdown_heading(line):
+            return line.strip()
+    return None
+
+
+def trim_content_by_end_marker(content, end_marker):
+    """Trim content before the first line containing end_marker."""
+    if not end_marker or not isinstance(content, str) or not content:
+        return content
+
+    lines = content.splitlines()
+    for idx, line in enumerate(lines):
+        if end_marker in line:
+            return "\n".join(lines[:idx]).rstrip()
+    return content
+
 def clean_title_for_matching(title):
     """Clean title for matching by removing markdown formatting and span elements"""
     if not title:
@@ -444,6 +465,45 @@ def find_matching_line_numbers(ai_sections, target_hierarchy_dict):
     
     return matched_dict
 
+def get_heading_level(hierarchy):
+    """Get markdown heading level from hierarchy string, if present."""
+    if not hierarchy:
+        return None
+    leaf = hierarchy.split(' > ')[-1] if ' > ' in hierarchy else hierarchy
+    leaf = leaf.strip()
+    m = re.match(r'^(#{1,10})\s+\S', leaf)
+    if m:
+        return len(m.group(1))
+    return None
+
+def choose_best_ai_match(ai_matched, source_hierarchy):
+    """Pick the best line when AI returns multiple possible sections."""
+    if not ai_matched:
+        return None, None
+    if len(ai_matched) == 1:
+        line, hierarchy = next(iter(ai_matched.items()))
+        return line, hierarchy
+
+    source_level = get_heading_level(source_hierarchy)
+    items = list(ai_matched.items())
+
+    # Prefer same heading level as source section.
+    if source_level is not None:
+        same_level = []
+        for line, hierarchy in items:
+            h_level = get_heading_level(hierarchy)
+            if h_level == source_level:
+                same_level.append((line, hierarchy))
+        if same_level:
+            # If multiple same-level matches, keep the one with largest line number
+            # (usually the more specific/inner section in this workflow).
+            same_level.sort(key=lambda x: int(x[0]))
+            return same_level[-1]
+
+    # Fallback to largest line number to avoid accidentally choosing top-level title.
+    items.sort(key=lambda x: int(x[0]))
+    return items[-1]
+
 def build_hierarchy_path(lines, line_num, all_headers):
     """Build the full hierarchy path for a header at given line (from auto-sync-pr-changes.py)"""
     if line_num not in all_headers:
@@ -620,14 +680,14 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
     direct_match_sections = OrderedDict()
     ai_match_sections = OrderedDict()
     added_sections = OrderedDict()
-    bottom_sections = OrderedDict()  # New category for bottom sections
+    bottom_sections = OrderedDict()  # Only bottom-added sections should be here
     
     for key, hierarchy in source_hierarchies.items():
         # Check if this is an intro section (highest priority)
         if hierarchy == "intro_section" or key == "intro_section":
             intro_section_sections[key] = hierarchy
-        # Check if this is a bottom section (no matching needed)
-        elif hierarchy.startswith('bottom-'):
+        # Only bottom-added sections should skip matching and append to end.
+        elif hierarchy.startswith('bottom-added-'):
             bottom_sections[key] = hierarchy
         # Check if this is an added section
         elif key.startswith('added_'):
@@ -649,7 +709,7 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
     thread_safe_print(f"   🎯 Direct matching: {len(direct_match_sections)} sections")
     thread_safe_print(f"   🤖 AI matching: {len(ai_match_sections)} sections")
     thread_safe_print(f"   ➕ Added sections: {len(added_sections)} sections")
-    thread_safe_print(f"   🔚 Bottom sections: {len(bottom_sections)} sections (no matching needed)")
+    thread_safe_print(f"   🔚 Bottom-added sections: {len(bottom_sections)} sections (no matching needed)")
     
     # Process each section in original order
     thread_safe_print(f"\n🔄 Processing sections in original order...")
@@ -675,12 +735,12 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
                 "target_hierarchy": "intro_section",
                 "intro_section_end_line": first_level2_line  # Store where intro section ends
             }
-        elif hierarchy.startswith('bottom-'):
-            # Bottom section - no matching needed, append to end
-            thread_safe_print(f"      🔚 Bottom section - append to end of document")
+        elif hierarchy.startswith('bottom-added-'):
+            # Bottom-added section - no matching needed, append to end
+            thread_safe_print(f"      🔚 Bottom-added section - append to end of document")
             result = {
-                "target_line": "-1",  # Special marker for bottom sections
-                "target_hierarchy": hierarchy  # Keep the bottom-xxx marker
+                "target_line": "-1",  # Special marker for bottom-added sections
+                "target_hierarchy": hierarchy
             }
         elif key.startswith('added_'):
             # Added section - find insertion point
@@ -689,8 +749,31 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
         else:
             # Modified or deleted section - find matching section
             operation = source_diff_dict[key].get('operation', 'unknown')
+            effective_hierarchy = hierarchy
+
+            # bottom-modified means "last section in source file", not "append in target".
+            # Recover heading from source content and do normal matching.
+            if hierarchy.startswith('bottom-modified-'):
+                source_info = source_diff_dict.get(key, {})
+                source_content = source_info.get('new_content') or source_info.get('old_content') or ''
+                inferred_heading = extract_first_heading_from_content(source_content)
+                if inferred_heading:
+                    effective_hierarchy = inferred_heading
+                    thread_safe_print(f"      🔚 Bottom-modified section - matching by inferred heading: {inferred_heading}")
+                else:
+                    thread_safe_print(f"      ⚠️  Bottom-modified section has no inferred heading, fallback to original hierarchy")
+
             thread_safe_print(f"      {operation.capitalize()} section - finding target match")
-            result = process_modified_or_deleted_section(key, hierarchy, target_hierarchy, target_lines, ai_client, repo_config, max_non_system_sections, max_tokens)
+            result = process_modified_or_deleted_section(
+                key,
+                effective_hierarchy,
+                target_hierarchy,
+                target_lines,
+                ai_client,
+                repo_config,
+                max_non_system_sections,
+                max_tokens
+            )
         
         if result:
             # Add source language information from source_diff_dict
@@ -704,6 +787,9 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
             if hierarchy == "intro_section" or key == "intro_section":
                 # Extract intro section content from target
                 target_content, _ = extract_intro_section_content_from_lines(target_lines)
+            elif target_line == '-1':
+                # Bottom-added sections do not have existing target content.
+                target_content = ""
             elif target_line != 'unknown' and target_line != '0':
                 try:
                     target_line_num = int(target_line)
@@ -715,6 +801,10 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
             elif target_line == '0':
                 # For frontmatter, extract content from beginning to first header
                 target_content = extract_frontmatter_content(target_lines)
+
+            target_end_marker = source_info.get('target_end_marker')
+            if target_end_marker:
+                target_content = trim_content_by_end_marker(target_content, target_end_marker)
             
             enhanced_result = {
                 **result,  # Include existing target matching info
@@ -722,7 +812,8 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
                 'source_original_hierarchy': source_info.get('original_hierarchy', ''),
                 'source_operation': source_info.get('operation', ''),
                 'source_old_content': source_info.get('old_content', ''),
-                'source_new_content': source_info.get('new_content', '')
+                'source_new_content': source_info.get('new_content', ''),
+                'target_end_marker': target_end_marker
             }
             all_matched_sections[key] = enhanced_result
             thread_safe_print(f"      ✅ {key}: -> line {target_line}")
@@ -803,8 +894,7 @@ def process_modified_or_deleted_section(key, hierarchy, target_hierarchy, target
                 ai_matched = find_matching_line_numbers(ai_sections, target_hierarchy)
                 
                 if ai_matched:
-                    target_line = list(ai_matched.keys())[0]
-                    target_hierarchy_str = list(ai_matched.values())[0]
+                    target_line, target_hierarchy_str = choose_best_ai_match(ai_matched, hierarchy)
                     
                     # Format AI matched hierarchy with # prefix and remove top-level title
                     formatted_hierarchy = format_target_hierarchy(target_hierarchy_str)

@@ -25,6 +25,7 @@ from file_adder import process_added_files
 from file_deleter import process_deleted_files
 from file_updater import process_files_in_batches, process_added_sections, process_modified_sections, process_deleted_sections
 from toc_processor import process_toc_files
+from keword_processor import process_keyword_files
 from section_matcher import match_source_diff_to_target
 
 # Configuration from environment variables
@@ -50,7 +51,7 @@ AI_MAX_TOKENS_GEMINI = 8192     # Gemini maximum output tokens (can go higher bu
 AI_MAX_TOKENS = 8192            # Default maximum tokens for AI translation requests
 
 # Special file configuration
-SPECIAL_FILES = ["TOC.md"]
+SPECIAL_FILES = ["TOC.md", "keywords.md"]
 IGNORE_FILES = ["TOC-tidb-cloud.md","TOC-tidb-cloud-starter.md","TOC-tidb-cloud-essential.md","TOC-tidb-cloud-premium.md"]
 
 # Repository configuration for workflow
@@ -87,6 +88,7 @@ def get_workflow_repo_configs():
         source_repo_key: {
             "target_repo": target_repo_key,
             "target_local_path": TARGET_REPO_PATH,
+            "prefer_local_target_for_read": False,
             "source_language": source_language,
             "target_language": target_language
         }
@@ -393,8 +395,13 @@ def extract_file_diff_from_pr(pr_diff, source_file_path):
 def determine_file_processing_type(source_file_path, file_sections, special_files=None):
     """Determine how to process a file based on operation type and file characteristics"""
     
-    # Check if this is a special file (like TOC.md)
+    # Check if this is a special file (like TOC.md or keywords.md)
     if special_files and os.path.basename(source_file_path) in special_files:
+        basename = os.path.basename(source_file_path)
+        if basename == "keywords.md":
+            if isinstance(file_sections, dict) and file_sections.get("keyword_regular_only"):
+                return "regular_modified"
+            return "special_file_keyword"
         return "special_file_toc"
     
     # For all other modified files, use regular processing
@@ -445,7 +452,13 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, pr
         
         # Get target file hierarchy and content
         target_repo = repo_config['target_repo']
-        target_hierarchy, target_lines = get_target_hierarchy_and_content(source_file_path, github_client, target_repo)
+        target_hierarchy, target_lines = get_target_hierarchy_and_content(
+            source_file_path,
+            github_client,
+            target_repo,
+            repo_config.get('target_local_path'),
+            repo_config.get('prefer_local_target_for_read', False),
+        )
         
         if not target_hierarchy or not target_lines:
             print(f"   ❌ Could not get target file content for {source_file_path}")
@@ -620,7 +633,7 @@ def main():
     
     # Step 2: Analyze source changes with operation categorization
     print(f"\n📊 Step 2: Analyzing source changes...")
-    added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, added_images, modified_images, deleted_images = analyze_source_changes(
+    added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images = analyze_source_changes(
         SOURCE_PR_URL, github_client, 
         special_files=SPECIAL_FILES, 
         ignore_files=IGNORE_FILES, 
@@ -635,6 +648,7 @@ def main():
     # Import necessary functions
     from file_updater import process_modified_sections, update_target_document_from_match_data
     from toc_processor import process_toc_files
+    from keword_processor import process_keyword_files
     
     # Step 3.1: Process deleted files (file-level deletions)
     if deleted_files:
@@ -653,6 +667,15 @@ def main():
         print(f"\n📋 Step 3.3: Processing {len(toc_files)} special files (TOC)...")
         process_toc_files(toc_files, SOURCE_PR_URL, github_client, ai_client, repo_config)
         print(f"   ✅ Special files processed")
+    
+    # Step 3.3b: Process keyword files (keywords.md)
+    if keyword_files:
+        print(f"\n📋 Step 3.3b: Processing {len(keyword_files)} keyword files...")
+        keyword_success = process_keyword_files(keyword_files, SOURCE_PR_URL, github_client, ai_client, repo_config)
+        if not keyword_success:
+            print("   ❌ Keyword files processing failed, exiting workflow")
+            return
+        print(f"   ✅ Keyword files processed")
     
     # Step 3.4: Process modified files (section-level modifications)
     if modified_sections:
@@ -679,6 +702,10 @@ def main():
             if file_type == "special_file_toc":
                 # Special files should have been processed in Step 3.3, skip here
                 print(f"   ⏭️  Special file already processed in Step 3.3, skipping...")
+                continue
+            
+            elif file_type == "special_file_keyword":
+                print(f"   ⏭️  Keyword file already processed in Step 3.3b, skipping...")
                 continue
             
             elif file_type == "regular_modified":
@@ -715,6 +742,7 @@ def main():
     print(f"   📄 Added files: {len(added_files)} processed")
     print(f"   🗑️  Deleted files: {len(deleted_files)} processed")
     print(f"   📋 TOC files: {len(toc_files)} processed")
+    print(f"   📋 Keyword files: {len(keyword_files)} processed")
     print(f"   📝 Modified files: {len(modified_sections)} processed")
     print(f"   🖼️  Added images: {len(added_images)} processed")
     print(f"   🖼️  Modified images: {len(modified_images)} processed")

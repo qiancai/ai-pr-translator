@@ -27,6 +27,40 @@ def is_markdown_heading(line):
         return False
     return re.match(r'^#{1,10}\s+\S', line) is not None
 
+def resolve_section_start_line(target_lines, target_line_num, target_hierarchy):
+    """Resolve a robust 0-based section start line for replace/delete."""
+    if target_line_num <= 0:
+        return 0
+
+    candidate = target_line_num - 1
+    heading_text = (target_hierarchy or "").strip()
+
+    # 1) Exact candidate
+    if 0 <= candidate < len(target_lines) and is_markdown_heading(target_lines[candidate]):
+        return candidate
+
+    # 2) Off-by-one previous line
+    if candidate - 1 >= 0 and is_markdown_heading(target_lines[candidate - 1]):
+        if not heading_text or target_lines[candidate - 1].strip() == heading_text:
+            thread_safe_print(f"   🔧 Adjusted start line from {target_line_num} to {target_line_num - 1} (off-by-one heading)")
+            return candidate - 1
+
+    # 3) Search exact heading text in file
+    if heading_text:
+        for idx, raw_line in enumerate(target_lines):
+            if raw_line.strip() == heading_text and is_markdown_heading(raw_line):
+                thread_safe_print(f"   🔧 Resolved start line by heading text at line {idx + 1}")
+                return idx
+
+    # 4) Last resort: nearest heading around candidate
+    for delta in range(1, 6):
+        for idx in (candidate - delta, candidate + delta):
+            if 0 <= idx < len(target_lines) and is_markdown_heading(target_lines[idx]):
+                thread_safe_print(f"   🔧 Resolved start line by nearby heading at line {idx + 1}")
+                return idx
+
+    return max(0, min(candidate, len(target_lines) - 1))
+
 def count_changed_lines(old_text, new_text):
     """Count changed lines between two text blocks."""
     old_lines = old_text.splitlines()
@@ -134,6 +168,115 @@ def enforce_minimal_target_updates(target_sections, updated_sections, pr_diff):
 
     return guarded
 
+
+def extract_changed_source_tokens(source_old, source_new):
+    """Extract stable tokens from changed source lines to scope target edits."""
+    if not isinstance(source_old, str):
+        source_old = source_old or ""
+    if not isinstance(source_new, str):
+        source_new = source_new or ""
+
+    old_lines = source_old.splitlines()
+    new_lines = source_new.splitlines()
+    matcher = difflib.SequenceMatcher(None, old_lines, new_lines)
+
+    changed_fragments = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        changed_fragments.extend(old_lines[i1:i2])
+        changed_fragments.extend(new_lines[j1:j2])
+
+    if not changed_fragments:
+        return set()
+
+    changed_text = "\n".join(changed_fragments)
+    tokens = set()
+
+    # Markdown/link paths and references.
+    tokens.update(re.findall(r'/[A-Za-z0-9._/\-]+(?:\.[A-Za-z0-9]+)?', changed_text))
+    # Backtick-wrapped identifiers.
+    tokens.update(re.findall(r'`([^`]+)`', changed_text))
+    # Uppercase identifiers like INFORMATION_SCHEMA.KEYWORDS.
+    tokens.update(re.findall(r'[A-Z][A-Z0-9_.-]{2,}', changed_text))
+
+    return {t for t in tokens if isinstance(t, str) and len(t) >= 3}
+
+
+def line_has_any_token(line, tokens):
+    if not line or not tokens:
+        return False
+    return any(token in line for token in tokens)
+
+
+def filter_target_update_with_tokens(original_text, updated_text, tokens):
+    """Keep only updated target lines that are related to changed source tokens."""
+    if not tokens or original_text == updated_text:
+        return updated_text
+
+    old_lines = (original_text or "").splitlines(keepends=True)
+    new_lines = (updated_text or "").splitlines(keepends=True)
+    matcher = difflib.SequenceMatcher(None, old_lines, new_lines)
+
+    merged = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        old_chunk = old_lines[i1:i2]
+        new_chunk = new_lines[j1:j2]
+
+        if tag == "equal":
+            merged.extend(old_chunk)
+            continue
+
+        if tag == "replace":
+            max_len = max(len(old_chunk), len(new_chunk))
+            for idx in range(max_len):
+                old_line = old_chunk[idx] if idx < len(old_chunk) else None
+                new_line = new_chunk[idx] if idx < len(new_chunk) else None
+
+                if new_line is not None and (
+                    line_has_any_token(new_line, tokens) or
+                    (old_line is not None and line_has_any_token(old_line, tokens))
+                ):
+                    merged.append(new_line)
+                elif old_line is not None:
+                    merged.append(old_line)
+            continue
+
+        if tag == "delete":
+            for old_line in old_chunk:
+                if not line_has_any_token(old_line, tokens):
+                    merged.append(old_line)
+            continue
+
+        if tag == "insert":
+            for new_line in new_chunk:
+                if line_has_any_token(new_line, tokens):
+                    merged.append(new_line)
+            continue
+
+    return "".join(merged)
+
+
+def enforce_source_token_scoped_updates(target_sections, updated_sections, enhanced_sections):
+    """Apply source-token guard to suppress unrelated target rewrites."""
+    guarded = {}
+    for key, updated_text in updated_sections.items():
+        original_text = target_sections.get(key, "")
+        source_info = enhanced_sections.get(key, {}) if isinstance(enhanced_sections, dict) else {}
+        source_old = source_info.get("source_old_content", "")
+        source_new = source_info.get("source_new_content", "")
+        tokens = extract_changed_source_tokens(source_old, source_new)
+
+        filtered_text = filter_target_update_with_tokens(original_text, updated_text, tokens)
+        if filtered_text != updated_text:
+            thread_safe_print(
+                f"   🛡️  Source-token guard reverted unrelated edits in {key} "
+                f"(tokens={len(tokens)})"
+            )
+        guarded[key] = filtered_text
+
+    return guarded
+
 def get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_dict, ai_client, source_language, target_language, target_file_name=None):
     """Use AI to update target sections based on source old content, PR diff, and target sections"""
     if not source_old_content_dict or not target_sections:
@@ -180,8 +323,8 @@ def get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_di
 Task: Update the target sections in {target_language} according to the diff in {source_language}.
 
 Instructions:
-1. Carefully analyze the PR diff to identify exactly which source lines and words changed.
-2. For lines changed in the diff, apply the corresponding minimal edits to the target lines in {target_language} according to the diff. For lines not changed in the diff, keep the corresponding target lines byte-for-byte identical (same wording, punctuation, spacing, indentation, list markers, and line breaks).
+1. Carefully analyze the PR diff to identify exactly which source lines and words changed in {source_language}.
+2. According to the diff, identify the lines that should be updated accordingly in {target_language}. For lines that needs to be updated in {target_language}, apply the corresponding minimal edits according to the diff. For lines not changed or not included in the diff, make sure to keep the corresponding target lines byte-for-byte identical (same wording, punctuation, spacing, indentation, list markers, and line breaks), which means do not add, remove, or modify lines not included in the diff.
 3. Never rewrite style, improve wording, or rephrase unaffected content.
 4. Keep the JSON structure unchanged, only modify section content where required by the diff.
 5. Ensure updated target content is logically consistent with the source diff. If uncertain, prefer leaving a line unchanged rather than rewriting.
@@ -785,7 +928,11 @@ def process_single_file_deletion(file_path, source_sections, pr_url, github_clie
     
     # Get target file hierarchy and content
     target_hierarchy, target_lines = get_target_hierarchy_and_content(
-        file_path, github_client, repo_config['target_repo']
+        file_path,
+        github_client,
+        repo_config['target_repo'],
+        repo_config.get('target_local_path'),
+        repo_config.get('prefer_local_target_for_read', False),
     )
     
     if not target_hierarchy:
@@ -1003,6 +1150,12 @@ def process_single_file(file_path, source_sections, pr_diff, pr_url, github_clie
                 if not updated_sections:
                     thread_safe_print(f"   [{thread_id}] ⚠️  Could not get AI update")
                     return False, f"Could not get AI update for {file_path}"
+
+                updated_sections = enforce_source_token_scoped_updates(
+                    target_sections,
+                    updated_sections,
+                    enhanced_sections,
+                )
                 
                 # Return the AI results for further processing
                 thread_safe_print(f"   [{thread_id}] ✅ Successfully got AI translation results for {file_path}")
@@ -1015,7 +1168,13 @@ def process_single_file(file_path, source_sections, pr_diff, pr_url, github_clie
         # Regular file processing continues here for old format
         # Get target hierarchy and content (get-target-affected-hierarchy.py logic)
         from pr_analyzer import get_target_hierarchy_and_content
-        target_hierarchy, target_lines = get_target_hierarchy_and_content(file_path, github_client, repo_config['target_repo'])
+        target_hierarchy, target_lines = get_target_hierarchy_and_content(
+            file_path,
+            github_client,
+            repo_config['target_repo'],
+            repo_config.get('target_local_path'),
+            repo_config.get('prefer_local_target_for_read', False),
+        )
         if not target_hierarchy:
             thread_safe_print(f"   [{thread_id}] ⚠️  Could not get target content")
             return False, f"Could not get target content for {file_path}"
@@ -1204,7 +1363,11 @@ def process_added_sections(added_sections, pr_diff, pr_url, github_client, ai_cl
         
         # Get target file hierarchy and content
         target_hierarchy, target_lines = get_target_hierarchy_and_content(
-            file_path, github_client, repo_config['target_repo']
+            file_path,
+            github_client,
+            repo_config['target_repo'],
+            repo_config.get('target_local_path'),
+            repo_config.get('prefer_local_target_for_read', False),
         )
         
         if not target_hierarchy:
@@ -1512,6 +1675,7 @@ def update_target_document_sections(all_sections, target_file_path):
         insertion_type = section_data.get('insertion_type', '')
         target_hierarchy = section_data.get('target_hierarchy', '')
         target_new_content = section_data.get('target_new_content')
+        target_end_marker = section_data.get('target_end_marker')
         
         thread_safe_print(f"\n📝 {i}/{len(all_sections)} Processing {key} (Line {target_line_num})")
         thread_safe_print(f"   Operation type: {operation}")
@@ -1526,14 +1690,19 @@ def update_target_document_sections(all_sections, target_file_path):
             thread_safe_print(f"   🗑️  Delete mode: removing section starting at line {target_line_num}")
             
             # Find section end position
-            start_line = target_line_num - 1  # Convert to 0-based index
+            start_line = resolve_section_start_line(target_lines, target_line_num, target_hierarchy)
             
             if start_line >= len(target_lines):
                 thread_safe_print(f"   ❌ Line number out of range: {target_line_num} > {len(target_lines)}")
                 continue
             
             # Find section end position
-            end_line = find_section_end_for_update(target_lines, start_line, target_hierarchy)
+            end_line = find_section_end_for_update(
+                target_lines,
+                start_line,
+                target_hierarchy,
+                end_marker=target_end_marker,
+            )
             
             thread_safe_print(f"   📍 Delete range: line {start_line + 1} to {end_line}")
             thread_safe_print(f"   📄 Delete content: {target_lines[start_line].strip()[:50]}...")
@@ -1655,21 +1824,14 @@ def update_target_document_sections(all_sections, target_file_path):
                 # Intro section special handling: replace from start to first ##
                 thread_safe_print(f"   📄 Intro section mode: replacing from start to first level-2 header")
                 
-                # Find the first level-2 heading position (##)
-                first_level2_line = section_data.get('intro_section_end_line')
-                
+                # Recompute on current buffer instead of relying on stale matched line numbers.
+                first_level2_line = None
+                for i, line in enumerate(target_lines):
+                    if is_markdown_heading(line) and line.strip().startswith('## '):
+                        first_level2_line = i
+                        break
                 if first_level2_line is None:
-                    # Fallback: manually find first ## if not provided
-                    first_level2_line = 0
-                    for i, line in enumerate(target_lines):
-                        if line.strip().startswith('## '):
-                            first_level2_line = i
-                            break
-                    if first_level2_line == 0:
-                        first_level2_line = len(target_lines)
-                else:
-                    # Convert from 1-based to 0-based index
-                    first_level2_line = first_level2_line - 1 if first_level2_line > 0 else len(target_lines)
+                    first_level2_line = len(target_lines)
                 
                 thread_safe_print(f"   📍 Intro section range: line 1 to {first_level2_line}")
                 
@@ -1767,14 +1929,19 @@ def update_target_document_sections(all_sections, target_file_path):
                     target_new_content += '\n'
                 
                 # Find section end position
-                start_line = target_line_num - 1  # Convert to 0-based index
+                start_line = resolve_section_start_line(target_lines, target_line_num, target_hierarchy)
                 
                 if start_line >= len(target_lines):
                     thread_safe_print(f"   ❌ Line number out of range: {target_line_num} > {len(target_lines)}")
                     continue
                 
                 # Find section end position
-                end_line = find_section_end_for_update(target_lines, start_line, target_hierarchy)
+                end_line = find_section_end_for_update(
+                    target_lines,
+                    start_line,
+                    target_hierarchy,
+                    end_marker=target_end_marker,
+                )
                 
                 thread_safe_print(f"   📍 Replace range: line {start_line + 1} to {end_line}")
                 
@@ -1795,9 +1962,15 @@ def update_target_document_sections(all_sections, target_file_path):
     
     return True
 
-def find_section_end_for_update(lines, start_line, target_hierarchy):
+def find_section_end_for_update(lines, start_line, target_hierarchy, end_marker=None):
     """Find section end position - based on test_target_update.py logic"""
     current_line = lines[start_line].strip()
+
+    if end_marker:
+        for i in range(start_line + 1, len(lines)):
+            if end_marker in lines[i]:
+                thread_safe_print(f"     📍 End marker '{end_marker}' found at line {i + 1}")
+                return i
     
     if target_hierarchy == "frontmatter":
         # Frontmatter special handling: from --- to second ---, then to first top-level heading
