@@ -719,8 +719,14 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
         
         # Determine processing strategy based on section type and content
         if hierarchy == "intro_section" or key == "intro_section":
-            # Intro section - match to target's intro section (from start to first ##)
-            thread_safe_print(f"      📄 Intro section - matching to target intro section")
+            # Intro section - match to target's content from first # heading to first ## heading
+            thread_safe_print(f"      📄 Intro section - matching to target (# to ##)")
+            # Find the first top-level heading in target
+            first_heading_line = 0
+            for i, line in enumerate(target_lines, 1):
+                if line.strip().startswith('# '):
+                    first_heading_line = i
+                    break
             # Find the first level-2 header in target
             first_level2_line = 0
             for i, line in enumerate(target_lines, 1):
@@ -731,9 +737,9 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
                 first_level2_line = len(target_lines) + 1
             
             result = {
-                "target_line": "1",  # Intro section starts at line 1
+                "target_line": str(first_heading_line) if first_heading_line else "1",
                 "target_hierarchy": "intro_section",
-                "intro_section_end_line": first_level2_line  # Store where intro section ends
+                "intro_section_end_line": first_level2_line
             }
         elif hierarchy.startswith('bottom-added-'):
             # Bottom-added section - no matching needed, append to end
@@ -1115,22 +1121,28 @@ def extract_frontmatter_content(target_lines):
 
 def extract_intro_section_content_from_lines(target_lines):
     """
-    Extract intro section content from target lines (from start to first ##).
+    Extract intro section content from target lines: from the first
+    top-level heading (#) to the line before the first level-2 heading (##).
+    Excludes frontmatter.
     Returns: (intro_content, first_level2_line)
     """
-    intro_lines = []
-    first_level2_line = 0
-    
-    for i, line in enumerate(target_lines, 1):
-        line_stripped = line.strip()
-        if line_stripped.startswith('## '):
-            first_level2_line = i
+    start_idx = None
+    for i, line in enumerate(target_lines):
+        if line.strip().startswith('# '):
+            start_idx = i
             break
-        intro_lines.append(line.rstrip())
-    
-    if first_level2_line == 0:
-        first_level2_line = len(target_lines) + 1
-    
+
+    if start_idx is None:
+        return "", len(target_lines) + 1
+
+    intro_lines = []
+    first_level2_line = len(target_lines) + 1
+    for i in range(start_idx, len(target_lines)):
+        if target_lines[i].strip().startswith('## '):
+            first_level2_line = i + 1  # 1-based
+            break
+        intro_lines.append(target_lines[i].rstrip())
+
     intro_content = '\n'.join(intro_lines)
     return intro_content, first_level2_line
 

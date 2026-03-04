@@ -528,6 +528,52 @@ def extract_section_direct_content(lines, start_line):
     
     return '\n'.join(section_content)
 
+def find_first_heading_line(file_lines):
+    """
+    Find the 1-based line number of the first top-level heading (# ).
+    Returns 0 if no heading is found (entire file is frontmatter).
+    """
+    for i, line in enumerate(file_lines):
+        if line.strip().startswith('# '):
+            return i + 1  # 1-based
+    return 0
+
+
+def find_first_level2_line(file_lines):
+    """
+    Find the 1-based line number of the first level-2 heading (## ).
+    Returns 0 if no ## heading is found.
+    """
+    for i, line in enumerate(file_lines):
+        if line.strip().startswith('## '):
+            return i + 1
+    return 0
+
+
+def has_changes_in_range(operations, start_1based, end_1based,
+                         base_start_1based=None, base_end_1based=None):
+    """
+    Check if any operations affect lines in [start, end) (1-based).
+    Added/modified lines are checked against (start, end).
+    Deleted lines are checked against (base_start, base_end).
+    """
+    if base_start_1based is None:
+        base_start_1based = start_1based
+    if base_end_1based is None:
+        base_end_1based = end_1based
+
+    for line in operations.get('added_lines', []):
+        if start_1based <= line['line_number'] < end_1based:
+            return True
+    for line in operations.get('modified_lines', []):
+        if start_1based <= line['line_number'] < end_1based:
+            return True
+    for line in operations.get('deleted_lines', []):
+        if base_start_1based <= line['line_number'] < base_end_1based:
+            return True
+    return False
+
+
 def extract_frontmatter_content(file_lines):
     """Extract content from the beginning of file to the first top-level header"""
     if not file_lines:
@@ -546,38 +592,37 @@ def extract_frontmatter_content(file_lines):
 
 def extract_intro_section_content(file_lines):
     """
-    Extract intro section content: from start of file (including frontmatter) 
-    to the first level-2 header (##).
-    
-    Intro section typically includes:
-    - Frontmatter (YAML)
-    - Level-1 header (# Title)
-    - Introduction paragraphs
-    - Videos, images, etc.
-    
-    Returns: (intro_content, end_line_number)
+    Extract intro section content: from the first top-level heading (#)
+    to the line before the first level-2 header (##).
+    Excludes frontmatter (everything before #).
+
+    Returns: (intro_content, start_line_1based, end_line_1based)
+      - start_line_1based: line number of the first # heading
+      - end_line_1based: line number of the first ## heading (content stops before it)
+      - If no # heading found, returns ("", 0, 0)
     """
     if not file_lines:
-        return "", 0
-    
-    intro_lines = []
-    end_line = 0
-    
+        return "", 0, 0
+
+    start_idx = None
     for i, line in enumerate(file_lines):
-        line_stripped = line.strip()
-        
-        # Stop when we hit the first level-2 header (##)
-        if line_stripped.startswith('## '):
-            end_line = i + 1  # Convert to 1-based line number
+        if line.strip().startswith('# '):
+            start_idx = i
             break
-        
-        intro_lines.append(line.rstrip())
-    else:
-        # No level-2 header found, entire file is intro
-        end_line = len(file_lines)
+
+    if start_idx is None:
+        return "", 0, 0
+
+    intro_lines = []
+    end_line = len(file_lines)
+    for i in range(start_idx, len(file_lines)):
+        if file_lines[i].strip().startswith('## '):
+            end_line = i + 1  # 1-based
+            break
+        intro_lines.append(file_lines[i].rstrip())
     
     intro_content = '\n'.join(intro_lines)
-    return intro_content, end_line
+    return intro_content, start_idx + 1, end_line
 
 
 def detect_intro_section_changes(operations, file_lines):
@@ -954,21 +999,50 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
     has_intro_changes, first_level2_line = detect_intro_section_changes(operations, file_lines)
     
     if has_intro_changes:
-        print(f"   🎯 Intro section changes detected (before line {first_level2_line})")
+        print(f"   🎯 Pre-section changes detected (before line {first_level2_line})")
         
-        # Extract intro section content from both new and old files
-        new_intro_content, _ = extract_intro_section_content(file_lines)
-        old_intro_content, _ = extract_intro_section_content(base_file_lines)
+        # Independently detect frontmatter changes and intro_section changes.
+        # frontmatter  = line 1 → line before first # heading
+        # intro_section = first # heading → line before first ## heading
+        first_heading = find_first_heading_line(file_lines)
+        base_first_heading = find_first_heading_line(base_file_lines)
         
-        # Add intro section as a special entry
-        source_diff_dict["intro_section"] = {
-            "new_line_number": 1,  # Intro section always starts at line 1
-            "original_hierarchy": "intro_section",
-            "operation": "modified",
-            "new_content": new_intro_content,
-            "old_content": old_intro_content
-        }
-        print(f"   ✅ Intro section added to diff dict")
+        fm_end = first_heading if first_heading else len(file_lines) + 1
+        base_fm_end = base_first_heading if base_first_heading else len(base_file_lines) + 1
+        
+        has_fm_changes = has_changes_in_range(
+            operations, 1, fm_end, 1, base_fm_end)
+        
+        intro_start = first_heading if first_heading else first_level2_line
+        base_intro_start = base_first_heading if base_first_heading else first_level2_line
+        has_intro_body_changes = has_changes_in_range(
+            operations, intro_start, first_level2_line, base_intro_start, first_level2_line)
+        
+        if has_fm_changes:
+            print(f"   📋 Frontmatter changes detected (before first # heading)")
+            new_fm = extract_frontmatter_content(file_lines)
+            old_fm = extract_frontmatter_content(base_file_lines)
+            source_diff_dict["frontmatter"] = {
+                "new_line_number": 0,
+                "original_hierarchy": "frontmatter",
+                "operation": "modified",
+                "new_content": new_fm,
+                "old_content": old_fm
+            }
+            print(f"   ✅ Frontmatter section added to diff dict")
+        
+        if has_intro_body_changes:
+            print(f"   📝 Intro section changes detected (# to ##)")
+            new_intro, intro_start_line, _ = extract_intro_section_content(file_lines)
+            old_intro, base_intro_start_line, _ = extract_intro_section_content(base_file_lines)
+            source_diff_dict["intro_section"] = {
+                "new_line_number": intro_start_line,
+                "original_hierarchy": "intro_section",
+                "operation": "modified",
+                "new_content": new_intro,
+                "old_content": old_intro
+            }
+            print(f"   ✅ Intro section added to diff dict (from line {intro_start_line})")
         
         # Filter out all sections that are within intro section range
         # These will be handled as part of the intro section
@@ -1834,6 +1908,25 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
                 if basename == "keywords.md" and keyword_regular_only:
                     modified_entry['keyword_regular_only'] = True
                 modified_sections[file.filename] = modified_entry
+        
+        # Ensure files with frontmatter/intro_section changes in source_diff_dict
+        # get into modified_sections even when no header-based sections were affected.
+        if source_diff_dict and file.filename not in modified_sections:
+            has_frontmatter_or_intro = any(
+                k in ("frontmatter", "intro_section") for k in source_diff_dict
+            )
+            if has_frontmatter_or_intro:
+                synthetic_sections = {}
+                if "frontmatter" in source_diff_dict:
+                    synthetic_sections["0"] = "frontmatter"
+                if "intro_section" in source_diff_dict:
+                    synthetic_sections["intro_section"] = "intro_section"
+                modified_sections[file.filename] = {
+                    'sections': synthetic_sections,
+                    'original_hierarchy': all_hierarchy_dict,
+                    'current_hierarchy': all_hierarchy_dict
+                }
+                print(f"   ✏️  Added file to modified_sections via {list(synthetic_sections.values())} detection")
     
     # Process image files
     print(f"\n🖼️  Analyzing image files...")
