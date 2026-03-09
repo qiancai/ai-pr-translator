@@ -35,6 +35,10 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 AI_PROVIDER = os.getenv("AI_PROVIDER", "deepseek")
 TARGET_REPO_PATH = os.getenv("TARGET_REPO_PATH")
 
+# Cloud docs skip configuration
+SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH = os.getenv("SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH", "true").lower() == "true"
+CLOUD_FOLDER_NAME = os.getenv("CLOUD_FOLDER_NAME", "tidb-cloud")
+
 # AI configuration
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_TOKEN")
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
@@ -561,6 +565,49 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, pr
         return False
 
 
+def is_cloud_doc(file_path, cloud_folder):
+    """Check if a file path is under the cloud docs folder"""
+    return file_path.startswith(cloud_folder + "/") or file_path == cloud_folder
+
+def filter_cloud_docs(cloud_folder, added_sections, modified_sections, deleted_sections,
+                      added_files, deleted_files, toc_files, keyword_files,
+                      added_images, modified_images, deleted_images):
+    """Remove all entries under the cloud folder from every result category.
+    Returns the filtered versions of all inputs."""
+    def filter_dict(d):
+        return {k: v for k, v in d.items() if not is_cloud_doc(k, cloud_folder)}
+
+    def filter_list(lst):
+        return [item for item in lst if not is_cloud_doc(item, cloud_folder)]
+
+    skipped = []
+    for d in (added_sections, modified_sections, deleted_sections, added_files, toc_files, keyword_files):
+        for k in list(d.keys()):
+            if is_cloud_doc(k, cloud_folder):
+                skipped.append(k)
+    for lst in (deleted_files, added_images, modified_images, deleted_images):
+        for item in lst:
+            if is_cloud_doc(item, cloud_folder):
+                skipped.append(item)
+
+    if skipped:
+        print(f"\n☁️  Skipping {len(skipped)} cloud doc entries under '{cloud_folder}/':")
+        for s in skipped:
+            print(f"   ⏭️  {s}")
+
+    return (
+        filter_dict(added_sections),
+        filter_dict(modified_sections),
+        filter_dict(deleted_sections),
+        filter_dict(added_files),
+        filter_list(deleted_files),
+        filter_dict(toc_files),
+        filter_dict(keyword_files),
+        filter_list(added_images),
+        filter_list(modified_images),
+        filter_list(deleted_images),
+    )
+
 def get_workflow_repo_config(pr_url, repo_configs):
     """Get repository configuration for workflow environment"""
     from pr_analyzer import parse_pr_url
@@ -641,6 +688,18 @@ def main():
         max_non_system_sections=MAX_NON_SYSTEM_SECTIONS_FOR_AI,
         pr_diff=pr_diff  # Pass the PR diff to avoid re-fetching
     )
+    
+    # Filter out cloud docs when translating to Chinese
+    if SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH and repo_config.get('target_language') == 'Chinese':
+        print(f"\n☁️  SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH is enabled, filtering '{CLOUD_FOLDER_NAME}/' docs...")
+        (added_sections, modified_sections, deleted_sections,
+         added_files, deleted_files, toc_files, keyword_files,
+         added_images, modified_images, deleted_images) = filter_cloud_docs(
+            CLOUD_FOLDER_NAME,
+            added_sections, modified_sections, deleted_sections,
+            added_files, deleted_files, toc_files, keyword_files,
+            added_images, modified_images, deleted_images
+        )
     
     # Step 3: Process different types of files based on operation type
     print(f"\n📋 Step 3: Processing files based on operation type...")

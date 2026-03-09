@@ -3,10 +3,13 @@ Main Entry Point
 Orchestrates the entire auto-sync workflow
 """
 
-SOURCE_PR_URL = "https://github.com/pingcap/docs/pull/22502"
+SOURCE_PR_URL = "https://github.com/pingcap/docs/pull/22543"
 AI_PROVIDER = "deepseek"  # Options: "deepseek", "gemini"
 zh_doc_local_path = "/Users/grcai/Documents/GitHub/docs-cn"
 en_doc_local_path = "/Users/grcai/Documents/GitHub/docs"
+
+SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH = True
+CLOUD_FOLDER_NAME = "tidb-cloud"
 
 import sys
 import os
@@ -567,6 +570,49 @@ def get_local_repo_config(pr_url):
     
     return config
 
+def is_cloud_doc(file_path, cloud_folder):
+    """Check if a file path is under the cloud docs folder"""
+    return file_path.startswith(cloud_folder + "/") or file_path == cloud_folder
+
+def filter_cloud_docs(cloud_folder, added_sections, modified_sections, deleted_sections,
+                      added_files, deleted_files, toc_files, keyword_files,
+                      added_images, modified_images, deleted_images):
+    """Remove all entries under the cloud folder from every result category.
+    Returns the filtered versions of all inputs."""
+    def filter_dict(d):
+        return {k: v for k, v in d.items() if not is_cloud_doc(k, cloud_folder)}
+
+    def filter_list(lst):
+        return [item for item in lst if not is_cloud_doc(item, cloud_folder)]
+
+    skipped = []
+    for d in (added_sections, modified_sections, deleted_sections, added_files, toc_files, keyword_files):
+        for k in list(d.keys()):
+            if is_cloud_doc(k, cloud_folder):
+                skipped.append(k)
+    for lst in (deleted_files, added_images, modified_images, deleted_images):
+        for item in lst:
+            if is_cloud_doc(item, cloud_folder):
+                skipped.append(item)
+
+    if skipped:
+        print(f"\n☁️  Skipping {len(skipped)} cloud doc entries under '{cloud_folder}/':")
+        for s in skipped:
+            print(f"   ⏭️  {s}")
+
+    return (
+        filter_dict(added_sections),
+        filter_dict(modified_sections),
+        filter_dict(deleted_sections),
+        filter_dict(added_files),
+        filter_list(deleted_files),
+        filter_dict(toc_files),
+        filter_dict(keyword_files),
+        filter_list(added_images),
+        filter_list(modified_images),
+        filter_list(deleted_images),
+    )
+
 def main():
     """Main function - orchestrates the entire workflow"""
     pr_url = sys.argv[1] if len(sys.argv) > 1 else SOURCE_PR_URL
@@ -621,7 +667,17 @@ def main():
         pr_diff=pr_diff  # Pass the PR diff to avoid re-fetching
     )
     
-
+    # Filter out cloud docs when translating to Chinese
+    if SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH and repo_config.get('target_language') == 'Chinese':
+        print(f"\n☁️  SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH is enabled, filtering '{CLOUD_FOLDER_NAME}/' docs...")
+        (added_sections, modified_sections, deleted_sections,
+         added_files, deleted_files, toc_files, keyword_files,
+         added_images, modified_images, deleted_images) = filter_cloud_docs(
+            CLOUD_FOLDER_NAME,
+            added_sections, modified_sections, deleted_sections,
+            added_files, deleted_files, toc_files, keyword_files,
+            added_images, modified_images, deleted_images
+        )
     
     # Step 3: Process different types of files based on operation type
     print(f"\n📋 Step 3: Processing files based on operation type...")
