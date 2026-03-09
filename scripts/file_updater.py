@@ -209,8 +209,20 @@ def line_has_any_token(line, tokens):
     return any(token in line for token in tokens)
 
 
+def _is_small_edit(old_line, new_line, threshold=0.65):
+    """Return True if two lines are similar enough that the edit is small/targeted."""
+    if old_line is None or new_line is None:
+        return False
+    ratio = difflib.SequenceMatcher(None, old_line, new_line).ratio()
+    return ratio >= threshold
+
+
 def filter_target_update_with_tokens(original_text, updated_text, tokens):
-    """Keep only updated target lines that are related to changed source tokens."""
+    """Keep only updated target lines that are related to changed source tokens.
+
+    Small, targeted edits (high line similarity) are always allowed through
+    so that cross-language natural-language changes are not reverted.
+    """
     if not tokens or original_text == updated_text:
         return updated_text
 
@@ -235,7 +247,8 @@ def filter_target_update_with_tokens(original_text, updated_text, tokens):
 
                 if new_line is not None and (
                     line_has_any_token(new_line, tokens) or
-                    (old_line is not None and line_has_any_token(old_line, tokens))
+                    (old_line is not None and line_has_any_token(old_line, tokens)) or
+                    _is_small_edit(old_line, new_line)
                 ):
                     merged.append(new_line)
                 elif old_line is not None:
