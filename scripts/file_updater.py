@@ -275,6 +275,9 @@ def enforce_source_token_scoped_updates(target_sections, updated_sections, enhan
     guarded = {}
     for key, updated_text in updated_sections.items():
         original_text = target_sections.get(key, "")
+        if not original_text:
+            guarded[key] = updated_text
+            continue
         source_info = enhanced_sections.get(key, {}) if isinstance(enhanced_sections, dict) else {}
         source_old = source_info.get("source_old_content", "")
         source_new = source_info.get("source_new_content", "")

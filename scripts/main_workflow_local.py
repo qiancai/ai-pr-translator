@@ -3,8 +3,8 @@ Main Entry Point
 Orchestrates the entire auto-sync workflow
 """
 
-SOURCE_PR_URL = "https://github.com/pingcap/docs/pull/22543"
-AI_PROVIDER = "deepseek"  # Options: "deepseek", "gemini"
+SOURCE_PR_URL = "https://github.com/pingcap/docs-cn/pull/21434"
+AI_PROVIDER = "deepseek"  # Options: "deepseek", "gemini", "openai"
 zh_doc_local_path = "/Users/grcai/Documents/GitHub/docs-cn"
 en_doc_local_path = "/Users/grcai/Documents/GitHub/docs"
 
@@ -41,14 +41,17 @@ from image_processor import process_all_images
 REPO_OWNER = SOURCE_PR_URL.split("/")[3]
 
 # AI configuration
-# To switch AI providers, change AI_PROVIDER to "deepseek" or "gemini"
+# To switch AI providers, change AI_PROVIDER to "deepseek", "gemini", or "openai"
 # For Gemini: Set GEMINI_API_TOKEN environment variable
 # For DeepSeek: Set DEEPSEEK_API_TOKEN environment variable
+# For OpenAI: Set OPENAI_API_TOKEN environment variable
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_TOKEN")
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 GEMINI_API_KEY = os.getenv("GEMINI_API_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GEMINI_MODEL_NAME = "gemini-3-flash-preview"
+OPENAI_MODEL_NAME = "gpt-4.1"
 
 # Processing limit configuration
 MAX_NON_SYSTEM_SECTIONS_FOR_AI = 120
@@ -57,9 +60,11 @@ SOURCE_TOKEN_LIMIT = 50000  # Maximum tokens for source new_content before skipp
 # AI configuration - Provider-specific limits
 AI_MAX_TOKENS_DEEPSEEK = 8192   # DeepSeek maximum output tokens (hard limit)
 AI_MAX_TOKENS_GEMINI = 8192     # Gemini maximum output tokens (can go higher but 8K is safe)
+AI_MAX_TOKENS_OPENAI = 16384    # OpenAI GPT-4.1 maximum output tokens
 PROVIDER_MAX_TOKENS = {
     "deepseek": AI_MAX_TOKENS_DEEPSEEK,
-    "gemini": AI_MAX_TOKENS_GEMINI
+    "gemini": AI_MAX_TOKENS_GEMINI,
+    "openai": AI_MAX_TOKENS_OPENAI
 }
 AI_MAX_TOKENS = PROVIDER_MAX_TOKENS.get(AI_PROVIDER, AI_MAX_TOKENS_DEEPSEEK)  # Set based on provider
 
@@ -163,6 +168,13 @@ class UnifiedAIClient:
             self.client = genai.Client(api_key=GEMINI_API_KEY)
             self.model = GEMINI_MODEL_NAME
             self.max_tokens = AI_MAX_TOKENS_GEMINI
+        elif provider == "openai":
+            from openai import OpenAI
+            if not OPENAI_API_KEY:
+                raise ValueError("OPENAI_API_TOKEN environment variable must be set")
+            self.client = OpenAI(api_key=OPENAI_API_KEY)
+            self.model = OPENAI_MODEL_NAME
+            self.max_tokens = AI_MAX_TOKENS_OPENAI
         else:
             raise ValueError(f"Unsupported AI provider: {provider}")
     
@@ -174,7 +186,7 @@ class UnifiedAIClient:
         # Ensure max_tokens doesn't exceed provider limit
         max_tokens = min(max_tokens, self.max_tokens)
         
-        if self.provider == "deepseek":
+        if self.provider in ("deepseek", "openai"):
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
