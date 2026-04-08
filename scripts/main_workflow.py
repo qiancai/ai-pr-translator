@@ -35,16 +35,20 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 AI_PROVIDER = os.getenv("AI_PROVIDER", "deepseek")
 TARGET_REPO_PATH = os.getenv("TARGET_REPO_PATH")
 
-# Cloud docs skip configuration
+# Skip dealing with cloud docs when translating to Chinese
 SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH = os.getenv("SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH", "true").lower() == "true"
 CLOUD_FOLDER_NAME = os.getenv("CLOUD_FOLDER_NAME", "tidb-cloud")
+
+# Skip dealing with AI docs when translating to Chinese
+SKIP_TRANSLATING_AI_DOCS_TO_ZH = os.getenv("SKIP_TRANSLATING_AI_DOCS_TO_ZH", "true").lower() == "true"
+AI_DOCS_FOLDER_NAME = os.getenv("AI_DOCS_FOLDER_NAME", "ai")
 
 # AI configuration
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_TOKEN")
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 GEMINI_API_KEY = os.getenv("GEMINI_API_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_TOKEN")
-GEMINI_MODEL_NAME = "gemini-2.5-flash-lite" #gemini-3-flash-preview
+GEMINI_MODEL_NAME = "gemini-3.1-flash-lite-preview" #gemini-2.5-flash-lite
 OPENAI_MODEL_NAME = "gpt-4.1"
 
 # Processing limit configuration
@@ -575,33 +579,37 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, pr
         return False
 
 
-def is_cloud_doc(file_path, cloud_folder):
-    """Check if a file path is under the cloud docs folder"""
-    return file_path.startswith(cloud_folder + "/") or file_path == cloud_folder
+def is_under_exclude_folder(file_path, folder_name):
+    """Check if a file path is under the given folder"""
+    return file_path.startswith(folder_name + "/") or file_path == folder_name
 
-def filter_cloud_docs(cloud_folder, added_sections, modified_sections, deleted_sections,
-                      added_files, deleted_files, toc_files, keyword_files,
-                      added_images, modified_images, deleted_images):
-    """Remove all entries under the cloud folder from every result category.
+def filter_docs_by_folder(folder_name, added_sections, modified_sections, deleted_sections,
+                          added_files, deleted_files, toc_files, keyword_files,
+                          added_images, modified_images, deleted_images,
+                          label=None):
+    """Remove all entries under the given folder from every result category.
     Returns the filtered versions of all inputs."""
+    if label is None:
+        label = folder_name
+
     def filter_dict(d):
-        return {k: v for k, v in d.items() if not is_cloud_doc(k, cloud_folder)}
+        return {k: v for k, v in d.items() if not is_under_exclude_folder(k, folder_name)}
 
     def filter_list(lst):
-        return [item for item in lst if not is_cloud_doc(item, cloud_folder)]
+        return [item for item in lst if not is_under_exclude_folder(item, folder_name)]
 
     skipped = []
     for d in (added_sections, modified_sections, deleted_sections, added_files, toc_files, keyword_files):
         for k in list(d.keys()):
-            if is_cloud_doc(k, cloud_folder):
+            if is_under_exclude_folder(k, folder_name):
                 skipped.append(k)
     for lst in (deleted_files, added_images, modified_images, deleted_images):
         for item in lst:
-            if is_cloud_doc(item, cloud_folder):
+            if is_under_exclude_folder(item, folder_name):
                 skipped.append(item)
 
     if skipped:
-        print(f"\n☁️  Skipping {len(skipped)} cloud doc entries under '{cloud_folder}/':")
+        print(f"\n🚫 Skipping {len(skipped)} {label} doc entries under '{folder_name}/':")
         for s in skipped:
             print(f"   ⏭️  {s}")
 
@@ -704,11 +712,25 @@ def main():
         print(f"\n☁️  SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH is enabled, filtering '{CLOUD_FOLDER_NAME}/' docs...")
         (added_sections, modified_sections, deleted_sections,
          added_files, deleted_files, toc_files, keyword_files,
-         added_images, modified_images, deleted_images) = filter_cloud_docs(
+         added_images, modified_images, deleted_images) = filter_docs_by_folder(
             CLOUD_FOLDER_NAME,
             added_sections, modified_sections, deleted_sections,
             added_files, deleted_files, toc_files, keyword_files,
-            added_images, modified_images, deleted_images
+            added_images, modified_images, deleted_images,
+            label="cloud"
+        )
+
+    # Filter out AI docs when translating to Chinese
+    if SKIP_TRANSLATING_AI_DOCS_TO_ZH and repo_config.get('target_language') == 'Chinese':
+        print(f"\n🤖 SKIP_TRANSLATING_AI_DOCS_TO_ZH is enabled, filtering '{AI_DOCS_FOLDER_NAME}/' docs...")
+        (added_sections, modified_sections, deleted_sections,
+         added_files, deleted_files, toc_files, keyword_files,
+         added_images, modified_images, deleted_images) = filter_docs_by_folder(
+            AI_DOCS_FOLDER_NAME,
+            added_sections, modified_sections, deleted_sections,
+            added_files, deleted_files, toc_files, keyword_files,
+            added_images, modified_images, deleted_images,
+            label="AI"
         )
     
     # Step 3: Process different types of files based on operation type
