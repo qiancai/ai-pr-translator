@@ -6,6 +6,7 @@ Orchestrates the entire auto-sync workflow in GitHub Actions environment
 import sys
 import os
 import json
+import subprocess
 import threading
 import tiktoken
 import time
@@ -142,6 +143,18 @@ def clean_temp_output_dir():
     os.makedirs(temp_dir, exist_ok=True)
     print(f"📁 Created temp_output directory: {temp_dir}")
     return temp_dir
+
+def git_add_changes(target_repo_path):
+    """Stage all current changes in the target repo so they survive a later failure."""
+    result = subprocess.run(
+        ["git", "add", "."],
+        cwd=target_repo_path,
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        print(f"   ✅ git add . completed in {target_repo_path}")
+    else:
+        print(f"   ❌ git add . failed: {result.stderr}")
 
 def estimate_tokens(text):
     """Calculate accurate token count using tiktoken (GPT-4/3.5 encoding)"""
@@ -746,11 +759,14 @@ def main():
         print(f"\n🗑️  Step 3.1: Processing {len(deleted_files)} deleted files...")
         process_deleted_files(deleted_files, github_client, repo_config)
         print(f"   ✅ Deleted files processed")
+        git_add_changes(TARGET_REPO_PATH)
     
-    # Step 3.2: Process added files (file-level additions)
+    # Step 3.2: Process added files (file-level additions) one by one
     if added_files:
         print(f"\n📄 Step 3.2: Processing {len(added_files)} added files...")
-        process_added_files(added_files, SOURCE_PR_URL, github_client, ai_client, repo_config)
+        for file_path, file_content in added_files.items():
+            process_added_files({file_path: file_content}, SOURCE_PR_URL, github_client, ai_client, repo_config)
+            git_add_changes(TARGET_REPO_PATH)
         print(f"   ✅ Added files processed")
     
     # Step 3.3: Process special files (TOC.md and similar)
@@ -758,6 +774,7 @@ def main():
         print(f"\n📋 Step 3.3: Processing {len(toc_files)} special files (TOC)...")
         process_toc_files(toc_files, SOURCE_PR_URL, github_client, ai_client, repo_config)
         print(f"   ✅ Special files processed")
+        git_add_changes(TARGET_REPO_PATH)
     
     # Step 3.3b: Process keyword files (keywords.md)
     if keyword_files:
@@ -767,6 +784,7 @@ def main():
             print("   ❌ Keyword files processing failed, exiting workflow")
             return
         print(f"   ✅ Keyword files processed")
+        git_add_changes(TARGET_REPO_PATH)
     
     # Step 3.4: Process modified files (section-level modifications)
     if modified_sections:
@@ -814,6 +832,7 @@ def main():
                 
                 if success:
                     print(f"   ✅ Successfully processed {source_file_path}")
+                    git_add_changes(TARGET_REPO_PATH)
                 else:
                     print(f"   ❌ Failed to process {source_file_path}")
             
@@ -825,6 +844,7 @@ def main():
         print(f"\n🖼️  Step 3.5: Processing images...")
         process_all_images(added_images, modified_images, deleted_images, SOURCE_PR_URL, github_client, repo_config)
         print(f"   ✅ Images processed")
+        git_add_changes(TARGET_REPO_PATH)
     
     # Final summary
     print(f"\n" + "="*80)
