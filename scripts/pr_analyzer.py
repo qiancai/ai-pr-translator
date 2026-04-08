@@ -1320,14 +1320,21 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
     
     return source_diff_dict
 
-def analyze_source_changes(pr_url, github_client, special_files=None, ignore_files=None, repo_configs=None, max_non_system_sections=120, pr_diff=None):
-    """Analyze source language changes and categorize them as added, modified, or deleted"""
+def analyze_source_changes(pr_url, github_client, special_files=None, ignore_files=None, repo_configs=None, max_non_system_sections=120, pr_diff=None, exclude_folders=None):
+    """Analyze source language changes and categorize them as added, modified, or deleted
+    
+    Args:
+        exclude_folders: list of folder names to skip entirely (e.g. ["tidb-cloud", "ai"])
+    """
     # Import modules needed in this function
     import os
     import json
     from toc_processor import process_toc_operations
     from keword_processor import find_tabs_region, parse_letter_blocks, diff_changed_letters
     from image_processor import is_image_file
+    
+    if exclude_folders is None:
+        exclude_folders = []
     
     owner, repo, pr_number = parse_pr_url(pr_url)
     repository = github_client.get_repo(f"{owner}/{repo}")
@@ -1347,6 +1354,22 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
     
     print(f"📄 Found {len(markdown_files)} markdown files")
     print(f"🖼️  Found {len(image_files)} image files")
+    
+    if exclude_folders:
+        def _is_excluded(path):
+            return any(path.startswith(folder + "/") or path == folder for folder in exclude_folders)
+        
+        excluded_md = [f for f in markdown_files if _is_excluded(f.filename)]
+        excluded_img = [f for f in image_files if _is_excluded(f.filename)]
+        markdown_files = [f for f in markdown_files if not _is_excluded(f.filename)]
+        image_files = [f for f in image_files if not _is_excluded(f.filename)]
+        
+        if excluded_md or excluded_img:
+            print(f"🚫 Early exclusion: skipped {len(excluded_md)} markdown + {len(excluded_img)} image files under {exclude_folders}")
+            for f in excluded_md:
+                print(f"   ⏭️  {f.filename}")
+            for f in excluded_img:
+                print(f"   ⏭️  {f.filename}")
     
     # Return dictionaries for different operation types
     added_sections = {}      # New sections that were added

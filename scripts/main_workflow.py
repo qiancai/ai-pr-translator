@@ -709,6 +709,13 @@ def main():
         return
     print(f"✅ Got PR diff: {len(pr_diff)} characters")
     
+    # Build list of folders to exclude early (before expensive per-file processing)
+    exclude_folders = []
+    if SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH and repo_config.get('target_language') == 'Chinese':
+        exclude_folders.append(CLOUD_FOLDER_NAME)
+    if SKIP_TRANSLATING_AI_DOCS_TO_ZH and repo_config.get('target_language') == 'Chinese':
+        exclude_folders.append(AI_DOCS_FOLDER_NAME)
+    
     # Step 2: Analyze source changes with operation categorization
     print(f"\n📊 Step 2: Analyzing source changes...")
     added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images = analyze_source_changes(
@@ -717,34 +724,9 @@ def main():
         ignore_files=IGNORE_FILES, 
         repo_configs=repo_configs,
         max_non_system_sections=MAX_NON_SYSTEM_SECTIONS_FOR_AI,
-        pr_diff=pr_diff  # Pass the PR diff to avoid re-fetching
+        pr_diff=pr_diff,
+        exclude_folders=exclude_folders,
     )
-    
-    # Filter out cloud docs when translating to Chinese
-    if SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH and repo_config.get('target_language') == 'Chinese':
-        print(f"\n☁️  SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH is enabled, filtering '{CLOUD_FOLDER_NAME}/' docs...")
-        (added_sections, modified_sections, deleted_sections,
-         added_files, deleted_files, toc_files, keyword_files,
-         added_images, modified_images, deleted_images) = filter_docs_by_folder(
-            CLOUD_FOLDER_NAME,
-            added_sections, modified_sections, deleted_sections,
-            added_files, deleted_files, toc_files, keyword_files,
-            added_images, modified_images, deleted_images,
-            label="cloud"
-        )
-
-    # Filter out AI docs when translating to Chinese
-    if SKIP_TRANSLATING_AI_DOCS_TO_ZH and repo_config.get('target_language') == 'Chinese':
-        print(f"\n🤖 SKIP_TRANSLATING_AI_DOCS_TO_ZH is enabled, filtering '{AI_DOCS_FOLDER_NAME}/' docs...")
-        (added_sections, modified_sections, deleted_sections,
-         added_files, deleted_files, toc_files, keyword_files,
-         added_images, modified_images, deleted_images) = filter_docs_by_folder(
-            AI_DOCS_FOLDER_NAME,
-            added_sections, modified_sections, deleted_sections,
-            added_files, deleted_files, toc_files, keyword_files,
-            added_images, modified_images, deleted_images,
-            label="AI"
-        )
     
     # Step 3: Process different types of files based on operation type
     print(f"\n📋 Step 3: Processing files based on operation type...")
