@@ -3,8 +3,8 @@ Main Entry Point
 Orchestrates the entire auto-sync workflow
 """
 
-SOURCE_PR_URL = "https://github.com/pingcap/docs/pull/22542"
-AI_PROVIDER = "deepseek"  # Options: "deepseek", "gemini", "openai"
+SOURCE_PR_URL = "https://github.com/pingcap/docs-cn/pull/21434"
+AI_PROVIDER = "azure"  # Options: "deepseek", "gemini", "openai", "azure"
 zh_doc_local_path = "/Users/grcai/Documents/GitHub/docs-cn"
 en_doc_local_path = "/Users/grcai/Documents/GitHub/docs"
 
@@ -17,20 +17,11 @@ AI_DOCS_FOLDER_NAME = "ai"
 import sys
 import os
 import json
-import threading
 import tiktoken
-import time
 from github import Github
-#from google import genai
-
-# Conditional import for Gemini
-try:
-    from google import genai
-    GEMINI_AVAILABLE = True
-except ImportError:
-    GEMINI_AVAILABLE = False
 
 # Import all modules
+from ai_client import UnifiedAIClient, thread_safe_print, print_lock, PROVIDER_MAX_TOKENS
 from pr_analyzer import analyze_source_changes, get_repo_config, get_target_hierarchy_and_content
 from file_adder import process_added_files
 from file_deleter import process_deleted_files
@@ -43,33 +34,12 @@ from image_processor import process_all_images
 # extract the repo owner from the SOURCE_PR_URL
 REPO_OWNER = SOURCE_PR_URL.split("/")[3]
 
-# AI configuration
-# To switch AI providers, change AI_PROVIDER to "deepseek", "gemini", or "openai"
-# For Gemini: Set GEMINI_API_TOKEN environment variable
-# For DeepSeek: Set DEEPSEEK_API_TOKEN environment variable
-# For OpenAI: Set OPENAI_API_TOKEN environment variable
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_TOKEN")
-DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-GEMINI_API_KEY = os.getenv("GEMINI_API_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GEMINI_MODEL_NAME = "gemini-3-flash-preview"
-OPENAI_MODEL_NAME = "gpt-4.1"
 
 # Processing limit configuration
 MAX_NON_SYSTEM_SECTIONS_FOR_AI = 120
 SOURCE_TOKEN_LIMIT = 50000  # Maximum tokens for source new_content before skipping file processing
-
-# AI configuration - Provider-specific limits
-AI_MAX_TOKENS_DEEPSEEK = 8192   # DeepSeek maximum output tokens (hard limit)
-AI_MAX_TOKENS_GEMINI = 8192     # Gemini maximum output tokens (can go higher but 8K is safe)
-AI_MAX_TOKENS_OPENAI = 16384    # OpenAI GPT-4.1 maximum output tokens
-PROVIDER_MAX_TOKENS = {
-    "deepseek": AI_MAX_TOKENS_DEEPSEEK,
-    "gemini": AI_MAX_TOKENS_GEMINI,
-    "openai": AI_MAX_TOKENS_OPENAI
-}
-AI_MAX_TOKENS = PROVIDER_MAX_TOKENS.get(AI_PROVIDER, AI_MAX_TOKENS_DEEPSEEK)  # Set based on provider
+AI_MAX_TOKENS = PROVIDER_MAX_TOKENS.get(AI_PROVIDER, 8192)
 
 # Special file configuration
 SPECIAL_FILES = ["TOC.md", "keywords.md"]
@@ -92,18 +62,6 @@ REPO_CONFIGS = {
         "target_language": "English"
     }
 }
-
-# Thread-safe printing function
-print_lock = threading.Lock()
-
-def thread_safe_print(*args, **kwargs):
-    with print_lock:
-        print(*args, **kwargs)
-
-# Simple rate limiting for Gemini free tier (5 RPM)
-gemini_call_count = 0
-GEMINI_RATE_LIMIT_CALLS = 10  # Number of calls before sleeping
-GEMINI_RATE_LIMIT_SLEEP = 30  # Seconds to sleep after reaching limit
 
 def ensure_temp_output_dir():
     """Ensure the temp_output directory exists"""
@@ -152,95 +110,6 @@ def print_token_estimation(prompt_text, context="AI translation"):
     thread_safe_print(f"      📝 Input: {char_count:,} characters")
     thread_safe_print(f"      🔢 Actual tokens: {actual_tokens:,} (using tiktoken cl100k_base)")
     return actual_tokens
-
-class UnifiedAIClient:
-    """Unified interface for different AI providers"""
-    
-    def __init__(self, provider="deepseek"):
-        self.provider = provider
-        if provider == "deepseek":
-            from openai import OpenAI
-            self.client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
-            self.model = "deepseek-chat"
-            self.max_tokens = AI_MAX_TOKENS_DEEPSEEK
-        elif provider == "gemini":
-            if not GEMINI_AVAILABLE:
-                raise ImportError("google.generativeai package not installed. Run: pip install google-generativeai")
-            if not GEMINI_API_KEY:
-                raise ValueError("GEMINI_API_TOKEN environment variable must be set")
-            self.client = genai.Client(api_key=GEMINI_API_KEY)
-            self.model = GEMINI_MODEL_NAME
-            self.max_tokens = AI_MAX_TOKENS_GEMINI
-        elif provider == "openai":
-            from openai import OpenAI
-            if not OPENAI_API_KEY:
-                raise ValueError("OPENAI_API_TOKEN environment variable must be set")
-            self.client = OpenAI(api_key=OPENAI_API_KEY)
-            self.model = OPENAI_MODEL_NAME
-            self.max_tokens = AI_MAX_TOKENS_OPENAI
-        else:
-            raise ValueError(f"Unsupported AI provider: {provider}")
-    
-    def chat_completion(self, messages, temperature=0.1, max_tokens=None):
-        """Unified chat completion interface"""
-        # Use provider-specific max_tokens if not explicitly provided
-        if max_tokens is None:
-            max_tokens = self.max_tokens
-        # Ensure max_tokens doesn't exceed provider limit
-        max_tokens = min(max_tokens, self.max_tokens)
-        
-        if self.provider in ("deepseek", "openai"):
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens
-            )
-            return response.choices[0].message.content.strip()
-        elif self.provider == "gemini":
-            global gemini_call_count
-            try:
-                # Simple rate limiting: sleep after every N calls
-                gemini_call_count += 1
-                if gemini_call_count > GEMINI_RATE_LIMIT_CALLS:
-                    thread_safe_print(f"   ⏳ Rate limit: {GEMINI_RATE_LIMIT_CALLS} calls reached, sleeping {GEMINI_RATE_LIMIT_SLEEP}s...")
-                    time.sleep(GEMINI_RATE_LIMIT_SLEEP)
-                    gemini_call_count = 1  # Reset counter
-                
-                # Convert OpenAI-style messages to Gemini format
-                prompt = self._convert_messages_to_prompt(messages)
-                thread_safe_print(f"   🔄 Calling Gemini API ({gemini_call_count}/{GEMINI_RATE_LIMIT_CALLS})...")
-                
-                # Use the correct Gemini API call format (based on your reference file)
-                response = self.client.models.generate_content(
-                    model=self.model, 
-                    contents=prompt
-                )
-                
-                if response and response.text:
-                    thread_safe_print(f"   ✅ Gemini response received")
-                    return response.text.strip()
-                else:
-                    thread_safe_print(f"   ⚠️  Gemini response was empty or blocked")
-                    return "No response from Gemini"
-                    
-            except Exception as e:
-                thread_safe_print(f"   ❌ Gemini API error: {str(e)}")
-                # Fallback: suggest switching to DeepSeek
-                thread_safe_print(f"   💡 Consider switching to DeepSeek in main.py: AI_PROVIDER = 'deepseek'")
-                raise e
-    
-    def _convert_messages_to_prompt(self, messages):
-        """Convert OpenAI-style messages to a single prompt for Gemini"""
-        prompt_parts = []
-        for message in messages:
-            role = message.get("role", "user")
-            content = message.get("content", "")
-            if role == "user":
-                prompt_parts.append(content)
-            elif role == "system":
-                prompt_parts.append(f"System: {content}")
-        return "\n\n".join(prompt_parts)
 
 def check_source_token_limit(source_diff_dict_file, token_limit=SOURCE_TOKEN_LIMIT):
     """Check if the total tokens of all new_content in source-diff-dict exceeds the limit"""
