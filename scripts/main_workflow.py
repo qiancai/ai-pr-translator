@@ -20,6 +20,7 @@ from file_updater import process_files_in_batches, process_added_sections, proce
 from toc_processor import process_toc_files
 from keword_processor import process_keyword_files
 from section_matcher import match_source_diff_to_target
+from glossary import load_glossary, create_glossary_matcher
 
 # Configuration from environment variables
 SOURCE_PR_URL = os.getenv("SOURCE_PR_URL")
@@ -35,6 +36,9 @@ CLOUD_FOLDER_NAME = os.getenv("CLOUD_FOLDER_NAME", "tidb-cloud")
 # Skip dealing with AI docs when translating to Chinese
 SKIP_TRANSLATING_AI_DOCS_TO_ZH = os.getenv("SKIP_TRANSLATING_AI_DOCS_TO_ZH", "true").lower() == "true"
 AI_DOCS_FOLDER_NAME = os.getenv("AI_DOCS_FOLDER_NAME", "ai")
+
+# Glossary terms path (optional, defaults to resources/terms.md in the docs repo)
+TERMS_PATH = os.getenv("TERMS_PATH", "")
 
 # Processing limit configuration
 MAX_NON_SYSTEM_SECTIONS_FOR_AI = 120
@@ -318,7 +322,7 @@ def determine_file_processing_type(source_file_path, file_sections, special_file
     # For all other modified files, use regular processing
     return "regular_modified"
 
-def process_regular_modified_file(source_file_path, file_sections, file_diff, pr_url, github_client, ai_client, repo_config, max_sections):
+def process_regular_modified_file(source_file_path, file_sections, file_diff, pr_url, github_client, ai_client, repo_config, max_sections, glossary_matcher=None):
     """Process a regular markdown file that has been modified"""
     try:
         print(f"   📝 Processing as regular modified file: {source_file_path}")
@@ -414,7 +418,7 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, pr
         }
         
         # Call the existing process_modified_sections function to get AI translation
-        results = process_modified_sections(file_data, file_diff, pr_url, github_client, ai_client, repo_config, max_sections)
+        results = process_modified_sections(file_data, file_diff, pr_url, github_client, ai_client, repo_config, max_sections, glossary_matcher=glossary_matcher)
         
         # Step 3: Update match_source_diff_to_target.json with AI results
         if results and len(results) > 0:
@@ -579,6 +583,16 @@ def main():
         thread_safe_print(f"❌ Failed to initialize AI client: {e}")
         return
     
+    # Load glossary and create matcher for term-aware translation
+    terms_path = TERMS_PATH
+    if not terms_path and TARGET_REPO_PATH:
+        candidate = os.path.join(TARGET_REPO_PATH, "resources", "terms.md")
+        if os.path.exists(candidate):
+            terms_path = candidate
+    print(f"\n📚 Loading glossary from: {terms_path or '(not configured)'}")
+    glossary = load_glossary(terms_path) if terms_path else []
+    glossary_matcher = create_glossary_matcher(glossary)
+    
     print(f"\n🚀 Starting auto-sync for PR: {SOURCE_PR_URL}")
     
     # Step 1: Get PR diff
@@ -627,7 +641,7 @@ def main():
     if added_files:
         print(f"\n📄 Step 3.2: Processing {len(added_files)} added files...")
         for file_path, file_content in added_files.items():
-            process_added_files({file_path: file_content}, SOURCE_PR_URL, github_client, ai_client, repo_config)
+            process_added_files({file_path: file_content}, SOURCE_PR_URL, github_client, ai_client, repo_config, glossary_matcher=glossary_matcher)
             git_add_changes(TARGET_REPO_PATH)
         print(f"   ✅ Added files processed")
     
@@ -689,7 +703,8 @@ def main():
                     github_client, 
                     ai_client, 
                     repo_config, 
-                    MAX_NON_SYSTEM_SECTIONS_FOR_AI
+                    MAX_NON_SYSTEM_SECTIONS_FOR_AI,
+                    glossary_matcher=glossary_matcher
                 )
                 
                 if success:

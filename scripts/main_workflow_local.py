@@ -7,12 +7,15 @@ SOURCE_PR_URL = "https://github.com/pingcap/docs-cn/pull/21434"
 AI_PROVIDER = "azure"  # Options: "deepseek", "gemini", "openai", "azure"
 zh_doc_local_path = "/Users/grcai/Documents/GitHub/docs-cn"
 en_doc_local_path = "/Users/grcai/Documents/GitHub/docs"
+terms_path = "/Users/grcai/Documents/GitHub/docs/resources/terms.md"
 
 SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH = True
 CLOUD_FOLDER_NAME = "tidb-cloud"
 
 SKIP_TRANSLATING_AI_DOCS_TO_ZH = True
 AI_DOCS_FOLDER_NAME = "ai"
+
+STOP_AFTER_PROMPTS_READY = False  # Set True to generate prompts without calling AI
 
 import sys
 import os
@@ -30,6 +33,7 @@ from toc_processor import process_toc_files
 from keword_processor import process_keyword_files
 from section_matcher import match_source_diff_to_target
 from image_processor import process_all_images
+from glossary import load_glossary, create_glossary_matcher
 
 # extract the repo owner from the SOURCE_PR_URL
 REPO_OWNER = SOURCE_PR_URL.split("/")[3]
@@ -284,7 +288,7 @@ def determine_file_processing_type(source_file_path, file_sections, special_file
     # For all other modified files, use regular processing
     return "regular_modified"
 
-def process_regular_modified_file(source_file_path, file_sections, file_diff, pr_url, github_client, ai_client, repo_config, max_sections):
+def process_regular_modified_file(source_file_path, file_sections, file_diff, pr_url, github_client, ai_client, repo_config, max_sections, glossary_matcher=None, dry_run=False):
     """Process a regular markdown file that has been modified"""
     try:
         print(f"   📝 Processing as regular modified file: {source_file_path}")
@@ -380,8 +384,12 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, pr
         }
         
         # Call the existing process_modified_sections function to get AI translation
-        results = process_modified_sections(file_data, file_diff, pr_url, github_client, ai_client, repo_config, max_sections)
-        
+        results = process_modified_sections(file_data, file_diff, pr_url, github_client, ai_client, repo_config, max_sections, glossary_matcher=glossary_matcher, dry_run=dry_run)
+
+        if dry_run:
+            print(f"   ⏸️  Dry-run mode: prompts saved, skipping AI translation and target update")
+            return True
+
         # Step 3: Update match_source_diff_to_target.json with AI results
         if results and len(results) > 0:
             file_path, success, ai_updated_sections = results[0]  # Get first result
@@ -534,6 +542,11 @@ def main():
         thread_safe_print(f"❌ Failed to initialize AI client: {e}")
         return
     
+    # Load glossary and create matcher for term-aware translation
+    print(f"\n📚 Loading glossary from: {terms_path}")
+    glossary = load_glossary(terms_path)
+    glossary_matcher = create_glossary_matcher(glossary)
+    
     print(f"\n🚀 Starting auto-sync for PR: {pr_url}")
     
     # Step 1: Get PR diff
@@ -565,38 +578,43 @@ def main():
     
     # Step 3: Process different types of files based on operation type
     print(f"\n📋 Step 3: Processing files based on operation type...")
+    if STOP_AFTER_PROMPTS_READY:
+        print(f"   ⏸️  STOP_AFTER_PROMPTS_READY=True: will generate prompts only, skip AI calls and target updates")
     
     # Import necessary functions
     from file_updater import process_modified_sections, update_target_document_from_match_data
     from toc_processor import process_toc_files
     from keword_processor import process_keyword_files
     
-    # Step 3.1: Process deleted files (file-level deletions)
-    if deleted_files:
-        print(f"\n🗑️  Step 3.1: Processing {len(deleted_files)} deleted files...")
-        process_deleted_files(deleted_files, github_client, repo_config)
-        print(f"   ✅ Deleted files processed")
-    
-    # Step 3.2: Process added files (file-level additions)
-    if added_files:
-        print(f"\n📄 Step 3.2: Processing {len(added_files)} added files...")
-        process_added_files(added_files, pr_url, github_client, ai_client, repo_config)
-        print(f"   ✅ Added files processed")
-    
-    # Step 3.3: Process special files (TOC.md and similar)
-    if toc_files:
-        print(f"\n📋 Step 3.3: Processing {len(toc_files)} special files (TOC)...")
-        process_toc_files(toc_files, pr_url, github_client, ai_client, repo_config)
-        print(f"   ✅ Special files processed")
-    
-    # Step 3.3b: Process keyword files (keywords.md)
-    if keyword_files:
-        print(f"\n📋 Step 3.3b: Processing {len(keyword_files)} keyword files...")
-        keyword_success = process_keyword_files(keyword_files, pr_url, github_client, ai_client, repo_config)
-        if not keyword_success:
-            print("   ❌ Keyword files processing failed, exiting workflow")
-            return
-        print(f"   ✅ Keyword files processed")
+    if not STOP_AFTER_PROMPTS_READY:
+        # Step 3.1: Process deleted files (file-level deletions)
+        if deleted_files:
+            print(f"\n🗑️  Step 3.1: Processing {len(deleted_files)} deleted files...")
+            process_deleted_files(deleted_files, github_client, repo_config)
+            print(f"   ✅ Deleted files processed")
+        
+        # Step 3.2: Process added files (file-level additions)
+        if added_files:
+            print(f"\n📄 Step 3.2: Processing {len(added_files)} added files...")
+            process_added_files(added_files, pr_url, github_client, ai_client, repo_config, glossary_matcher=glossary_matcher)
+            print(f"   ✅ Added files processed")
+        
+        # Step 3.3: Process special files (TOC.md and similar)
+        if toc_files:
+            print(f"\n📋 Step 3.3: Processing {len(toc_files)} special files (TOC)...")
+            process_toc_files(toc_files, pr_url, github_client, ai_client, repo_config)
+            print(f"   ✅ Special files processed")
+        
+        # Step 3.3b: Process keyword files (keywords.md)
+        if keyword_files:
+            print(f"\n📋 Step 3.3b: Processing {len(keyword_files)} keyword files...")
+            keyword_success = process_keyword_files(keyword_files, pr_url, github_client, ai_client, repo_config)
+            if not keyword_success:
+                print("   ❌ Keyword files processing failed, exiting workflow")
+                return
+            print(f"   ✅ Keyword files processed")
+    else:
+        print(f"\n⏭️  Skipping steps 3.1–3.3b (delete / add / TOC / keyword) in dry-run mode")
     
     # Step 3.4: Process modified files (section-level modifications)
     if modified_sections:
@@ -639,7 +657,9 @@ def main():
                     github_client, 
                     ai_client, 
                     repo_config, 
-                    MAX_NON_SYSTEM_SECTIONS_FOR_AI
+                    MAX_NON_SYSTEM_SECTIONS_FOR_AI,
+                    glossary_matcher=glossary_matcher,
+                    dry_run=STOP_AFTER_PROMPTS_READY
                 )
                 
                 if success:
@@ -651,7 +671,7 @@ def main():
                 print(f"   ⚠️  Unknown file processing type: {file_type} for {source_file_path}, skipping...")
     
     # Step 3.5: Process images (added, modified, deleted)
-    if added_images or modified_images or deleted_images:
+    if not STOP_AFTER_PROMPTS_READY and (added_images or modified_images or deleted_images):
         print(f"\n🖼️  Step 3.5: Processing images...")
         process_all_images(added_images, modified_images, deleted_images, pr_url, github_client, repo_config)
         print(f"   ✅ Images processed")

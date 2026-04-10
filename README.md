@@ -13,6 +13,7 @@ An intelligent documentation translator that automatically synchronizes document
 ### Translation consistency
 
 - **Context-aware translation**: Provides AI with existing translations as reference, ensuring consistent terminology and style across updates
+- **Glossary-aware translation**: Loads a project glossary (e.g. `terms.md`) and automatically matches only the terms that appear in the current document, feeding them to the AI for accurate, consistent terminology — without bloating the prompt with the entire glossary
 - **Preserves established translations**: Reuses proven translations for unchanged content
 - **Maintains voice and tone**: Keeps your documentation's character consistent over time
 
@@ -44,6 +45,7 @@ An intelligent documentation translator that automatically synchronizes document
 
 - **Direct Matching**: Exact matching for identical section hierarchies
 - **AI Fuzzy Matching**: Handles restructured or renamed sections using AI
+- **Glossary Filtering**: Matches only the relevant glossary terms for each document, keeping prompts lean and costs low
 - **System Variable Recognition**: Automatically identifies configuration items and system variables
 - **Special File Handling**: Custom logic for TOC files and configuration documents
 - **Batch Processing**: Efficient handling of large documentation files
@@ -88,6 +90,9 @@ export AI_PROVIDER="deepseek"  # or "gemini"
 export DEEPSEEK_API_TOKEN="your_deepseek_token"  # if using DeepSeek
 # OR
 export GEMINI_API_TOKEN="your_gemini_token"  # if using Gemini
+
+# Optional: Glossary for consistent term translation
+export TERMS_PATH="/path/to/terms.md"  # auto-detected from TARGET_REPO_PATH if not set
 
 # Optional: Token limits
 export MAX_NON_SYSTEM_SECTIONS_FOR_AI=120
@@ -154,6 +159,7 @@ scripts/
 ├── main_workflow.py      # Main orchestration and workflow entry point
 ├── pr_analyzer.py        # PR analysis, diff parsing, hierarchy building
 ├── section_matcher.py    # Section matching (direct + AI fuzzy matching)
+├── glossary.py           # Glossary loading, term matching, and prompt formatting
 ├── file_adder.py         # New file processing and translation
 ├── file_deleter.py       # Deleted file processing
 ├── file_updater.py       # Modified section processing and translation

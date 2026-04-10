@@ -72,13 +72,25 @@ def create_section_batches(file_content, max_lines_per_batch=200):
     
     return batches
 
-def translate_file_batch(batch_content, ai_client, source_language="English", target_language="Chinese"):
+def translate_file_batch(batch_content, ai_client, source_language="English", target_language="Chinese", glossary_matcher=None):
     """Translate a single batch of file content using AI"""
     if not batch_content.strip():
         return batch_content
     
     thread_safe_print(f"   🤖 Translating batch ({len(batch_content.split())} words)...")
-    
+
+    # Build glossary section for prompt if matcher is provided
+    glossary_prompt_section = ""
+    glossary_instruction = ""
+    if glossary_matcher:
+        from glossary import filter_terms_for_content, format_terms_for_prompt
+        matched_terms = filter_terms_for_content(glossary_matcher, batch_content, source_language=source_language)
+        if matched_terms:
+            glossary_text = format_terms_for_prompt(matched_terms)
+            glossary_prompt_section = f"\n{glossary_text}\n"
+            glossary_instruction = "\n6. When translating terms listed in the glossary above, use the provided translations for consistency."
+            thread_safe_print(f"   📚 Matched {len(matched_terms)} glossary terms for batch translation")
+
     prompt = f"""You are a professional technical writer. Please translate the following {source_language} content to {target_language}.
 
 IMPORTANT INSTRUCTIONS:
@@ -90,8 +102,8 @@ IMPORTANT INSTRUCTIONS:
    - Variable names and system configuration parameters
 3. Translate only the descriptive text and explanations
 4. Maintain the exact structure and indentation
-5. Keep all special characters and formatting intact
-
+5. Keep all special characters and formatting intact{glossary_instruction}
+{glossary_prompt_section}
 Content to translate:
 {batch_content}
 
@@ -132,7 +144,7 @@ Please provide the translated content maintaining all formatting and structure."
         thread_safe_print(f"   ❌ Batch translation failed: {e}")
         return batch_content  # Return original content if translation fails
 
-def process_added_files(added_files, pr_url, github_client, ai_client, repo_config):
+def process_added_files(added_files, pr_url, github_client, ai_client, repo_config, glossary_matcher=None):
     """Process newly added files by translating and creating them in target repository"""
     if not added_files:
         thread_safe_print("\n📄 No new files to process")
@@ -173,7 +185,8 @@ def process_added_files(added_files, pr_url, github_client, ai_client, repo_conf
                 batch, 
                 ai_client, 
                 source_language, 
-                target_language
+                target_language,
+                glossary_matcher=glossary_matcher
             )
             translated_batches.append(translated_batch)
         

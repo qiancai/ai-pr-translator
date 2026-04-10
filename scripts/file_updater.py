@@ -169,7 +169,7 @@ def enforce_minimal_target_updates(target_sections, updated_sections, pr_diff):
     return guarded
 
 
-def get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_dict, ai_client, source_language, target_language, target_file_name=None):
+def get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_dict, ai_client, source_language, target_language, target_file_name=None, glossary_matcher=None, dry_run=False):
     """Use AI to update target sections based on source old content, PR diff, and target sections"""
     if not source_old_content_dict or not target_sections:
         return {}
@@ -200,7 +200,21 @@ def get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_di
     thread_safe_print(f"   🤖 Getting AI translation for {len(source_sections)} sections...")
 
     diff_content = source_sections
-    
+
+    # Build glossary section for prompt if matcher is provided
+    glossary_prompt_section = ""
+    glossary_instruction = ""
+    if glossary_matcher:
+        from glossary import filter_terms_for_content, format_terms_for_prompt
+        source_text = '\n'.join(str(v) for v in source_sections.values() if v)
+        target_text = '\n'.join(str(v) for v in target_sections.values() if v)
+        matched_terms = filter_terms_for_content(glossary_matcher, source_text, target_text, pr_diff or '', source_language=source_language)
+        if matched_terms:
+            glossary_text = format_terms_for_prompt(matched_terms)
+            glossary_prompt_section = f"\n4. {glossary_text}\n"
+            glossary_instruction = "\n6. When translating terms listed in the glossary above, use the provided translations for consistency."
+            thread_safe_print(f"   📚 Matched {len(matched_terms)} glossary terms for prompt")
+
     prompt = f"""You are a professional technical writer in the Database domain. I will provide you with:
 
 1. Source sections in {source_language}:
@@ -211,7 +225,7 @@ def get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_di
 
 3. Current target sections in {target_language}:
 {formatted_target_sections}
-
+{glossary_prompt_section}
 Task: Update the target sections in {target_language} according to the diff in {source_language}.
 
 Instructions:
@@ -219,7 +233,7 @@ Instructions:
 2. According to the diff, identify the lines that should be updated accordingly in {target_language}. For lines that needs to be updated in {target_language}, apply the corresponding minimal edits according to the diff. For lines not changed or not included in the diff, make sure to keep the corresponding target lines byte-for-byte identical (same wording, punctuation, spacing, indentation, list markers, and line breaks), which means do not add, remove, or modify lines not included in the diff.
 3. Never rewrite style, improve wording, or rephrase unaffected content.
 4. Keep the JSON structure unchanged, only modify section content where required by the diff.
-5. Ensure updated target content is logically consistent with the source diff. If uncertain, prefer leaving a line unchanged rather than rewriting.
+5. Ensure updated target content is logically consistent with the source diff. If uncertain, prefer leaving a line unchanged rather than rewriting.{glossary_instruction}
 
 Please return the complete updated JSON in the same format as target sections, without any additional explanatory text."""
 
@@ -250,6 +264,11 @@ Please return the complete updated JSON in the same format as target sections, w
     thread_safe_print(f"📝 Prompt length: {len(prompt)} characters")
     thread_safe_print(f"📊 Source sections: {len(source_sections)}")
     thread_safe_print(f"📊 Target sections: {len(target_sections)}")
+
+    if dry_run:
+        thread_safe_print(f"⏸️  Dry-run mode: prompt saved, skipping AI call")
+        return {}
+
     thread_safe_print(f"🤖 Sending prompt to AI...")
 
     thread_safe_print(f"\n   📤 AI Update Prompt ({source_language} → {target_language}):")
@@ -738,7 +757,7 @@ def insert_sections_into_document(file_path, translated_sections, target_inserti
         thread_safe_print(f"   ❌ Error inserting sections: {e}")
         return False
 
-def process_modified_sections(modified_sections, pr_diff, pr_url, github_client, ai_client, repo_config, max_non_system_sections=120):
+def process_modified_sections(modified_sections, pr_diff, pr_url, github_client, ai_client, repo_config, max_non_system_sections=120, glossary_matcher=None, dry_run=False):
     """Process modified sections with full data structure support"""
     results = []
     
@@ -755,7 +774,9 @@ def process_modified_sections(modified_sections, pr_diff, pr_url, github_client,
                 github_client, 
                 ai_client, 
                 repo_config, 
-                max_non_system_sections
+                max_non_system_sections,
+                glossary_matcher=glossary_matcher,
+                dry_run=dry_run
             )
             
             if success:
@@ -984,7 +1005,7 @@ def delete_sections_from_document(file_path, sections_to_delete, target_local_pa
         thread_safe_print(f"   ❌ Error deleting sections from {target_file_path}: {e}")
         return False
 
-def process_single_file(file_path, source_sections, pr_diff, pr_url, github_client, ai_client, repo_config, max_non_system_sections=120):
+def process_single_file(file_path, source_sections, pr_diff, pr_url, github_client, ai_client, repo_config, max_non_system_sections=120, glossary_matcher=None, dry_run=False):
     """Process a single file - thread-safe function for parallel processing"""
     thread_id = threading.current_thread().name
     thread_safe_print(f"\n📄 [{thread_id}] Processing {file_path}")
@@ -1038,7 +1059,10 @@ def process_single_file(file_path, source_sections, pr_diff, pr_url, github_clie
                 
                 # Update sections with AI (get-updated-target-sections.py logic)
                 thread_safe_print(f"   [{thread_id}] 🤖 Getting updated sections from AI...")
-                updated_sections = get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_dict, ai_client, repo_config['source_language'], repo_config['target_language'], file_path)
+                updated_sections = get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_dict, ai_client, repo_config['source_language'], repo_config['target_language'], file_path, glossary_matcher=glossary_matcher, dry_run=dry_run)
+                if dry_run:
+                    thread_safe_print(f"   [{thread_id}] ⏸️  Dry-run: prompt saved for {file_path}")
+                    return True, {}
                 if not updated_sections:
                     thread_safe_print(f"   [{thread_id}] ⚠️  Could not get AI update")
                     return False, f"Could not get AI update for {file_path}"
@@ -1209,7 +1233,10 @@ def process_single_file(file_path, source_sections, pr_diff, pr_url, github_clie
         
         # Update sections with AI (get-updated-target-sections.py logic)
         thread_safe_print(f"   [{thread_id}] 🤖 Getting updated sections from AI...")
-        updated_sections = get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_dict, ai_client, repo_config['source_language'], repo_config['target_language'], file_path)
+        updated_sections = get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_dict, ai_client, repo_config['source_language'], repo_config['target_language'], file_path, glossary_matcher=glossary_matcher, dry_run=dry_run)
+        if dry_run:
+            thread_safe_print(f"   [{thread_id}] ⏸️  Dry-run: prompt saved for {file_path}")
+            return True, {}
         if not updated_sections:
             thread_safe_print(f"   [{thread_id}] ⚠️  Could not get AI update")
             return False, f"Could not get AI update for {file_path}"
@@ -1229,7 +1256,7 @@ def process_single_file(file_path, source_sections, pr_diff, pr_url, github_clie
         thread_safe_print(f"   [{thread_id}] ❌ Error processing {file_path}: {e}")
         return False, f"Error processing {file_path}: {e}"
 
-def process_added_sections(added_sections, pr_diff, pr_url, github_client, ai_client, repo_config, max_non_system_sections=120):
+def process_added_sections(added_sections, pr_diff, pr_url, github_client, ai_client, repo_config, max_non_system_sections=120, glossary_matcher=None):
     """Process added sections by translating and inserting them"""
     if not added_sections:
         thread_safe_print("\n➕ No added sections to process")
@@ -1288,7 +1315,8 @@ def process_added_sections(added_sections, pr_diff, pr_url, github_client, ai_cl
             ai_client,
             repo_config['source_language'], 
             repo_config['target_language'],
-            file_path
+            file_path,
+            glossary_matcher=glossary_matcher
         )
         
         if translated_sections:
@@ -1298,7 +1326,7 @@ def process_added_sections(added_sections, pr_diff, pr_url, github_client, ai_cl
         else:
             thread_safe_print(f"   ⚠️  No sections were translated for {file_path}")
 
-def process_files_in_batches(source_changes, pr_diff, pr_url, github_client, ai_client, repo_config, operation_type="modified", batch_size=5, max_non_system_sections=120):
+def process_files_in_batches(source_changes, pr_diff, pr_url, github_client, ai_client, repo_config, operation_type="modified", batch_size=5, max_non_system_sections=120, glossary_matcher=None):
     """Process files in parallel batches"""
     # Handle different data formats
     if isinstance(source_changes, dict):
@@ -1351,7 +1379,8 @@ def process_files_in_batches(source_changes, pr_diff, pr_url, github_client, ai_
                     github_client, 
                     ai_client,
                     repo_config,
-                    max_non_system_sections
+                    max_non_system_sections,
+                    glossary_matcher=glossary_matcher
                 )
                 future_to_file[future] = file_path
             
