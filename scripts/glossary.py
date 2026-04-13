@@ -8,6 +8,7 @@ Reference: docs-toolkit/markdown-translator/src/glossary.js
 
 import os
 import re
+from log_sanitizer import sanitize_exception_message
 
 # Pattern placeholder used in terms.md for version-like patterns
 _VERSION_PLACEHOLDER = 'X.X.X'
@@ -78,7 +79,7 @@ def load_glossary(terms_path):
         return glossary
 
     except Exception as e:
-        print(f"   ❌ Error loading glossary: {e}")
+        print(f"   ❌ Error loading glossary: {sanitize_exception_message(e)}")
         return []
 
 

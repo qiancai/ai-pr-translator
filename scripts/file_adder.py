@@ -9,6 +9,7 @@ import json
 import threading
 from github import Github
 from openai import OpenAI
+from log_sanitizer import sanitize_exception_message
 
 # Thread-safe printing
 print_lock = threading.Lock()
@@ -141,7 +142,7 @@ Please provide the translated content maintaining all formatting and structure."
         return translated_content
         
     except Exception as e:
-        thread_safe_print(f"   ❌ Batch translation failed: {e}")
+        thread_safe_print(f"   ❌ Batch translation failed: {sanitize_exception_message(e)}")
         return batch_content  # Return original content if translation fails
 
 def process_added_files(added_files, pr_url, github_client, ai_client, repo_config, glossary_matcher=None):
@@ -201,6 +202,8 @@ def process_added_files(added_files, pr_url, github_client, ai_client, repo_conf
             thread_safe_print(f"   ✅ Created translated file: {target_file_path}")
             
         except Exception as e:
-            thread_safe_print(f"   ❌ Error creating file {target_file_path}: {e}")
+            thread_safe_print(
+                f"   ❌ Error creating file {target_file_path}: {sanitize_exception_message(e)}"
+            )
     
     thread_safe_print(f"\n✅ Completed processing all new files")

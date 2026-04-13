@@ -13,6 +13,7 @@ import re
 import json
 import difflib
 import threading
+from log_sanitizer import sanitize_exception_message
 
 print_lock = threading.Lock()
 
@@ -378,7 +379,7 @@ Input JSON:
             temperature=0.1,
         )
     except Exception as e:
-        raise ValueError(f"Keyword block AI call failed: {e}")
+        raise ValueError(f"Keyword block AI call failed: {sanitize_exception_message(e)}")
 
     parsed = _extract_json_object(response)
     if not isinstance(parsed, dict):
@@ -515,7 +516,9 @@ def process_keyword_file(file_path, keyword_data, pr_url, github_client, ai_clie
         return True
 
     except Exception as e:
-        thread_safe_print(f"   Error processing keyword file {file_path}: {e}")
+        thread_safe_print(
+            f"   Error processing keyword file {file_path}: {sanitize_exception_message(e)}"
+        )
         return False
 
 

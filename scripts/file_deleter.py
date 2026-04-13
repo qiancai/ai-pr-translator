@@ -6,6 +6,7 @@ Handles processing of deleted files and deleted sections
 import os
 import threading
 from github import Github
+from log_sanitizer import sanitize_exception_message
 
 # Thread-safe printing
 print_lock = threading.Lock()
@@ -36,7 +37,9 @@ def process_deleted_files(deleted_files, github_client, repo_config):
                 os.remove(target_file_path)
                 thread_safe_print(f"   ✅ Deleted file: {target_file_path}")
             except Exception as e:
-                thread_safe_print(f"   ❌ Error deleting file {target_file_path}: {e}")
+                thread_safe_print(
+                    f"   ❌ Error deleting file {target_file_path}: {sanitize_exception_message(e)}"
+                )
         else:
             thread_safe_print(f"   ⚠️  Target file not found: {target_file_path}")
     

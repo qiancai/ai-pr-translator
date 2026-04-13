@@ -9,6 +9,7 @@ import json
 import threading
 from github import Github
 from openai import OpenAI
+from log_sanitizer import sanitize_exception_message
 
 # Thread-safe printing
 print_lock = threading.Lock()
@@ -413,7 +414,7 @@ Please select the corresponding {number_of_sections} section(s) in {target_langu
         
         return ai_response
     except Exception as e:
-        print(f"   ❌ AI mapping error: {e}")
+        print(f"   ❌ AI mapping error: {sanitize_exception_message(e)}")
         return None
 
 def parse_ai_response(ai_response):

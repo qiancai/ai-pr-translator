@@ -34,6 +34,7 @@ from keword_processor import process_keyword_files
 from section_matcher import match_source_diff_to_target
 from image_processor import process_all_images
 from glossary import load_glossary, create_glossary_matcher
+from log_sanitizer import sanitize_exception_message
 
 # extract the repo owner from the SOURCE_PR_URL
 REPO_OWNER = SOURCE_PR_URL.split("/")[3]
@@ -103,7 +104,9 @@ def estimate_tokens(text):
         return len(tokens)
     except Exception as e:
         # Fallback to character approximation if tiktoken fails
-        thread_safe_print(f"   ⚠️  Tiktoken encoding failed: {e}, using character approximation")
+        thread_safe_print(
+            f"   ⚠️  Tiktoken encoding failed: {sanitize_exception_message(e)}, using character approximation"
+        )
         return len(text) // 4
 
 def print_token_estimation(prompt_text, context="AI translation"):
@@ -151,7 +154,9 @@ def check_source_token_limit(source_diff_dict_file, token_limit=SOURCE_TOKEN_LIM
             return True, total_tokens, token_limit
             
     except Exception as e:
-        thread_safe_print(f"   ❌ Error checking token limit for {source_diff_dict_file}: {e}")
+        thread_safe_print(
+            f"   ❌ Error checking token limit for {source_diff_dict_file}: {sanitize_exception_message(e)}"
+        )
         return True, 0, 0  # Allow processing on error to avoid blocking
 
 def get_pr_diff(pr_url, github_client):
@@ -175,7 +180,7 @@ def get_pr_diff(pr_url, github_client):
         return "\n".join(diff_content)
         
     except Exception as e:
-        thread_safe_print(f"   ❌ Error getting PR diff: {e}")
+        thread_safe_print(f"   ❌ Error getting PR diff: {sanitize_exception_message(e)}")
         return None
 
 def filter_diff_by_operation_type(pr_diff, operation_type, target_sections=None):
@@ -442,7 +447,9 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, pr
             return False
         
     except Exception as e:
-        print(f"   ❌ Error processing regular modified file {source_file_path}: {e}")
+        print(
+            f"   ❌ Error processing regular modified file {source_file_path}: {sanitize_exception_message(e)}"
+        )
         return False
 
 
@@ -526,7 +533,7 @@ def main():
         print(f"📁 Target Repo: {repo_config['target_repo']} ({repo_config['target_language']})")
         print(f"📁 Target Path: {repo_config['target_local_path']}")
     except ValueError as e:
-        print(f"❌ {e}")
+        print(f"❌ {sanitize_exception_message(e)}")
         return
     
     # Use the new authentication method to avoid deprecation warning
@@ -539,7 +546,7 @@ def main():
         ai_client = UnifiedAIClient(provider=AI_PROVIDER)
         thread_safe_print(f"🤖 AI Provider: {AI_PROVIDER.upper()} ({ai_client.model})")
     except Exception as e:
-        thread_safe_print(f"❌ Failed to initialize AI client: {e}")
+        thread_safe_print(f"❌ Failed to initialize AI client: {sanitize_exception_message(e)}")
         return
     
     # Load glossary and create matcher for term-aware translation

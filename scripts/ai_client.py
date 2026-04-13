@@ -10,6 +10,7 @@ Provides a unified interface for multiple AI providers:
 import os
 import time
 import threading
+from log_sanitizer import sanitize_exception_message
 
 # ---------------------------------------------------------------------------
 # Gemini SDK – try the newer google-genai first, fall back to legacy
@@ -211,7 +212,7 @@ class UnifiedAIClient:
             return "No response from Gemini"
 
         except Exception as e:
-            thread_safe_print(f"   ❌ Gemini API error: {e}")
+            thread_safe_print(f"   ❌ Gemini API error: {sanitize_exception_message(e)}")
             thread_safe_print(
                 "   💡 Consider switching to DeepSeek: AI_PROVIDER = 'deepseek'"
             )

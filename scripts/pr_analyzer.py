@@ -9,6 +9,7 @@ import os
 import re
 import threading
 from github import Github
+from log_sanitizer import sanitize_exception_message
 
 # Thread-safe printing
 print_lock = threading.Lock()
@@ -66,7 +67,7 @@ def get_pr_diff(pr_url, github_client):
         return "\n".join(diff_content)
         
     except Exception as e:
-        print(f"   ❌ Error getting PR diff: {e}")
+        print(f"   ❌ Error getting PR diff: {sanitize_exception_message(e)}")
         return None
 
 def get_changed_line_ranges(file):
@@ -793,7 +794,9 @@ def get_target_hierarchy_and_content(
                 hierarchy = build_hierarchy_dict(file_content)
                 return hierarchy, lines
             except Exception as e:
-                print(f"   ⚠️  Error reading local target file {local_file_path}: {e}")
+                print(
+                    f"   ⚠️  Error reading local target file {local_file_path}: {sanitize_exception_message(e)}"
+                )
 
     try:
         repository = github_client.get_repo(target_repo)
@@ -806,7 +809,7 @@ def get_target_hierarchy_and_content(
         
         return hierarchy, lines
     except Exception as e:
-        print(f"   ❌ Error getting target file: {e}")
+        print(f"   ❌ Error getting target file: {sanitize_exception_message(e)}")
         return {}, []
 
 def get_source_sections_content(pr_url, file_path, source_affected, github_client):
@@ -837,7 +840,7 @@ def get_source_sections_content(pr_url, file_path, source_affected, github_clien
         
         return source_sections
     except Exception as e:
-        thread_safe_print(f"   ⚠️  Could not get source sections: {e}")
+        thread_safe_print(f"   ⚠️  Could not get source sections: {sanitize_exception_message(e)}")
         return {}
 
 def get_source_file_hierarchy(file_path, pr_url, github_client, get_base_version=False):
@@ -859,7 +862,7 @@ def get_source_file_hierarchy(file_path, pr_url, github_client, get_base_version
         return source_hierarchy
         
     except Exception as e:
-        thread_safe_print(f"   ❌ Error getting source file hierarchy: {e}")
+        thread_safe_print(f"   ❌ Error getting source file hierarchy: {sanitize_exception_message(e)}")
         return {}
 
 # Helper function needed for find_sections_by_operation_type
@@ -1404,7 +1407,7 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
                 print(f"   ✅ Added complete file for translation")
                 continue
             except Exception as e:
-                print(f"   ❌ Error getting new file content: {e}")
+                print(f"   ❌ Error getting new file content: {sanitize_exception_message(e)}")
                 continue
         
         elif file.status == 'removed':
@@ -1417,7 +1420,7 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
         try:
             file_content = repository.get_contents(file.filename, ref=pr.head.sha).decoded_content.decode('utf-8')
         except Exception as e:
-            print(f"   ❌ Error getting content: {e}")
+            print(f"   ❌ Error getting content: {sanitize_exception_message(e)}")
             continue
         
         basename = os.path.basename(file.filename)
@@ -1438,7 +1441,9 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
                 try:
                     base_file_content_preloaded = repository.get_contents(file.filename, ref=base_ref).decoded_content.decode('utf-8')
                 except Exception as e:
-                    print(f"   ⚠️  Could not get base keywords.md content: {e}")
+                    print(
+                        f"   ⚠️  Could not get base keywords.md content: {sanitize_exception_message(e)}"
+                    )
                     base_file_content_preloaded = file_content
 
                 source_base_lines = base_file_content_preloaded.split('\n')
@@ -1472,7 +1477,9 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
                                 target_blocks = parse_letter_blocks(target_lines, target_tabs_region)
                                 target_blocks_source = f"local:{local_target_file}"
                             except Exception as e:
-                                print(f"   ⚠️  Could not read local target keyword file: {e}")
+                                print(
+                                    f"   ⚠️  Could not read local target keyword file: {sanitize_exception_message(e)}"
+                                )
 
                     # Fallback to remote target repo if local file is unavailable.
                     if not target_blocks:
@@ -1485,7 +1492,9 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
                             target_blocks = parse_letter_blocks(target_lines, target_tabs_region)
                             target_blocks_source = f"remote:{repo_config['target_repo']}@{target_ref}"
                         except Exception as e:
-                            print(f"   ⚠️  Could not get target keyword file content for tabs changes: {e}")
+                            print(
+                                f"   ⚠️  Could not get target keyword file content for tabs changes: {sanitize_exception_message(e)}"
+                            )
                             target_blocks = {}
 
                     print(f"   📌 Keyword target baseline source: {target_blocks_source}")
@@ -1558,7 +1567,7 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
                     target_file_content = target_repository.get_contents(file.filename, ref="master").decoded_content.decode('utf-8')
                     target_lines = target_file_content.split('\n')
                 except Exception as e:
-                    print(f"   ⚠️  Could not get target file content: {e}")
+                    print(f"   ⚠️  Could not get target file content: {sanitize_exception_message(e)}")
                     continue
                 
                 # Analyze diff operations for TOC.md
@@ -1653,7 +1662,7 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
                 base_file_content = repository.get_contents(file.filename, ref=base_ref).decoded_content.decode('utf-8')
             base_hierarchy_dict = build_hierarchy_dict(base_file_content)
         except Exception as e:
-            print(f"   ⚠️  Could not get base file content: {e}")
+            print(f"   ⚠️  Could not get base file content: {sanitize_exception_message(e)}")
             base_hierarchy_dict = all_hierarchy_dict
             base_file_content = file_content  # Fallback to current content
         

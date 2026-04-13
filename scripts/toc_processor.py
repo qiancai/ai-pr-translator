@@ -9,6 +9,7 @@ import json
 import threading
 from github import Github
 from openai import OpenAI
+from log_sanitizer import sanitize_exception_message
 
 # Thread-safe printing
 print_lock = threading.Lock()
@@ -322,11 +323,13 @@ Return format:
                 return translation_mapping
                 
         except json.JSONDecodeError as e:
-            thread_safe_print(f"   ❌ Failed to parse AI translation response: {e}")
+            thread_safe_print(
+                f"   ❌ Failed to parse AI translation response: {sanitize_exception_message(e)}"
+            )
             return {}
             
     except Exception as e:
-        thread_safe_print(f"   ❌ AI translation failed: {e}")
+        thread_safe_print(f"   ❌ AI translation failed: {sanitize_exception_message(e)}")
         return {}
 
 def process_toc_file(file_path, toc_data, pr_url, github_client, ai_client, repo_config):
@@ -416,7 +419,9 @@ def process_toc_file(file_path, toc_data, pr_url, github_client, ai_client, repo
         thread_safe_print(f"   ✅ TOC file updated: {file_path}")
         
     except Exception as e:
-        thread_safe_print(f"   ❌ Error processing TOC file {file_path}: {e}")
+        thread_safe_print(
+            f"   ❌ Error processing TOC file {file_path}: {sanitize_exception_message(e)}"
+        )
 
 def process_toc_files(toc_files, pr_url, github_client, ai_client, repo_config):
     """Process all TOC files"""

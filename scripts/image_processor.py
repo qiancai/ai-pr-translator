@@ -6,6 +6,7 @@ Handles processing of image files (add, delete, modify) in target repository
 import os
 import threading
 from github import Github
+from log_sanitizer import sanitize_exception_message
 
 # Thread-safe printing
 print_lock = threading.Lock()
@@ -41,7 +42,9 @@ def download_image_from_source(file_path, pr_url, github_client):
         return image_data
         
     except Exception as e:
-        thread_safe_print(f"   ❌ Error downloading image from source: {e}")
+        thread_safe_print(
+            f"   ❌ Error downloading image from source: {sanitize_exception_message(e)}"
+        )
         return None
 
 def process_added_images(added_images, pr_url, github_client, repo_config):
@@ -87,7 +90,9 @@ def process_added_images(added_images, pr_url, github_client, repo_config):
             thread_safe_print(f"   ✅ Saved image to: {target_file_path}")
             
         except Exception as e:
-            thread_safe_print(f"   ❌ Error saving image {target_file_path}: {e}")
+            thread_safe_print(
+                f"   ❌ Error saving image {target_file_path}: {sanitize_exception_message(e)}"
+            )
     
     thread_safe_print(f"\n✅ Completed processing all new images")
 
@@ -128,7 +133,9 @@ def process_modified_images(modified_images, pr_url, github_client, repo_config)
             thread_safe_print(f"   ✅ Updated image: {target_file_path}")
             
         except Exception as e:
-            thread_safe_print(f"   ❌ Error updating image {target_file_path}: {e}")
+            thread_safe_print(
+                f"   ❌ Error updating image {target_file_path}: {sanitize_exception_message(e)}"
+            )
     
     thread_safe_print(f"\n✅ Completed processing all modified images")
 
@@ -154,7 +161,9 @@ def process_deleted_images(deleted_images, repo_config):
                 os.remove(target_file_path)
                 thread_safe_print(f"   ✅ Deleted image: {target_file_path}")
             except Exception as e:
-                thread_safe_print(f"   ❌ Error deleting image {target_file_path}: {e}")
+                thread_safe_print(
+                    f"   ❌ Error deleting image {target_file_path}: {sanitize_exception_message(e)}"
+                )
         else:
             thread_safe_print(f"   ⚠️  Target image not found: {target_file_path}")
     
@@ -174,4 +183,3 @@ def process_all_images(added_images, modified_images, deleted_images, pr_url, gi
     thread_safe_print("\n" + "="*80)
     thread_safe_print("✅ IMAGE PROCESSING COMPLETED")
     thread_safe_print("="*80)
-

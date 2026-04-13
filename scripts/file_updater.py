@@ -11,6 +11,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from github import Github
 from openai import OpenAI
+from log_sanitizer import sanitize_exception_message
 
 # Thread-safe printing
 print_lock = threading.Lock()
@@ -321,7 +322,7 @@ Please return the complete updated JSON in the same format as target sections, w
         return result
         
     except Exception as e:
-        thread_safe_print(f"   ❌ AI translation failed: {e}")
+        thread_safe_print(f"   ❌ AI translation failed: {sanitize_exception_message(e)}")
         return {}
 
 def parse_updated_sections(ai_response):
@@ -409,7 +410,7 @@ def parse_updated_sections(ai_response):
             return None
         
     except json.JSONDecodeError as e:
-        print(f"   ❌ Error parsing AI response as JSON: {e}")
+        print(f"   ❌ Error parsing AI response as JSON: {sanitize_exception_message(e)}")
         print(f"   📝 Error at position: {e.pos if hasattr(e, 'pos') else 'unknown'}")
         
         # Save debug info
@@ -426,7 +427,7 @@ def parse_updated_sections(ai_response):
         print(f"   📁 Debug info saved to: {debug_file}")
         return None
     except Exception as e:
-        print(f"   ❌ Unexpected error parsing AI response: {e}")
+        print(f"   ❌ Unexpected error parsing AI response: {sanitize_exception_message(e)}")
         return None
 
 
@@ -588,7 +589,7 @@ def update_local_document(file_path, updated_sections, hierarchy_dict, target_lo
         return True
         
     except Exception as e:
-        thread_safe_print(f"   ❌ Error updating file: {e}")
+        thread_safe_print(f"   ❌ Error updating file: {sanitize_exception_message(e)}")
         return False
 
 def find_section_boundaries(lines, hierarchy_dict):
@@ -754,7 +755,7 @@ def insert_sections_into_document(file_path, translated_sections, target_inserti
         return True
         
     except Exception as e:
-        thread_safe_print(f"   ❌ Error inserting sections: {e}")
+        thread_safe_print(f"   ❌ Error inserting sections: {sanitize_exception_message(e)}")
         return False
 
 def process_modified_sections(modified_sections, pr_diff, pr_url, github_client, ai_client, repo_config, max_non_system_sections=120, glossary_matcher=None, dry_run=False):
@@ -787,8 +788,9 @@ def process_modified_sections(modified_sections, pr_diff, pr_url, github_client,
                 results.append((file_path, False, message))
                 
         except Exception as e:
-            thread_safe_print(f"   ❌ Error processing {file_path}: {e}")
-            results.append((file_path, False, f"Error processing {file_path}: {e}"))
+            sanitized = sanitize_exception_message(e)
+            thread_safe_print(f"   ❌ Error processing {file_path}: {sanitized}")
+            results.append((file_path, False, f"Error processing {file_path}: {sanitized}"))
     
     return results
 
@@ -819,8 +821,9 @@ def process_deleted_sections(deleted_sections, pr_url, github_client, ai_client,
                 results.append((file_path, False, message))
                 
         except Exception as e:
-            thread_safe_print(f"   ❌ Error processing deletions in {file_path}: {e}")
-            results.append((file_path, False, f"Error processing deletions in {file_path}: {e}"))
+            sanitized = sanitize_exception_message(e)
+            thread_safe_print(f"   ❌ Error processing deletions in {file_path}: {sanitized}")
+            results.append((file_path, False, f"Error processing deletions in {file_path}: {sanitized}"))
     
     return results
 
@@ -920,7 +923,9 @@ def process_single_file_deletion(file_path, source_sections, pr_url, github_clie
                         sections_to_delete.append(int(target_line))
                         thread_safe_print(f"      ✅ Marked regular section for deletion: line {target_line}")
                     except ValueError as e:
-                        thread_safe_print(f"      ❌ Error converting target_line to int: {target_line}, error: {e}")
+                        thread_safe_print(
+                            f"      ❌ Error converting target_line to int: {target_line}, error: {sanitize_exception_message(e)}"
+                        )
                         # If target_line is not a number, try to find it in target_hierarchy
                         for line_num, hierarchy in target_hierarchy.items():
                             if target_line in hierarchy or hierarchy in target_line:
@@ -1002,7 +1007,9 @@ def delete_sections_from_document(file_path, sections_to_delete, target_local_pa
         return True
         
     except Exception as e:
-        thread_safe_print(f"   ❌ Error deleting sections from {target_file_path}: {e}")
+        thread_safe_print(
+            f"   ❌ Error deleting sections from {target_file_path}: {sanitize_exception_message(e)}"
+        )
         return False
 
 def process_single_file(file_path, source_sections, pr_diff, pr_url, github_client, ai_client, repo_config, max_non_system_sections=120, glossary_matcher=None, dry_run=False):
@@ -1253,8 +1260,9 @@ def process_single_file(file_path, source_sections, pr_diff, pr_url, github_clie
             return False, f"Failed to update {file_path}"
             
     except Exception as e:
-        thread_safe_print(f"   [{thread_id}] ❌ Error processing {file_path}: {e}")
-        return False, f"Error processing {file_path}: {e}"
+        sanitized = sanitize_exception_message(e)
+        thread_safe_print(f"   [{thread_id}] ❌ Error processing {file_path}: {sanitized}")
+        return False, f"Error processing {file_path}: {sanitized}"
 
 def process_added_sections(added_sections, pr_diff, pr_url, github_client, ai_client, repo_config, max_non_system_sections=120, glossary_matcher=None):
     """Process added sections by translating and inserting them"""
@@ -1393,7 +1401,9 @@ def process_files_in_batches(source_changes, pr_diff, pr_url, github_client, ai_
                     success, message = future.result()
                     batch_results.append((file_path, success, message))
                 except Exception as e:
-                    batch_results.append((file_path, False, f"Exception in thread: {e}"))
+                    batch_results.append(
+                        (file_path, False, f"Exception in thread: {sanitize_exception_message(e)}")
+                    )
             
             results.extend(batch_results)
         
