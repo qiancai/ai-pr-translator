@@ -20,6 +20,16 @@ def thread_safe_print(*args, **kwargs):
     with print_lock:
         print(*args, **kwargs)
 
+def read_text_lines_preserve_newlines(file_path):
+    """Read text lines without normalizing existing line endings."""
+    with open(file_path, 'r', encoding='utf-8', newline='') as f:
+        return f.readlines()
+
+def write_text_lines_preserve_newlines(file_path, lines):
+    """Write text lines back exactly as provided."""
+    with open(file_path, 'w', encoding='utf-8', newline='') as f:
+        f.writelines(lines)
+
 def is_markdown_heading(line):
     """Return True only for real markdown headings at column 0."""
     if not line or not isinstance(line, str):
@@ -952,11 +962,9 @@ def delete_sections_from_document(file_path, sections_to_delete, target_local_pa
         return False
     
     try:
-        # Read current file content
-        with open(target_file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        
-        lines = content.split('\n')
+        # Read current file content without normalizing unrelated line endings.
+        lines = read_text_lines_preserve_newlines(target_file_path)
+        content = ''.join(lines)
         
         # Import needed function
         from pr_analyzer import build_hierarchy_dict
@@ -998,10 +1006,8 @@ def delete_sections_from_document(file_path, sections_to_delete, target_local_pa
             thread_safe_print(f"      🗑️  Deleting lines {section_start + 1} to {section_end + 1}")
             del lines[section_start:section_end + 1]
         
-        # Write updated content back to file
-        updated_content = '\n'.join(lines)
-        with open(target_file_path, 'w', encoding='utf-8') as f:
-            f.write(updated_content)
+        # Write updated content back to file while preserving untouched line endings.
+        write_text_lines_preserve_newlines(target_file_path, lines)
         
         thread_safe_print(f"   ✅ Updated file: {target_file_path}")
         return True
@@ -1589,8 +1595,7 @@ def update_target_document_sections(all_sections, target_file_path):
         thread_safe_print(f"❌ Target file does not exist: {target_file_path}")
         return False
     
-    with open(target_file_path, 'r', encoding='utf-8') as f:
-        target_lines = f.readlines()
+    target_lines = read_text_lines_preserve_newlines(target_file_path)
     
     thread_safe_print(f"📄 Target document total lines: {len(target_lines)}")
     
@@ -1889,8 +1894,7 @@ def update_target_document_sections(all_sections, target_file_path):
                 thread_safe_print(f"   ✅ Replaced {end_line - start_line} lines with {len(new_lines)} lines")
     
     
-    with open(target_file_path, 'w', encoding='utf-8') as f:
-        f.writelines(target_lines)
+    write_text_lines_preserve_newlines(target_file_path, target_lines)
     
     thread_safe_print(f"\n✅ Target document update completed!")
     thread_safe_print(f"📄 Updated file: {target_file_path}")
