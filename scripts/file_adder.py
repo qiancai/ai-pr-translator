@@ -97,14 +97,17 @@ def translate_file_batch(batch_content, ai_client, source_language="English", ta
 IMPORTANT INSTRUCTIONS:
 1. Preserve ALL Markdown formatting (headers, links, code blocks, tables, etc.)
 2. Do NOT translate:
-   - Code examples, SQL queries, configuration values
+   - Code examples, SQL queries, configuration values, and doc variables wrapped in {{{ }}} such as {{{ .starter }}}.
    - Technical terms like "TiDB", "TiKV", "PD", API names, etc.
    - File paths, URLs, and command line examples
    - Variable names and system configuration parameters
 3. Translate only the descriptive text and explanations
 4. Maintain the exact structure and indentation
 5. Keep all special characters and formatting intact{glossary_instruction}
+
+Glossary for terms in {source_language} and {target_language}:
 {glossary_prompt_section}
+
 Content to translate:
 {batch_content}
 
@@ -145,8 +148,12 @@ Please provide the translated content maintaining all formatting and structure."
         thread_safe_print(f"   ❌ Batch translation failed: {sanitize_exception_message(e)}")
         return batch_content  # Return original content if translation fails
 
-def process_added_files(added_files, pr_url, github_client, ai_client, repo_config, glossary_matcher=None):
-    """Process newly added files by translating and creating them in target repository"""
+def process_added_files(added_files, source_context_or_pr_url, github_client, ai_client, repo_config, glossary_matcher=None):
+    """Process newly added files by translating and creating them in target repository.
+
+    source_context_or_pr_url is currently unused here, but the shared signature keeps
+    PR-based and commit-based call sites aligned.
+    """
     if not added_files:
         thread_safe_print("\n📄 No new files to process")
         return

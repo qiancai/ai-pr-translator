@@ -36,7 +36,7 @@
 
 ## 工作流程
 
-### 1. 分析阶段 (`pr_analyzer.py`)
+### 1. 分析阶段 (`diff_analyzer.py`)
 
 在 `analyze_source_changes()` 函数中，脚本会：
 - 识别 PR 中所有的图片文件
@@ -106,7 +106,7 @@ python scripts/main_workflow.py
    - `process_deleted_images()` - 处理删除图片
    - `process_all_images()` - 统一处理所有图片操作
 
-2. **`pr_analyzer.py`** - 扩展了图片检测功能
+2. **`diff_analyzer.py`** - 扩展了图片检测功能
    - 在 `analyze_source_changes()` 中添加了图片文件识别
    - 返回值新增：`added_images`, `modified_images`, `deleted_images`
 
@@ -180,4 +180,3 @@ python scripts/main_workflow.py
 ## 贡献
 
 欢迎提交 Issue 和 Pull Request 来改进图片处理功能！
-

@@ -532,7 +532,7 @@ def build_hierarchy_path(lines, line_num, all_headers):
     
     return hierarchy_path
 
-def map_insertion_points_to_target(insertion_points, target_hierarchy, target_lines, file_path, pr_url, github_client, ai_client, repo_config, max_non_system_sections=120):
+def map_insertion_points_to_target(insertion_points, target_hierarchy, target_lines, file_path, source_context_or_pr_url, github_client, ai_client, repo_config, max_non_system_sections=120):
     """Map source insertion points to target language locations"""
     target_insertion_points = {}
     

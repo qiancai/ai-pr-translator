@@ -332,7 +332,7 @@ Return format:
         thread_safe_print(f"   ❌ AI translation failed: {sanitize_exception_message(e)}")
         return {}
 
-def process_toc_file(file_path, toc_data, pr_url, github_client, ai_client, repo_config):
+def process_toc_file(file_path, toc_data, source_context_or_pr_url, github_client, ai_client, repo_config):
     """Process a single TOC.md file with special logic"""
     thread_safe_print(f"\n📋 Processing TOC file: {file_path}")
     
@@ -423,7 +423,7 @@ def process_toc_file(file_path, toc_data, pr_url, github_client, ai_client, repo
             f"   ❌ Error processing TOC file {file_path}: {sanitize_exception_message(e)}"
         )
 
-def process_toc_files(toc_files, pr_url, github_client, ai_client, repo_config):
+def process_toc_files(toc_files, source_context_or_pr_url, github_client, ai_client, repo_config):
     """Process all TOC files"""
     if not toc_files:
         return
@@ -432,7 +432,7 @@ def process_toc_files(toc_files, pr_url, github_client, ai_client, repo_config):
     
     for file_path, toc_data in toc_files.items():
         if toc_data['type'] == 'toc':
-            process_toc_file(file_path, toc_data, pr_url, github_client, ai_client, repo_config)
+            process_toc_file(file_path, toc_data, source_context_or_pr_url, github_client, ai_client, repo_config)
         else:
             thread_safe_print(f"   ⚠️  Unknown TOC data type: {toc_data['type']} for {file_path}")
     

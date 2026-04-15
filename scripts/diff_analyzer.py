@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-PR Analyzer Module
-Handles PR analysis, diff parsing, content getting, hierarchy building, and section getting
+Diff Analyzer Module
+Handles diff analysis, content retrieval, hierarchy building, and section extraction
+for both PR-based and commit-compare-based workflows.
 """
 
+from dataclasses import dataclass
 import json
 import os
 import re
 import threading
+from typing import Optional
 from github import Github
 from log_sanitizer import sanitize_exception_message
 
@@ -33,42 +36,168 @@ def parse_pr_url(pr_url):
     parts = pr_url.split('/')
     return parts[-4], parts[-3], int(parts[-1])  # owner, repo, pr_number
 
-def get_repo_config(pr_url, repo_configs):
-    """Get repository configuration based on source repo"""
-    owner, repo, pr_number = parse_pr_url(pr_url)
-    source_repo = f"{owner}/{repo}"
-    
+
+@dataclass
+class DiffFile:
+    """Normalized changed-file representation shared by PR and compare modes."""
+
+    filename: str
+    status: str
+    patch: Optional[str] = None
+    previous_filename: Optional[str] = None
+
+
+def is_diff_context(value):
+    """Return True when the provided value is a normalized diff context."""
+    return isinstance(value, dict) and {"mode", "source_repo", "base_ref", "head_ref", "changed_files"}.issubset(value.keys())
+
+
+def normalize_changed_file(file):
+    """Convert GitHub API file objects to a stable local shape."""
+    return DiffFile(
+        filename=file.filename,
+        status=file.status,
+        patch=getattr(file, "patch", None),
+        previous_filename=getattr(file, "previous_filename", None),
+    )
+
+
+def infer_language_direction(source_repo, target_repo):
+    """Infer language direction based on repo naming convention."""
+    if source_repo.endswith('-cn') and not target_repo.endswith('-cn'):
+        return "Chinese", "English"
+    if not source_repo.endswith('-cn') and target_repo.endswith('-cn'):
+        return "English", "Chinese"
+    return "English", "Chinese"
+
+
+def get_repo_config_from_source_repo(source_repo, repo_configs, target_repo_override=None):
+    """Get repository configuration based on source repo name."""
     if source_repo not in repo_configs:
         raise ValueError(f"Unsupported source repository: {source_repo}. Supported: {list(repo_configs.keys())}")
-    
+
     config = repo_configs[source_repo].copy()
-    config['source_repo'] = source_repo
-    config['pr_number'] = pr_number
-    
+    config["source_repo"] = source_repo
+    if target_repo_override:
+        config["target_repo"] = target_repo_override
+    if "source_language" not in config or "target_language" not in config:
+        source_language, target_language = infer_language_direction(
+            source_repo, config["target_repo"]
+        )
+        config.setdefault("source_language", source_language)
+        config.setdefault("target_language", target_language)
+
     return config
 
+
+def get_repo_config(pr_url, repo_configs):
+    """Get repository configuration based on source repo."""
+    owner, repo, pr_number = parse_pr_url(pr_url)
+    source_repo = f"{owner}/{repo}"
+    config = get_repo_config_from_source_repo(source_repo, repo_configs)
+    config["pr_number"] = pr_number
+    return config
+
+
+def build_diff_text(changed_files):
+    """Render a unified diff text block from normalized changed files."""
+    diff_content = []
+    for file in changed_files:
+        if file.filename.endswith('.md') and file.patch:
+            diff_content.append(f"File: {file.filename}")
+            diff_content.append(file.patch)
+            diff_content.append("-" * 80)
+    return "\n".join(diff_content)
+
+
+def build_pr_diff_context(pr_url, github_client, repo_configs):
+    """Build a normalized diff context from a PR URL."""
+    owner, repo, pr_number = parse_pr_url(pr_url)
+    source_repo = f"{owner}/{repo}"
+    repository = github_client.get_repo(source_repo)
+    pr = repository.get_pull(pr_number)
+    repo_config = get_repo_config(pr_url, repo_configs)
+
+    context = {
+        "mode": "pr",
+        "source_repo": source_repo,
+        "target_repo": repo_config["target_repo"],
+        "base_ref": getattr(pr.base, "sha", None) or getattr(pr.base, "ref", None) or repository.default_branch,
+        "head_ref": getattr(pr.head, "sha", None) or getattr(pr.head, "ref", None) or repository.default_branch,
+        "changed_files": [normalize_changed_file(file) for file in pr.get_files()],
+        "repo_config": repo_config,
+        "source_pr_url": pr_url,
+        "source_url": pr_url,
+        "source_description": f"PR #{pr_number}: {pr.title}",
+        "pr_number": pr_number,
+        "title": pr.title,
+    }
+    return context
+
+
+def build_commit_diff_context(source_repo, target_repo, base_ref, head_ref, github_client, repo_configs):
+    """Build a normalized diff context from a commit compare range."""
+    repository = github_client.get_repo(source_repo)
+    comparison = repository.compare(base_ref, head_ref)
+    repo_config = get_repo_config_from_source_repo(source_repo, repo_configs, target_repo_override=target_repo)
+
+    return {
+        "mode": "commit",
+        "source_repo": source_repo,
+        "target_repo": repo_config["target_repo"],
+        "base_ref": base_ref,
+        "head_ref": head_ref,
+        "changed_files": [normalize_changed_file(file) for file in comparison.files],
+        "repo_config": repo_config,
+        "source_url": f"https://github.com/{source_repo}/compare/{base_ref}...{head_ref}",
+        "source_description": f"compare {base_ref}...{head_ref}",
+    }
+
+
 def get_pr_diff(pr_url, github_client):
-    """Get the diff content from a GitHub PR"""
+    """Get the diff content from a GitHub PR."""
     try:
         owner, repo, pr_number = parse_pr_url(pr_url)
-        repository = github_client.get_repo(f"{owner}/{repo}")
+        source_repo = f"{owner}/{repo}"
+        repository = github_client.get_repo(source_repo)
         pr = repository.get_pull(pr_number)
-        
-        # Get files and their patches
-        files = pr.get_files()
-        diff_content = []
-        
-        for file in files:
-            if file.filename.endswith('.md') and file.patch:
-                diff_content.append(f"File: {file.filename}")
-                diff_content.append(file.patch)
-                diff_content.append("-" * 80)
-        
-        return "\n".join(diff_content)
-        
+        files = [normalize_changed_file(file) for file in pr.get_files()]
+        return build_diff_text(files)
     except Exception as e:
         print(f"   ❌ Error getting PR diff: {sanitize_exception_message(e)}")
         return None
+
+
+def resolve_source_repo_and_ref(source_context_or_pr_url, github_client, ref_name="head_ref"):
+    """Resolve source repo and ref from either a diff context or a legacy PR URL."""
+    if is_diff_context(source_context_or_pr_url):
+        return (
+            source_context_or_pr_url["source_repo"],
+            source_context_or_pr_url[ref_name],
+        )
+
+    owner, repo, pr_number = parse_pr_url(source_context_or_pr_url)
+    repository = github_client.get_repo(f"{owner}/{repo}")
+    pr = repository.get_pull(pr_number)
+    if ref_name == "base_ref":
+        ref = getattr(pr.base, "sha", None) or getattr(pr.base, "ref", None) or repository.default_branch
+    else:
+        ref = getattr(pr.head, "sha", None) or getattr(pr.head, "ref", None) or repository.default_branch
+    return f"{owner}/{repo}", ref
+
+
+def get_source_file_content(file_path, source_context_or_pr_url, github_client, ref_name="head_ref"):
+    """Read a source file as UTF-8 text from the resolved source ref."""
+    source_repo, ref = resolve_source_repo_and_ref(source_context_or_pr_url, github_client, ref_name=ref_name)
+    repository = github_client.get_repo(source_repo)
+    return repository.get_contents(file_path, ref=ref).decoded_content.decode("utf-8")
+
+
+def get_source_file_bytes(file_path, source_context_or_pr_url, github_client, ref_name="head_ref"):
+    """Read a source file as bytes from the resolved source ref."""
+    source_repo, ref = resolve_source_repo_and_ref(source_context_or_pr_url, github_client, ref_name=ref_name)
+    repository = github_client.get_repo(source_repo)
+    return repository.get_contents(file_path, ref=ref).decoded_content
 
 def get_changed_line_ranges(file):
     """Get the ranges of lines that were changed in the PR"""
@@ -812,15 +941,15 @@ def get_target_hierarchy_and_content(
         print(f"   ❌ Error getting target file: {sanitize_exception_message(e)}")
         return {}, []
 
-def get_source_sections_content(pr_url, file_path, source_affected, github_client):
-    """Get the content of source sections for better context"""
+def get_source_sections_content(source_context_or_pr_url, file_path, source_affected, github_client):
+    """Get the content of source sections for better context."""
     try:
-        owner, repo, pr_number = parse_pr_url(pr_url)
-        repository = github_client.get_repo(f"{owner}/{repo}")
-        pr = repository.get_pull(pr_number)
-        
-        # Get the source file content
-        file_content = repository.get_contents(file_path, ref=pr.head.sha).decoded_content.decode('utf-8')
+        file_content = get_source_file_content(
+            file_path,
+            source_context_or_pr_url,
+            github_client,
+            ref_name="head_ref",
+        )
         lines = file_content.split('\n')
         
         # Extract source sections
@@ -846,16 +975,13 @@ def get_source_sections_content(pr_url, file_path, source_affected, github_clien
 def get_source_file_hierarchy(file_path, pr_url, github_client, get_base_version=False):
     """Get source file hierarchy from PR head or base"""
     try:
-        owner, repo, pr_number = parse_pr_url(pr_url)
-        repository = github_client.get_repo(f"{owner}/{repo}")
-        pr = repository.get_pull(pr_number)
-        
-        if get_base_version:
-            # Get the source file content before PR changes (base version)
-            source_file_content = repository.get_contents(file_path, ref=pr.base.sha).decoded_content.decode('utf-8')
-        else:
-            # Get the source file content after PR changes (head version)
-            source_file_content = repository.get_contents(file_path, ref=pr.head.sha).decoded_content.decode('utf-8')
+        ref_name = "base_ref" if get_base_version else "head_ref"
+        source_file_content = get_source_file_content(
+            file_path,
+            pr_url,
+            github_client,
+            ref_name=ref_name,
+        )
             
         source_hierarchy = build_hierarchy_dict(source_file_content)
         
@@ -1323,7 +1449,7 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
     
     return source_diff_dict
 
-def analyze_source_changes(pr_url, github_client, special_files=None, ignore_files=None, repo_configs=None, max_non_system_sections=120, pr_diff=None, exclude_folders=None):
+def analyze_source_changes(source_context_or_pr_url, github_client, special_files=None, ignore_files=None, repo_configs=None, max_non_system_sections=120, pr_diff=None, exclude_folders=None):
     """Analyze source language changes and categorize them as added, modified, or deleted
     
     Args:
@@ -1339,17 +1465,48 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
     if exclude_folders is None:
         exclude_folders = []
     
-    owner, repo, pr_number = parse_pr_url(pr_url)
-    repository = github_client.get_repo(f"{owner}/{repo}")
-    pr = repository.get_pull(pr_number)
-    
-    # Get repository configuration for target repo info
-    repo_config = get_repo_config(pr_url, repo_configs)
-    
-    print(f"📋 Processing PR #{pr_number}: {pr.title}")
-    
-    # Get all files
-    files = pr.get_files()
+    if is_diff_context(source_context_or_pr_url):
+        source_context = source_context_or_pr_url
+        source_repo = source_context["source_repo"]
+        repository = github_client.get_repo(source_repo)
+        base_ref = source_context["base_ref"]
+        head_ref = source_context["head_ref"]
+        files = [
+            file if isinstance(file, DiffFile) else normalize_changed_file(file)
+            for file in source_context["changed_files"]
+        ]
+        repo_config = source_context.get("repo_config") or get_repo_config_from_source_repo(
+            source_repo,
+            repo_configs,
+            target_repo_override=source_context.get("target_repo"),
+        )
+        source_description = source_context.get("source_description") or f"compare {base_ref}...{head_ref}"
+        print(f"📋 Processing diff: {source_description}")
+    else:
+        pr_url = source_context_or_pr_url
+        owner, repo, pr_number = parse_pr_url(pr_url)
+        source_repo = f"{owner}/{repo}"
+        repository = github_client.get_repo(source_repo)
+        pr = repository.get_pull(pr_number)
+        base_ref = getattr(pr.base, "sha", None) or getattr(pr.base, "ref", None) or repository.default_branch
+        head_ref = getattr(pr.head, "sha", None) or getattr(pr.head, "ref", None) or repository.default_branch
+        repo_config = get_repo_config(pr_url, repo_configs)
+        files = [normalize_changed_file(file) for file in pr.get_files()]
+        source_context = {
+            "mode": "pr",
+            "source_repo": source_repo,
+            "target_repo": repo_config["target_repo"],
+            "base_ref": base_ref,
+            "head_ref": head_ref,
+            "changed_files": files,
+            "repo_config": repo_config,
+            "source_pr_url": pr_url,
+            "source_url": pr_url,
+            "source_description": f"PR #{pr_number}: {pr.title}",
+            "pr_number": pr_number,
+            "title": pr.title,
+        }
+        print(f"📋 Processing PR #{pr_number}: {pr.title}")
     
     # Separate markdown files and image files
     markdown_files = [f for f in files if f.filename.endswith('.md')]
@@ -1402,7 +1559,7 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
         if file.status == 'added':
             print(f"   ➕ Detected new file: {file.filename}")
             try:
-                file_content = repository.get_contents(file.filename, ref=pr.head.sha).decoded_content.decode('utf-8')
+                file_content = repository.get_contents(file.filename, ref=head_ref).decoded_content.decode('utf-8')
                 added_files[file.filename] = file_content
                 print(f"   ✅ Added complete file for translation")
                 continue
@@ -1415,10 +1572,26 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
             deleted_files.append(file.filename)
             print(f"   ✅ Marked file for deletion")
             continue
+
+        elif file.status == 'renamed':
+            previous_filename = getattr(file, 'previous_filename', None)
+            if previous_filename:
+                print(f"   🔄 Detected renamed file: {previous_filename} -> {file.filename}")
+                deleted_files.append(previous_filename)
+            else:
+                print(f"   🔄 Detected renamed file without previous path: {file.filename}")
+
+            try:
+                file_content = repository.get_contents(file.filename, ref=head_ref).decoded_content.decode('utf-8')
+                added_files[file.filename] = file_content
+                print(f"   ✅ Treating renamed markdown as delete old + add new")
+            except Exception as e:
+                print(f"   ❌ Error getting renamed file content: {sanitize_exception_message(e)}")
+            continue
         
         # For modified files, check if it's a special file like TOC.md
         try:
-            file_content = repository.get_contents(file.filename, ref=pr.head.sha).decoded_content.decode('utf-8')
+            file_content = repository.get_contents(file.filename, ref=head_ref).decoded_content.decode('utf-8')
         except Exception as e:
             print(f"   ❌ Error getting content: {sanitize_exception_message(e)}")
             continue
@@ -1437,7 +1610,6 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
                 operations = analyze_diff_operations(file)
 
                 source_head_lines = file_content.split('\n')
-                base_ref = getattr(pr.base, "sha", None) or getattr(pr.base, "ref", None) or repository.default_branch
                 try:
                     base_file_content_preloaded = repository.get_contents(file.filename, ref=base_ref).decoded_content.decode('utf-8')
                 except Exception as e:
@@ -1652,13 +1824,11 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
         # Build complete hierarchy from HEAD (after changes)
         all_hierarchy_dict = build_hierarchy_dict(file_content)
         
-        # For deletion/modification detection, compare against the PR base commit.
-        # Using default_branch here can produce false negatives on release-branch PRs.
+        # For deletion/modification detection, compare against the diff base ref.
         try:
             if base_file_content_preloaded is not None:
                 base_file_content = base_file_content_preloaded
             else:
-                base_ref = getattr(pr.base, "sha", None) or getattr(pr.base, "ref", None) or repository.default_branch
                 base_file_content = repository.get_contents(file.filename, ref=base_ref).decoded_content.decode('utf-8')
             base_hierarchy_dict = build_hierarchy_dict(base_file_content)
         except Exception as e:
@@ -1861,7 +2031,7 @@ def analyze_source_changes(pr_url, github_client, special_files=None, ignore_fil
             
             # Get source sections content (actual content, not just hierarchy)
             if file_added:
-                source_sections_content = get_source_sections_content(pr_url, file.filename, file_added, github_client)
+                source_sections_content = get_source_sections_content(source_context, file.filename, file_added, github_client)
                 file_added = source_sections_content  # Replace hierarchy with actual content
             
             if file_added:

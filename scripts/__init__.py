@@ -6,7 +6,7 @@ This package contains the refactored version of the auto-sync-pr-changes script,
 split into logical modules for better maintainability and testing.
 
 Modules:
-- pr_analyzer: PR analysis, diff parsing, content getting, hierarchy building
+- diff_analyzer: Diff analysis, diff parsing, content getting, hierarchy building
 - section_matcher: Section matching (direct matching + AI matching)  
 - file_adder: New file processing and translation
 - file_deleter: Deleted file processing
@@ -15,8 +15,14 @@ Modules:
 - main: Main orchestration function
 """
 
-# Import main functionality for easy access
-from main import main
+def main():
+    """Lazy package entrypoint to avoid import-time side effects during test discovery."""
+    try:
+        from .main_workflow import main as workflow_main
+    except ImportError:
+        from main_workflow import main as workflow_main
 
-# Make main function available at package level
+    return workflow_main()
+
+
 __all__ = ["main"]

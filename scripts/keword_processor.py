@@ -461,7 +461,7 @@ def apply_letter_block_updates(target_lines, target_blocks, ai_updates, tabs_reg
     return result_lines
 
 
-def process_keyword_file(file_path, keyword_data, pr_url, github_client, ai_client, repo_config):
+def process_keyword_file(file_path, keyword_data, source_context_or_pr_url, github_client, ai_client, repo_config):
     """Apply AI-updated TabsPanel letter changes to a keyword file.
 
     Returns:
@@ -522,7 +522,7 @@ def process_keyword_file(file_path, keyword_data, pr_url, github_client, ai_clie
         return False
 
 
-def process_keyword_files(keyword_files, pr_url, github_client, ai_client, repo_config):
+def process_keyword_files(keyword_files, source_context_or_pr_url, github_client, ai_client, repo_config):
     """Process all keyword files.
 
     Returns:
@@ -541,7 +541,7 @@ def process_keyword_files(keyword_files, pr_url, github_client, ai_client, repo_
         success = process_keyword_file(
             file_path,
             kw_data,
-            pr_url,
+            source_context_or_pr_url,
             github_client,
             ai_client,
             repo_config,

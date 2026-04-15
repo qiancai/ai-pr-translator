@@ -25,7 +25,7 @@ from github import Github
 
 # Import all modules
 from ai_client import UnifiedAIClient, thread_safe_print, print_lock, PROVIDER_MAX_TOKENS
-from pr_analyzer import analyze_source_changes, get_repo_config, get_target_hierarchy_and_content
+from diff_analyzer import analyze_source_changes, get_repo_config, get_target_hierarchy_and_content
 from file_adder import process_added_files
 from file_deleter import process_deleted_files
 from file_updater import process_files_in_batches, process_added_sections, process_modified_sections, process_deleted_sections
@@ -162,7 +162,7 @@ def check_source_token_limit(source_diff_dict_file, token_limit=SOURCE_TOKEN_LIM
 def get_pr_diff(pr_url, github_client):
     """Get the diff content from a GitHub PR (from auto-sync-pr-changes.py)"""
     try:
-        from pr_analyzer import parse_pr_url
+        from diff_analyzer import parse_pr_url
         owner, repo, pr_number = parse_pr_url(pr_url)
         repository = github_client.get_repo(f"{owner}/{repo}")
         pr = repository.get_pull(pr_number)
@@ -293,7 +293,7 @@ def determine_file_processing_type(source_file_path, file_sections, special_file
     # For all other modified files, use regular processing
     return "regular_modified"
 
-def process_regular_modified_file(source_file_path, file_sections, file_diff, pr_url, github_client, ai_client, repo_config, max_sections, glossary_matcher=None, dry_run=False):
+def process_regular_modified_file(source_file_path, file_sections, file_diff, source_context_or_pr_url, github_client, ai_client, repo_config, max_sections, glossary_matcher=None, dry_run=False):
     """Process a regular markdown file that has been modified"""
     try:
         print(f"   📝 Processing as regular modified file: {source_file_path}")
@@ -312,7 +312,7 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, pr
         import json
         import os
         from section_matcher import match_source_diff_to_target
-        from pr_analyzer import get_target_hierarchy_and_content
+        from diff_analyzer import get_target_hierarchy_and_content
         
         # Load source-diff-dict.json with file prefix
         temp_dir = ensure_temp_output_dir()
@@ -389,7 +389,7 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, pr
         }
         
         # Call the existing process_modified_sections function to get AI translation
-        results = process_modified_sections(file_data, file_diff, pr_url, github_client, ai_client, repo_config, max_sections, glossary_matcher=glossary_matcher, dry_run=dry_run)
+        results = process_modified_sections(file_data, file_diff, source_context_or_pr_url, github_client, ai_client, repo_config, max_sections, glossary_matcher=glossary_matcher, dry_run=dry_run)
 
         if dry_run:
             print(f"   ⏸️  Dry-run mode: prompts saved, skipping AI translation and target update")
@@ -455,7 +455,7 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, pr
 
 def get_local_repo_config(pr_url):
     """Get repository configuration using local config"""
-    from pr_analyzer import parse_pr_url
+    from diff_analyzer import parse_pr_url
     
     owner, repo, pr_number = parse_pr_url(pr_url)
     source_repo = f"{owner}/{repo}"
@@ -559,10 +559,13 @@ def main():
     # Step 1: Get PR diff
     print(f"\n📋 Step 1: Getting PR diff...")
     pr_diff = get_pr_diff(pr_url, github_client)
-    if not pr_diff:
+    if pr_diff is None:
         print("❌ Could not get PR diff")
         return
-    print(f"✅ Got PR diff: {len(pr_diff)} characters")
+    if pr_diff:
+        print(f"✅ Got PR diff: {len(pr_diff)} characters")
+    else:
+        print("⚠️  No markdown patch text found in this PR, continuing with file/image processing only")
     
     # Build list of folders to exclude early (before expensive per-file processing)
     exclude_folders = []
@@ -633,10 +636,13 @@ def main():
             
             # Extract file-specific diff from the complete PR diff
             print(f"   🔍 Extracting file-specific diff for: {source_file_path}")
-            file_specific_diff = extract_file_diff_from_pr(pr_diff, source_file_path)
+            file_specific_diff = extract_file_diff_from_pr(pr_diff, source_file_path) if pr_diff else ""
             
             if not file_specific_diff:
-                print(f"   ⚠️  No diff found for {source_file_path}, skipping...")
+                if pr_diff:
+                    print(f"   ⚠️  No diff found for {source_file_path}, skipping...")
+                else:
+                    print(f"   ⚠️  No markdown patch text available for {source_file_path}, skipping section-level translation.")
                 continue
             
             print(f"   📊 File-specific diff: {len(file_specific_diff)} chars")

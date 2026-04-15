@@ -236,13 +236,18 @@ def get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_di
 
 3. Current target sections in {target_language}:
 {formatted_target_sections}
+
+4. Glossary for terms in {source_language} and {target_language}:
 {glossary_prompt_section}
+
 Task: Update the target sections in {target_language} according to the diff in {source_language}.
 
 Instructions:
 1. Carefully analyze the PR diff to identify exactly which source lines and words changed in {source_language}.
-2. According to the diff, identify the lines that should be updated accordingly in {target_language}. For lines that needs to be updated in {target_language}, apply the corresponding minimal edits according to the diff. For lines not changed or not included in the diff, make sure to keep the corresponding target lines byte-for-byte identical (same wording, punctuation, spacing, indentation, list markers, and line breaks), which means do not add, remove, or modify lines not included in the diff.
-3. Never rewrite style, improve wording, or rephrase unaffected content.
+2. According to the diff, identify the lines that should be updated accordingly in {target_language}. For lines that needs to be updated in {target_language}, apply the corresponding minimal edits according to the diff. For lines not changed or not included in the diff, make sure to keep the corresponding target lines byte-for-byte identical (same wording, punctuation, spacing, indentation, list markers, and line breaks), which means Do Not add, remove, or modify lines not included in the diff. Never rewrite style, improve wording, or rephrase unaffected content.
+3. Translation rules:
+   - Keep doc variables wrapped in {{{ }}} such as {{{ .starter }}} in English.
+   - Keep UI button/label names wrapped in ** such as **My TiDB** in English.
 4. Keep the JSON structure unchanged, only modify section content where required by the diff.
 5. Ensure updated target content is logically consistent with the source diff. If uncertain, prefer leaving a line unchanged rather than rewriting.{glossary_instruction}
 
@@ -768,7 +773,7 @@ def insert_sections_into_document(file_path, translated_sections, target_inserti
         thread_safe_print(f"   ❌ Error inserting sections: {sanitize_exception_message(e)}")
         return False
 
-def process_modified_sections(modified_sections, pr_diff, pr_url, github_client, ai_client, repo_config, max_non_system_sections=120, glossary_matcher=None, dry_run=False):
+def process_modified_sections(modified_sections, pr_diff, source_context_or_pr_url, github_client, ai_client, repo_config, max_non_system_sections=120, glossary_matcher=None, dry_run=False):
     """Process modified sections with full data structure support"""
     results = []
     
@@ -781,7 +786,7 @@ def process_modified_sections(modified_sections, pr_diff, pr_url, github_client,
                 file_path, 
                 file_data,  # Pass the complete data structure (includes 'sections', 'original_hierarchy', etc.)
                 pr_diff, 
-                pr_url, 
+                source_context_or_pr_url, 
                 github_client, 
                 ai_client, 
                 repo_config, 
@@ -804,7 +809,7 @@ def process_modified_sections(modified_sections, pr_diff, pr_url, github_client,
     
     return results
 
-def process_deleted_sections(deleted_sections, pr_url, github_client, ai_client, repo_config, max_non_system_sections=120):
+def process_deleted_sections(deleted_sections, source_context_or_pr_url, github_client, ai_client, repo_config, max_non_system_sections=120):
     """Process deleted sections with full data structure support"""
     results = []
     
@@ -816,7 +821,7 @@ def process_deleted_sections(deleted_sections, pr_url, github_client, ai_client,
             success, message = process_single_file_deletion(
                 file_path, 
                 source_sections, 
-                pr_url, 
+                source_context_or_pr_url, 
                 github_client, 
                 ai_client, 
                 repo_config, 
@@ -837,11 +842,11 @@ def process_deleted_sections(deleted_sections, pr_url, github_client, ai_client,
     
     return results
 
-def process_single_file_deletion(file_path, source_sections, pr_url, github_client, ai_client, repo_config, max_non_system_sections=120):
+def process_single_file_deletion(file_path, source_sections, source_context_or_pr_url, github_client, ai_client, repo_config, max_non_system_sections=120):
     """Process deletion of sections in a single file"""
     
     # Import needed functions
-    from pr_analyzer import get_target_hierarchy_and_content
+    from diff_analyzer import get_target_hierarchy_and_content
     from section_matcher import (
         find_direct_matches_for_special_files, 
         filter_non_system_sections, 
@@ -967,7 +972,7 @@ def delete_sections_from_document(file_path, sections_to_delete, target_local_pa
         content = ''.join(lines)
         
         # Import needed function
-        from pr_analyzer import build_hierarchy_dict
+        from diff_analyzer import build_hierarchy_dict
         
         # Build hierarchy to understand section boundaries
         target_hierarchy = build_hierarchy_dict(content)
@@ -1018,7 +1023,7 @@ def delete_sections_from_document(file_path, sections_to_delete, target_local_pa
         )
         return False
 
-def process_single_file(file_path, source_sections, pr_diff, pr_url, github_client, ai_client, repo_config, max_non_system_sections=120, glossary_matcher=None, dry_run=False):
+def process_single_file(file_path, source_sections, pr_diff, source_context_or_pr_url, github_client, ai_client, repo_config, max_non_system_sections=120, glossary_matcher=None, dry_run=False):
     """Process a single file - thread-safe function for parallel processing"""
     thread_id = threading.current_thread().name
     thread_safe_print(f"\n📄 [{thread_id}] Processing {file_path}")
@@ -1027,7 +1032,7 @@ def process_single_file(file_path, source_sections, pr_diff, pr_url, github_clie
         # Check if this is a TOC file with special operations
         if isinstance(source_sections, dict) and 'type' in source_sections and source_sections['type'] == 'toc':
             from toc_processor import process_toc_file
-            return process_toc_file(file_path, source_sections, pr_url, github_client, ai_client, repo_config)
+            return process_toc_file(file_path, source_sections, source_context_or_pr_url, github_client, ai_client, repo_config)
         
         # Check if this is enhanced sections
         if isinstance(source_sections, dict) and 'sections' in source_sections:
@@ -1090,7 +1095,7 @@ def process_single_file(file_path, source_sections, pr_diff, pr_url, github_clie
         
         # Regular file processing continues here for old format
         # Get target hierarchy and content (get-target-affected-hierarchy.py logic)
-        from pr_analyzer import get_target_hierarchy_and_content
+        from diff_analyzer import get_target_hierarchy_and_content
         target_hierarchy, target_lines = get_target_hierarchy_and_content(
             file_path,
             github_client,
@@ -1225,7 +1230,7 @@ def process_single_file(file_path, source_sections, pr_diff, pr_url, github_clie
         
         # Extract target sections (get-target-affected-sections.py logic)
         thread_safe_print(f"   [{thread_id}] 📝 Extracting target sections...")
-        from pr_analyzer import extract_affected_sections
+        from diff_analyzer import extract_affected_sections
         target_sections = extract_affected_sections(target_affected, target_lines)
         
         # Extract source old content from the enhanced data structure
@@ -1270,7 +1275,7 @@ def process_single_file(file_path, source_sections, pr_diff, pr_url, github_clie
         thread_safe_print(f"   [{thread_id}] ❌ Error processing {file_path}: {sanitized}")
         return False, f"Error processing {file_path}: {sanitized}"
 
-def process_added_sections(added_sections, pr_diff, pr_url, github_client, ai_client, repo_config, max_non_system_sections=120, glossary_matcher=None):
+def process_added_sections(added_sections, pr_diff, source_context_or_pr_url, github_client, ai_client, repo_config, max_non_system_sections=120, glossary_matcher=None):
     """Process added sections by translating and inserting them"""
     if not added_sections:
         thread_safe_print("\n➕ No added sections to process")
@@ -1280,7 +1285,7 @@ def process_added_sections(added_sections, pr_diff, pr_url, github_client, ai_cl
     
     # Import needed functions
     from section_matcher import map_insertion_points_to_target
-    from pr_analyzer import get_target_hierarchy_and_content
+    from diff_analyzer import get_target_hierarchy_and_content
     
     for file_path, section_data in added_sections.items():
         thread_safe_print(f"\n➕ Processing added sections in {file_path}")
@@ -1303,7 +1308,7 @@ def process_added_sections(added_sections, pr_diff, pr_url, github_client, ai_cl
         
         # Map insertion points to target language
         target_insertion_points = map_insertion_points_to_target(
-            insertion_points, target_hierarchy, target_lines, file_path, pr_url, github_client, ai_client, repo_config, max_non_system_sections
+            insertion_points, target_hierarchy, target_lines, file_path, source_context_or_pr_url, github_client, ai_client, repo_config, max_non_system_sections
         )
         
         if not target_insertion_points:
@@ -1340,7 +1345,7 @@ def process_added_sections(added_sections, pr_diff, pr_url, github_client, ai_cl
         else:
             thread_safe_print(f"   ⚠️  No sections were translated for {file_path}")
 
-def process_files_in_batches(source_changes, pr_diff, pr_url, github_client, ai_client, repo_config, operation_type="modified", batch_size=5, max_non_system_sections=120, glossary_matcher=None):
+def process_files_in_batches(source_changes, pr_diff, source_context_or_pr_url, github_client, ai_client, repo_config, operation_type="modified", batch_size=5, max_non_system_sections=120, glossary_matcher=None):
     """Process files in parallel batches"""
     # Handle different data formats
     if isinstance(source_changes, dict):
@@ -1389,7 +1394,7 @@ def process_files_in_batches(source_changes, pr_diff, pr_url, github_client, ai_
                     file_path, 
                     source_sections, 
                     pr_diff, 
-                    pr_url, 
+                    source_context_or_pr_url, 
                     github_client, 
                     ai_client,
                     repo_config,

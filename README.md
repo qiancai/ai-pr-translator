@@ -1,6 +1,6 @@
 # AI PR Translator
 
-An intelligent documentation translator that automatically synchronizes documentation updates made in a pull request from the source language to the target language using AI-powered alignment and translation. Ideal for maintaining consistent, up-to-date multilingual documentation across folders or repositories.
+An intelligent documentation translator that automatically synchronizes incremental documentation updates from a source language repository to a target language repository using AI-powered alignment and translation. It supports both pull request diff sync and commit diff sync, making it suitable for contributor-driven PR updates as well as scheduled translation workflows.
 
 ## Why use this tool?
 
@@ -19,7 +19,7 @@ An intelligent documentation translator that automatically synchronizes document
 
 ### Safety and precision
 
-- **Non-destructive updates**: Only modifies sections that actually changed in the source PR
+- **Non-destructive updates**: Only modifies sections that actually changed in the source diff
 - **Preserves untouched content**: Sections not mentioned in the source diff remain completely unchanged in the target
 - **Section-level granularity**: Surgical precision in applying updates, avoiding accidental overwrites
 
@@ -36,6 +36,7 @@ An intelligent documentation translator that automatically synchronizes document
 ### Core capabilities
 
 - **🔄 Automated PR Synchronization**: Analyzes source PR changes and applies translated updates to target repository
+- **🕒 Commit-Based Incremental Sync**: Analyzes source commit ranges and creates target-language updates from `base_ref -> head_ref` diffs
 - **🤖 AI-Powered Translation**: Supports multiple AI providers (DeepSeek, Gemini) for high-quality technical translation
 - **📄 Smart File Operations**: Handles added, deleted, and modified files intelligently
 - **🎯 Section-Level Matching**: Advanced algorithms match source and target document sections with high accuracy
@@ -76,7 +77,9 @@ An intelligent documentation translator that automatically synchronizes document
 
 ### Environment variables
 
-Set the following environment variables:
+Set the variables for the mode you want to run.
+
+#### PR mode (`main_workflow.py`)
 
 ```bash
 # Required
@@ -100,16 +103,57 @@ export SOURCE_TOKEN_LIMIT=5000
 export AI_MAX_TOKENS=20000
 ```
 
+#### Commit-based mode (`commit_sync_workflow.py`)
+
+```bash
+# Required
+export SOURCE_REPO="owner/repo"
+export TARGET_REPO="owner/repo-cn"
+export GITHUB_TOKEN="your_github_token"
+export TARGET_REPO_PATH="/path/to/target/repo"
+export SOURCE_BASE_REF="abc123"
+export SOURCE_HEAD_REF="def456"
+
+# Optional: source branch label for logs / workflow context
+export SOURCE_BRANCH="main"
+
+# Optional: limit sync scope to a folder or explicit files
+export SOURCE_FOLDER="ai"
+export SOURCE_FILES="ai/foo.md,ai/bar.md"
+
+# AI Provider and glossary
+export AI_PROVIDER="deepseek"  # or "gemini"
+export TERMS_PATH="/path/to/terms.md"
+```
+
+`commit_sync_workflow.py` always uses the explicit `SOURCE_BASE_REF -> SOURCE_HEAD_REF` compare range passed in by the caller.
+
 ## Usage
 
-### Basic usage
+### PR mode
 
 ```bash
 cd scripts
 python main_workflow.py
 ```
 
+### Commit-based mode
+
+```bash
+cd scripts
+python commit_sync_workflow.py
+```
+
+For local verification with explicit source commits, you can also edit `scripts/commit_sync_workflow_local.py` and set `SOURCE_BASE_REF` / `SOURCE_HEAD_REF` directly before running:
+
+```bash
+cd scripts
+python commit_sync_workflow_local.py
+```
+
 ### GitHub actions
+
+#### PR-based sync
 
 Create a workflow file (`.github/workflows/sync-docs.yml`):
 
@@ -150,14 +194,19 @@ jobs:
           python main_workflow.py
 ```
 
+#### Scheduled commit-based sync
+
+Use `commit_sync_workflow.py` when you want another workflow to compute a source commit range and pass it in explicitly, for example after reading a cursor file such as `latest_translation_commit.json` in the target repository and comparing it to the current source branch HEAD.
+
 ## Architecture
 
 ### Module Overview
 
 ```text
 scripts/
-├── main_workflow.py      # Main orchestration and workflow entry point
-├── pr_analyzer.py        # PR analysis, diff parsing, hierarchy building
+├── main_workflow.py      # PR-based orchestration entry point
+├── commit_sync_workflow.py # Commit-based orchestration entry point for scheduled sync
+├── diff_analyzer.py      # Shared diff analysis for PR and commit workflows
 ├── section_matcher.py    # Section matching (direct + AI fuzzy matching)
 ├── glossary.py           # Glossary loading, term matching, and prompt formatting
 ├── file_adder.py         # New file processing and translation
@@ -171,29 +220,34 @@ scripts/
 
 ```mermaid
 graph TD
-    A[Start] --> B[Analyze Source PR]
-    B --> C[Categorize Changes]
-    C --> D{File Operation Type}
-    D -->|Added| E[Translate New Files]
-    D -->|Deleted| F[Remove Target Files]
-    D -->|Modified| G[Match Sections]
-    D -->|TOC| H[Process TOC Specially]
-    G --> I[AI Translation]
-    E --> I
-    H --> I
-    I --> J[Update Target Files]
-    J --> K[Create/Update Target PR]
-    K --> L[End]
+    A[Start] --> B{"Source Diff Type"}
+    B -->|PR| C[Analyze Source PR]
+    B -->|Commit Range| D[Analyze Commit Compare]
+    C --> E[Categorize Changes]
+    D --> E
+    E --> F{File Operation Type}
+    F -->|Added| G[Translate New Files]
+    F -->|Deleted| H[Remove Target Files]
+    F -->|Modified| I[Match Sections]
+    F -->|TOC| J[Process TOC Specially]
+    I --> K[AI Translation]
+    G --> K
+    J --> K
+    K --> L[Update Target Files]
+    L --> M[Create or Update Target PR]
+    M --> N[End]
 ```
 
 ### Processing Pipeline
 
-1. **PR Analysis** (`pr_analyzer.py`)
-   - Fetches PR diff from GitHub to identify **only what changed**
+1. **Diff Analysis** (`diff_analyzer.py`)
+   - Fetches a PR diff or a commit compare from GitHub to identify **only what changed**
    - Parses markdown files and builds document hierarchy
    - Categorizes changes by operation type (added/modified/deleted)
    - Extracts section content and metadata
    - **Benefit**: Eliminates unnecessary translation of unchanged content
+
+   In commit-based mode, `commit_sync_workflow.py` only consumes the explicit compare range it is given. If you use a cursor file such as `latest_translation_commit.json`, that file should be managed by the caller workflow (for example in the target repository), not by this repo.
 
 2. **Section Matching** (`section_matcher.py`)
    - Direct matching for identical hierarchies
@@ -276,7 +330,8 @@ When updating technical documentation, the tool provides AI with your existing t
 - **Documentation Internationalization**: Maintain English and Chinese versions of technical docs with incremental updates
 - **Cross-Repository Sync**: Keep documentation in sync across multiple repos without re-translating unchanged content
 - **Translation Quality Assurance**: Review only the changed sections before merging, not entire documents
-- **Large-Scale Documentation**: Handle repositories with thousands of markdown files efficiently by translating only PR changes
+- **Large-Scale Documentation**: Handle repositories with thousands of markdown files efficiently by translating only incremental PR or commit changes
+- **Scheduled Folder Sync**: Periodically translate directories such as `docs/ai` from the source repo and automatically open a target-language PR
 
 ## License
 
