@@ -10,6 +10,21 @@ import subprocess
 import tiktoken
 from github import Github, Auth
 
+# Configuration from environment variables
+SOURCE_PR_URL = os.getenv("SOURCE_PR_URL")
+TARGET_PR_URL = os.getenv("TARGET_PR_URL")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+AI_PROVIDER = os.getenv("AI_PROVIDER", "deepseek")
+TARGET_REPO_PATH = os.getenv("TARGET_REPO_PATH")
+TIDB_CLOUD_ABSOLUTE_LINK_PREFIX = os.getenv(
+    "TIDB_CLOUD_ABSOLUTE_LINK_PREFIX",
+    "https://docs.pingcap.com/tidbcloud/",
+)
+os.environ.setdefault(
+    "TIDB_CLOUD_ABSOLUTE_LINK_PREFIX",
+    TIDB_CLOUD_ABSOLUTE_LINK_PREFIX,
+)
+
 # Import all modules
 from ai_client import UnifiedAIClient, thread_safe_print, print_lock, PROVIDER_MAX_TOKENS
 from diff_analyzer import analyze_source_changes, get_repo_config, get_target_hierarchy_and_content, parse_pr_url
@@ -22,13 +37,6 @@ from keword_processor import process_keyword_files
 from section_matcher import match_source_diff_to_target
 from glossary import load_glossary, create_glossary_matcher
 from log_sanitizer import sanitize_exception_message
-
-# Configuration from environment variables
-SOURCE_PR_URL = os.getenv("SOURCE_PR_URL")
-TARGET_PR_URL = os.getenv("TARGET_PR_URL")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-AI_PROVIDER = os.getenv("AI_PROVIDER", "deepseek")
-TARGET_REPO_PATH = os.getenv("TARGET_REPO_PATH")
 
 # Skip dealing with cloud docs when translating to Chinese
 SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH = os.getenv("SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH", "true").lower() == "true"

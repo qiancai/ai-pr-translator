@@ -9,6 +9,26 @@ import os
 
 from github import Auth, Github
 
+SOURCE_REPO = os.getenv("SOURCE_REPO")
+TARGET_REPO = os.getenv("TARGET_REPO")
+SOURCE_BRANCH = os.getenv("SOURCE_BRANCH", "master")
+SOURCE_BASE_REF = os.getenv("SOURCE_BASE_REF", "")
+SOURCE_HEAD_REF = os.getenv("SOURCE_HEAD_REF", "")
+SOURCE_FOLDER = os.getenv("SOURCE_FOLDER", "")
+SOURCE_FILES = os.getenv("SOURCE_FILES", "")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+AI_PROVIDER = os.getenv("AI_PROVIDER", "deepseek")
+TARGET_REPO_PATH = os.getenv("TARGET_REPO_PATH")
+TERMS_PATH = os.getenv("TERMS_PATH", "")
+TIDB_CLOUD_ABSOLUTE_LINK_PREFIX = os.getenv(
+    "TIDB_CLOUD_ABSOLUTE_LINK_PREFIX",
+    "https://docs.pingcap.com/tidbcloud/",
+)
+os.environ.setdefault(
+    "TIDB_CLOUD_ABSOLUTE_LINK_PREFIX",
+    TIDB_CLOUD_ABSOLUTE_LINK_PREFIX,
+)
+
 from ai_client import UnifiedAIClient, thread_safe_print
 from diff_analyzer import (
     build_commit_diff_context,
@@ -37,19 +57,6 @@ from main_workflow import (
     process_regular_modified_file,
 )
 from toc_processor import process_toc_files
-
-
-SOURCE_REPO = os.getenv("SOURCE_REPO")
-TARGET_REPO = os.getenv("TARGET_REPO")
-SOURCE_BRANCH = os.getenv("SOURCE_BRANCH", "master")
-SOURCE_BASE_REF = os.getenv("SOURCE_BASE_REF", "")
-SOURCE_HEAD_REF = os.getenv("SOURCE_HEAD_REF", "")
-SOURCE_FOLDER = os.getenv("SOURCE_FOLDER", "")
-SOURCE_FILES = os.getenv("SOURCE_FILES", "")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-AI_PROVIDER = os.getenv("AI_PROVIDER", "deepseek")
-TARGET_REPO_PATH = os.getenv("TARGET_REPO_PATH")
-TERMS_PATH = os.getenv("TERMS_PATH", "")
 
 
 def get_commit_repo_config():

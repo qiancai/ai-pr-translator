@@ -44,6 +44,11 @@ EXPLICIT_HEADING_ANCHOR_RE = re.compile(r'\s+\{#([^}]+)\}\s*$')
 NON_TOP_LEVEL_HEADING_RE = re.compile(r'^(#{2,10})\s+(.+?)\s*$')
 DOC_VARIABLE_EXAMPLE = "{{{ .starter }}}"
 ALIASES_LINE_RE = re.compile(r'^(?P<prefix>\+?)(?P<indent>\s*)aliases:(?P<spacing>\s*)(?P<value>.+?)\s*$')
+TIDB_CLOUD_LINK_RE = re.compile(r'\[([^\]]+)\]\((/tidb-cloud/[^)]+)\)')
+TIDB_CLOUD_ABSOLUTE_LINK_PREFIX = os.getenv(
+    "TIDB_CLOUD_ABSOLUTE_LINK_PREFIX",
+    "https://docs.pingcap.com/tidbcloud/",
+)
 
 
 def has_explicit_heading_anchor(heading_line):
@@ -114,6 +119,26 @@ def get_source_mode(source_context_or_pr_url):
     return "pr"
 
 
+def should_apply_tidb_cloud_link_rewrite(source_language, target_language, source_mode=""):
+    """Return True when /tidb-cloud/ markdown links should become absolute URLs."""
+    if (source_language or "").lower() != "english" or (target_language or "").lower() != "chinese":
+        return False
+
+    normalized_mode = (source_mode or "").lower()
+    if normalized_mode == "pr":
+        return True
+    if normalized_mode != "commit":
+        return False
+
+    source_folder = os.getenv("SOURCE_FOLDER", "").strip("/").strip()
+    return source_folder == "ai"
+
+
+def get_tidb_cloud_absolute_link_prefix():
+    """Return the configured absolute link prefix for /tidb-cloud/ rewrites."""
+    return os.getenv("TIDB_CLOUD_ABSOLUTE_LINK_PREFIX", TIDB_CLOUD_ABSOLUTE_LINK_PREFIX)
+
+
 def normalize_aliases_value_for_zh(value):
     """Add /zh to alias paths that do not already carry the zh prefix."""
     try:
@@ -162,15 +187,57 @@ def preprocess_aliases_line_for_zh(line, diff_added_only=False):
     )
 
 
+def build_tidb_cloud_absolute_url(relative_url):
+    """Convert /tidb-cloud/... markdown paths to docs.pingcap.com/tidbcloud absolute URLs."""
+    anchor = ""
+    path = relative_url
+    if "#" in relative_url:
+        path, anchor = relative_url.split("#", 1)
+
+    filename = os.path.basename(path.rstrip("/"))
+    if filename.endswith(".md"):
+        filename = filename[:-3]
+
+    if not filename:
+        return relative_url
+
+    prefix = get_tidb_cloud_absolute_link_prefix()
+    absolute = f"{prefix.rstrip('/')}/{filename}"
+    if anchor:
+        absolute = f"{absolute}#{anchor}"
+    return absolute
+
+
+def preprocess_tidb_cloud_links_in_line(line, diff_added_only=False):
+    """Rewrite /tidb-cloud/ markdown links to absolute URLs."""
+    if diff_added_only and not line.startswith("+"):
+        return line
+
+    def repl(match):
+        label = match.group(1)
+        relative_url = match.group(2)
+        absolute_url = build_tidb_cloud_absolute_url(relative_url)
+        return f"[{label}]({absolute_url})"
+
+    return TIDB_CLOUD_LINK_RE.sub(repl, line)
+
+
 def preprocess_diff_for_heading_anchor_stability(pr_diff, source_language, target_language, source_mode=""):
     """Add prompt-only stability tweaks for commit-based English -> Chinese translation."""
     if not pr_diff:
         return pr_diff
 
-    if (source_mode or "").lower() != "commit":
+    if (source_language or "").lower() != "english" or (target_language or "").lower() != "chinese":
         return pr_diff
 
-    if (source_language or "").lower() != "english" or (target_language or "").lower() != "chinese":
+    enable_commit_only_preprocessing = (source_mode or "").lower() == "commit"
+    enable_tidb_cloud_link_rewrite = should_apply_tidb_cloud_link_rewrite(
+        source_language,
+        target_language,
+        source_mode=source_mode,
+    )
+
+    if not enable_commit_only_preprocessing and not enable_tidb_cloud_link_rewrite:
         return pr_diff
 
     lines = pr_diff.splitlines()
@@ -178,7 +245,7 @@ def preprocess_diff_for_heading_anchor_stability(pr_diff, source_language, targe
     i = 0
     while i < len(lines):
         line = lines[i]
-        if line.startswith('-') and not line.startswith('---'):
+        if enable_commit_only_preprocessing and line.startswith('-') and not line.startswith('---'):
             removed_heading = line[1:]
             removed_slug = extract_heading_anchor_slug(removed_heading)
             buffered = [line]
@@ -202,7 +269,10 @@ def preprocess_diff_for_heading_anchor_stability(pr_diff, source_language, targe
                 i = j
                 continue
 
-        line = preprocess_aliases_line_for_zh(line, diff_added_only=True)
+        if enable_commit_only_preprocessing:
+            line = preprocess_aliases_line_for_zh(line, diff_added_only=True)
+        if enable_tidb_cloud_link_rewrite:
+            line = preprocess_tidb_cloud_links_in_line(line, diff_added_only=True)
         processed_lines.append(line)
         i += 1
 

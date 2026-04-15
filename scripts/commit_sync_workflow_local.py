@@ -24,6 +24,7 @@ SOURCE_FILES = "ai/integrations/vector-search-integrate-with-jinaai-embedding.md
 
 AI_PROVIDER = "deepseek"  # Options: "deepseek", "gemini", "openai", "azure"
 TARGET_REPO_PATH = "/Users/grcai/Documents/GitHub/docs-cn"
+TIDB_CLOUD_ABSOLUTE_LINK_PREFIX = "https://docs.pingcap.com/tidbcloud/"
 
 # Optional glossary path.
 TERMS_PATH = "/Users/grcai/Documents/GitHub/docs/resources/terms.md"
@@ -45,6 +46,7 @@ def main():
         "TARGET_REPO_PATH": TARGET_REPO_PATH,
         "AI_PROVIDER": AI_PROVIDER,
         "TERMS_PATH": TERMS_PATH,
+        "TIDB_CLOUD_ABSOLUTE_LINK_PREFIX": TIDB_CLOUD_ABSOLUTE_LINK_PREFIX,
         "SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH": str(SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH).lower(),
         "SKIP_TRANSLATING_AI_DOCS_TO_ZH": str(SKIP_TRANSLATING_AI_DOCS_TO_ZH).lower(),
     }

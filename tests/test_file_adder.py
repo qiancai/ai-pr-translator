@@ -1,6 +1,8 @@
+import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
@@ -67,6 +69,34 @@ class FileAdderRegressionTest(unittest.TestCase):
             "aliases: ['/zh/tidb/stable/saas-best-practices/','/zh/tidb/dev/saas-best-practices/']",
             processed,
         )
+
+    def test_preprocess_added_file_batch_rewrites_tidb_cloud_links_in_pr_mode(self):
+        batch = "See [Private Endpoints](/tidb-cloud/test/set-up-private-endpoint-connections-serverless2.md)."
+
+        processed = preprocess_added_file_batch_for_heading_anchor_stability(
+            batch,
+            source_language="English",
+            target_language="Chinese",
+            source_mode="pr",
+        )
+
+        self.assertEqual(
+            processed,
+            "See [Private Endpoints](https://docs.pingcap.com/tidbcloud/set-up-private-endpoint-connections-serverless2).",
+        )
+
+    def test_preprocess_added_file_batch_rewrites_tidb_cloud_links_only_for_ai_commit_scope(self):
+        batch = "See [Private Endpoints](/tidb-cloud/test/set-up-private-endpoint-connections-serverless2.md)."
+
+        with mock.patch.dict(os.environ, {"SOURCE_FOLDER": "docs"}, clear=False):
+            processed = preprocess_added_file_batch_for_heading_anchor_stability(
+                batch,
+                source_language="English",
+                target_language="Chinese",
+                source_mode="commit",
+            )
+
+        self.assertEqual(processed, batch)
 
 
 if __name__ == "__main__":

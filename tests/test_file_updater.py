@@ -1,8 +1,10 @@
 import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
@@ -81,6 +83,28 @@ class FileUpdaterRegressionTest(unittest.TestCase):
 
         self.assertEqual(processed, pr_diff)
 
+    def test_preprocess_diff_rewrites_tidb_cloud_links_in_pr_mode(self):
+        pr_diff = "\n".join(
+            [
+                "File: ai/example.md",
+                "@@ -10,1 +10,1 @@",
+                "+See [Private Endpoints](/tidb-cloud/test/set-up-private-endpoint-connections-serverless3.md#examples).",
+                "-" * 80,
+            ]
+        )
+
+        processed = preprocess_diff_for_heading_anchor_stability(
+            pr_diff,
+            source_language="English",
+            target_language="Chinese",
+            source_mode="pr",
+        )
+
+        self.assertIn(
+            "+See [Private Endpoints](https://docs.pingcap.com/tidbcloud/set-up-private-endpoint-connections-serverless3#examples).",
+            processed,
+        )
+
     def test_preprocess_diff_does_not_add_anchor_for_heading_level_only_change(self):
         pr_diff = "\n".join(
             [
@@ -120,6 +144,49 @@ class FileUpdaterRegressionTest(unittest.TestCase):
 
         self.assertIn(
             "+aliases: ['/zh/tidb/stable/saas-best-practices/','/zh/tidb/dev/saas-best-practices/']",
+            processed,
+        )
+
+    def test_preprocess_diff_rewrites_tidb_cloud_links_only_for_ai_commit_scope(self):
+        pr_diff = "\n".join(
+            [
+                "File: docs/example.md",
+                "@@ -1,1 +1,1 @@",
+                "+See [Private Endpoints](/tidb-cloud/test/set-up-private-endpoint-connections-serverless2.md).",
+                "-" * 80,
+            ]
+        )
+
+        with mock.patch.dict(os.environ, {"SOURCE_FOLDER": "docs"}, clear=False):
+            processed = preprocess_diff_for_heading_anchor_stability(
+                pr_diff,
+                source_language="English",
+                target_language="Chinese",
+                source_mode="commit",
+            )
+
+        self.assertEqual(processed, pr_diff)
+
+    def test_preprocess_diff_rewrites_tidb_cloud_links_for_ai_commit_scope(self):
+        pr_diff = "\n".join(
+            [
+                "File: ai/example.md",
+                "@@ -1,1 +1,1 @@",
+                "+See [Private Endpoints](/tidb-cloud/test/set-up-private-endpoint-connections-serverless2.md).",
+                "-" * 80,
+            ]
+        )
+
+        with mock.patch.dict(os.environ, {"SOURCE_FOLDER": "ai"}, clear=False):
+            processed = preprocess_diff_for_heading_anchor_stability(
+                pr_diff,
+                source_language="English",
+                target_language="Chinese",
+                source_mode="commit",
+            )
+
+        self.assertIn(
+            "+See [Private Endpoints](https://docs.pingcap.com/tidbcloud/set-up-private-endpoint-connections-serverless2).",
             processed,
         )
 

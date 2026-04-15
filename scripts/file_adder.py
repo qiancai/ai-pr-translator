@@ -78,18 +78,33 @@ def preprocess_added_file_batch_for_heading_anchor_stability(batch_content, sour
     if not batch_content:
         return batch_content
 
-    if (source_mode or "").lower() != "commit":
-        return batch_content
-
     if (source_language or "").lower() != "english" or (target_language or "").lower() != "chinese":
         return batch_content
 
-    from file_updater import add_heading_anchor_if_needed, preprocess_aliases_line_for_zh
+    from file_updater import (
+        add_heading_anchor_if_needed,
+        preprocess_aliases_line_for_zh,
+        preprocess_tidb_cloud_links_in_line,
+        should_apply_tidb_cloud_link_rewrite,
+    )
+
+    enable_commit_only_preprocessing = (source_mode or "").lower() == "commit"
+    enable_tidb_cloud_link_rewrite = should_apply_tidb_cloud_link_rewrite(
+        source_language,
+        target_language,
+        source_mode=source_mode,
+    )
+
+    if not enable_commit_only_preprocessing and not enable_tidb_cloud_link_rewrite:
+        return batch_content
 
     processed_lines = []
     for line in batch_content.splitlines():
-        line = add_heading_anchor_if_needed(line)
-        line = preprocess_aliases_line_for_zh(line, diff_added_only=False)
+        if enable_commit_only_preprocessing:
+            line = add_heading_anchor_if_needed(line)
+            line = preprocess_aliases_line_for_zh(line, diff_added_only=False)
+        if enable_tidb_cloud_link_rewrite:
+            line = preprocess_tidb_cloud_links_in_line(line, diff_added_only=False)
         processed_lines.append(line)
     return "\n".join(processed_lines)
 

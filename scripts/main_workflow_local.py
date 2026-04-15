@@ -3,11 +3,12 @@ Main Entry Point
 Orchestrates the entire auto-sync workflow
 """
 
-SOURCE_PR_URL = "https://github.com/pingcap/docs-cn/pull/21434"
-AI_PROVIDER = "azure"  # Options: "deepseek", "gemini", "openai", "azure"
+SOURCE_PR_URL = "https://github.com/pingcap/docs/pull/22655"
+AI_PROVIDER = "deepseek"  # Options: "deepseek", "gemini", "openai", "azure"
 zh_doc_local_path = "/Users/grcai/Documents/GitHub/docs-cn"
 en_doc_local_path = "/Users/grcai/Documents/GitHub/docs"
 terms_path = "/Users/grcai/Documents/GitHub/docs/resources/terms.md"
+TIDB_CLOUD_ABSOLUTE_LINK_PREFIX = "https://docs.pingcap.com/tidbcloud/"
 
 SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH = True
 CLOUD_FOLDER_NAME = "tidb-cloud"
@@ -22,6 +23,11 @@ import os
 import json
 import tiktoken
 from github import Github
+
+os.environ.setdefault(
+    "TIDB_CLOUD_ABSOLUTE_LINK_PREFIX",
+    TIDB_CLOUD_ABSOLUTE_LINK_PREFIX,
+)
 
 # Import all modules
 from ai_client import UnifiedAIClient, thread_safe_print, print_lock, PROVIDER_MAX_TOKENS
