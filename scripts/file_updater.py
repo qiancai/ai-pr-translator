@@ -6,6 +6,7 @@ Handles processing and translation of updated files and sections
 import os
 import re
 import json
+import ast
 import difflib
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -42,6 +43,7 @@ def is_markdown_heading(line):
 EXPLICIT_HEADING_ANCHOR_RE = re.compile(r'\s+\{#([^}]+)\}\s*$')
 NON_TOP_LEVEL_HEADING_RE = re.compile(r'^(#{2,10})\s+(.+?)\s*$')
 DOC_VARIABLE_EXAMPLE = "{{{ .starter }}}"
+ALIASES_LINE_RE = re.compile(r'^(?P<prefix>\+?)(?P<indent>\s*)aliases:(?P<spacing>\s*)(?P<value>.+?)\s*$')
 
 
 def has_explicit_heading_anchor(heading_line):
@@ -112,8 +114,56 @@ def get_source_mode(source_context_or_pr_url):
     return "pr"
 
 
+def normalize_aliases_value_for_zh(value):
+    """Add /zh to alias paths that do not already carry the zh prefix."""
+    try:
+        aliases = ast.literal_eval(value)
+    except (SyntaxError, ValueError):
+        return value
+
+    if not isinstance(aliases, list):
+        return value
+
+    normalized = []
+    changed = False
+    for alias in aliases:
+        if not isinstance(alias, str):
+            return value
+
+        updated = alias
+        if alias.startswith("/") and alias != "/zh" and not alias.startswith("/zh/"):
+            updated = f"/zh{alias}"
+        normalized.append(updated)
+        if updated != alias:
+            changed = True
+
+    if not changed:
+        return value
+
+    return "[" + ",".join(repr(alias) for alias in normalized) + "]"
+
+
+def preprocess_aliases_line_for_zh(line, diff_added_only=False):
+    """Normalize aliases lines for English->Chinese translation prompts."""
+    if diff_added_only and not line.startswith("+"):
+        return line
+
+    match = ALIASES_LINE_RE.match(line)
+    if not match:
+        return line
+
+    normalized_value = normalize_aliases_value_for_zh(match.group("value"))
+    if normalized_value == match.group("value"):
+        return line
+
+    return (
+        f"{match.group('prefix')}{match.group('indent')}aliases:"
+        f"{match.group('spacing')}{normalized_value}"
+    )
+
+
 def preprocess_diff_for_heading_anchor_stability(pr_diff, source_language, target_language, source_mode=""):
-    """Add explicit anchors to changed non-top-level English headings before AI translation."""
+    """Add prompt-only stability tweaks for commit-based English -> Chinese translation."""
     if not pr_diff:
         return pr_diff
 
@@ -152,6 +202,7 @@ def preprocess_diff_for_heading_anchor_stability(pr_diff, source_language, targe
                 i = j
                 continue
 
+        line = preprocess_aliases_line_for_zh(line, diff_added_only=True)
         processed_lines.append(line)
         i += 1
 

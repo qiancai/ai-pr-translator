@@ -74,7 +74,7 @@ def create_section_batches(file_content, max_lines_per_batch=200):
     return batches
 
 def preprocess_added_file_batch_for_heading_anchor_stability(batch_content, source_language, target_language, source_mode=""):
-    """Add anchors to non-top-level headings for commit-based English -> Chinese file additions."""
+    """Add prompt-only stability tweaks for commit-based English -> Chinese file additions."""
     if not batch_content:
         return batch_content
 
@@ -84,11 +84,13 @@ def preprocess_added_file_batch_for_heading_anchor_stability(batch_content, sour
     if (source_language or "").lower() != "english" or (target_language or "").lower() != "chinese":
         return batch_content
 
-    from file_updater import add_heading_anchor_if_needed
+    from file_updater import add_heading_anchor_if_needed, preprocess_aliases_line_for_zh
 
     processed_lines = []
     for line in batch_content.splitlines():
-        processed_lines.append(add_heading_anchor_if_needed(line))
+        line = add_heading_anchor_if_needed(line)
+        line = preprocess_aliases_line_for_zh(line, diff_added_only=False)
+        processed_lines.append(line)
     return "\n".join(processed_lines)
 
 

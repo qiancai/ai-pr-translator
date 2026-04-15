@@ -47,6 +47,27 @@ class FileAdderRegressionTest(unittest.TestCase):
 
         self.assertEqual(processed, batch)
 
+    def test_preprocess_added_file_batch_adds_zh_prefix_to_aliases(self):
+        batch = "\n".join(
+            [
+                "---",
+                "aliases: ['/tidb/stable/saas-best-practices/','/zh/tidb/dev/saas-best-practices/']",
+                "---",
+            ]
+        )
+
+        processed = preprocess_added_file_batch_for_heading_anchor_stability(
+            batch,
+            source_language="English",
+            target_language="Chinese",
+            source_mode="commit",
+        )
+
+        self.assertIn(
+            "aliases: ['/zh/tidb/stable/saas-best-practices/','/zh/tidb/dev/saas-best-practices/']",
+            processed,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

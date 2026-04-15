@@ -101,6 +101,28 @@ class FileUpdaterRegressionTest(unittest.TestCase):
 
         self.assertEqual(processed, pr_diff)
 
+    def test_preprocess_diff_adds_zh_prefix_to_added_aliases(self):
+        pr_diff = "\n".join(
+            [
+                "File: ai/example.md",
+                "@@ -1,1 +1,1 @@",
+                "+aliases: ['/tidb/stable/saas-best-practices/','/zh/tidb/dev/saas-best-practices/']",
+                "-" * 80,
+            ]
+        )
+
+        processed = preprocess_diff_for_heading_anchor_stability(
+            pr_diff,
+            source_language="English",
+            target_language="Chinese",
+            source_mode="commit",
+        )
+
+        self.assertIn(
+            "+aliases: ['/zh/tidb/stable/saas-best-practices/','/zh/tidb/dev/saas-best-practices/']",
+            processed,
+        )
+
     def test_insert_preserves_unmodified_line_endings(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
