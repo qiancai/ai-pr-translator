@@ -38,6 +38,124 @@ def is_markdown_heading(line):
         return False
     return re.match(r'^#{1,10}\s+\S', line) is not None
 
+
+EXPLICIT_HEADING_ANCHOR_RE = re.compile(r'\s+\{#([^}]+)\}\s*$')
+NON_TOP_LEVEL_HEADING_RE = re.compile(r'^(#{2,10})\s+(.+?)\s*$')
+
+
+def has_explicit_heading_anchor(heading_line):
+    """Return True when a markdown heading already carries an explicit anchor."""
+    if not heading_line:
+        return False
+    return EXPLICIT_HEADING_ANCHOR_RE.search(heading_line.strip()) is not None
+
+
+def build_heading_anchor_slug(heading_text):
+    """Build a stable slug for an English markdown heading."""
+    if not heading_text:
+        return ""
+
+    text = EXPLICIT_HEADING_ANCHOR_RE.sub("", heading_text.strip())
+    text = re.sub(r'`([^`]*)`', r'\1', text)
+    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
+    # Ignore HTML tags themselves while preserving their visible text content.
+    text = re.sub(r'</?[^>]+>', ' ', text)
+    # Keep dotted version numbers compact in anchors, e.g. v4.0.10 -> v4010.
+    text = re.sub(r'(?<=\d)\.(?=\d)', '', text)
+    text = text.lower()
+    text = re.sub(r'[^a-z0-9\s-]', ' ', text)
+    text = re.sub(r'\s+', '-', text.strip())
+    text = re.sub(r'-+', '-', text)
+    return text.strip('-')
+
+
+def add_heading_anchor_if_needed(heading_line):
+    """Append an explicit anchor to a non-top-level heading when safe to do so."""
+    stripped = heading_line.rstrip()
+    if has_explicit_heading_anchor(stripped):
+        return heading_line
+
+    match = NON_TOP_LEVEL_HEADING_RE.match(stripped)
+    if not match:
+        return heading_line
+
+    heading_text = match.group(2)
+    slug = build_heading_anchor_slug(heading_text)
+    if not slug:
+        return heading_line
+
+    return f"{stripped} {{#{slug}}}"
+
+
+def extract_heading_anchor_slug(heading_line):
+    """Return the anchor slug implied by a heading line, if any."""
+    if not heading_line:
+        return ""
+
+    stripped = heading_line.rstrip()
+    explicit_match = EXPLICIT_HEADING_ANCHOR_RE.search(stripped)
+    if explicit_match:
+        return explicit_match.group(1).strip()
+
+    match = NON_TOP_LEVEL_HEADING_RE.match(stripped)
+    if not match:
+        return ""
+
+    return build_heading_anchor_slug(match.group(2))
+
+
+def get_source_mode(source_context_or_pr_url):
+    """Return the high-level source mode for the current workflow input."""
+    if isinstance(source_context_or_pr_url, dict):
+        return source_context_or_pr_url.get("mode", "")
+    return "pr"
+
+
+def preprocess_diff_for_heading_anchor_stability(pr_diff, source_language, target_language, source_mode=""):
+    """Add explicit anchors to changed non-top-level English headings before AI translation."""
+    if not pr_diff:
+        return pr_diff
+
+    if (source_mode or "").lower() != "commit":
+        return pr_diff
+
+    if (source_language or "").lower() != "english" or (target_language or "").lower() != "chinese":
+        return pr_diff
+
+    lines = pr_diff.splitlines()
+    processed_lines = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith('-') and not line.startswith('---'):
+            removed_heading = line[1:]
+            removed_slug = extract_heading_anchor_slug(removed_heading)
+            buffered = [line]
+            j = i + 1
+            consumed_replacement = False
+
+            while j < len(lines) and lines[j].startswith('+') and not lines[j].startswith('+++'):
+                added_line = lines[j]
+                added_heading = added_line[1:]
+                added_slug = extract_heading_anchor_slug(added_heading)
+
+                if removed_slug and added_slug and removed_slug != added_slug:
+                    added_line = f"+{add_heading_anchor_if_needed(added_heading)}"
+                    consumed_replacement = True
+
+                buffered.append(added_line)
+                j += 1
+
+            if consumed_replacement or len(buffered) > 1:
+                processed_lines.extend(buffered)
+                i = j
+                continue
+
+        processed_lines.append(line)
+        i += 1
+
+    return '\n'.join(processed_lines)
+
 def resolve_section_start_line(target_lines, target_line_num, target_hierarchy):
     """Resolve a robust 0-based section start line for replace/delete."""
     if target_line_num <= 0:
@@ -180,7 +298,7 @@ def enforce_minimal_target_updates(target_sections, updated_sections, pr_diff):
     return guarded
 
 
-def get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_dict, ai_client, source_language, target_language, target_file_name=None, glossary_matcher=None, dry_run=False):
+def get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_dict, ai_client, source_language, target_language, target_file_name=None, glossary_matcher=None, dry_run=False, source_mode=""):
     """Use AI to update target sections based on source old content, PR diff, and target sections"""
     if not source_old_content_dict or not target_sections:
         return {}
@@ -207,10 +325,12 @@ def get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_di
     total_source_chars = sum(len(str(content)) for content in source_sections.values())
     total_target_chars = sum(len(str(content)) for content in target_sections.values())
     thread_safe_print(f"   📏 Content size: Source={total_source_chars:,} chars, Target={total_target_chars:,} chars")
-
+    
     thread_safe_print(f"   🤖 Getting AI translation for {len(source_sections)} sections...")
 
-    diff_content = source_sections
+    prompt_pr_diff = preprocess_diff_for_heading_anchor_stability(
+        pr_diff, source_language, target_language, source_mode=source_mode
+    )
 
     # Build glossary section for prompt if matcher is provided
     glossary_prompt_section = ""
@@ -219,7 +339,7 @@ def get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_di
         from glossary import filter_terms_for_content, format_terms_for_prompt
         source_text = '\n'.join(str(v) for v in source_sections.values() if v)
         target_text = '\n'.join(str(v) for v in target_sections.values() if v)
-        matched_terms = filter_terms_for_content(glossary_matcher, source_text, target_text, pr_diff or '', source_language=source_language)
+        matched_terms = filter_terms_for_content(glossary_matcher, source_text, target_text, prompt_pr_diff or '', source_language=source_language)
         if matched_terms:
             glossary_text = format_terms_for_prompt(matched_terms)
             glossary_prompt_section = f"\n4. {glossary_text}\n"
@@ -232,7 +352,7 @@ def get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_di
 {formatted_source_sections}
 
 2. GitHub PR changes (Diff):
-{pr_diff}
+{prompt_pr_diff}
 
 3. Current target sections in {target_language}:
 {formatted_target_sections}
@@ -246,8 +366,9 @@ Instructions:
 1. Carefully analyze the PR diff to identify exactly which source lines and words changed in {source_language}.
 2. According to the diff, identify the lines that should be updated accordingly in {target_language}. For lines that needs to be updated in {target_language}, apply the corresponding minimal edits according to the diff. For lines not changed or not included in the diff, make sure to keep the corresponding target lines byte-for-byte identical (same wording, punctuation, spacing, indentation, list markers, and line breaks), which means Do Not add, remove, or modify lines not included in the diff. Never rewrite style, improve wording, or rephrase unaffected content.
 3. Translation rules:
-   - Keep doc variables wrapped in {{{ }}} such as {{{ .starter }}} in English.
+   - Keep doc variables wrapped in {{{{ }}}} such as {{{{ .starter }}}} in English.
    - Keep UI button/label names wrapped in ** such as **My TiDB** in English.
+   - Preserve explicit heading anchors such as {{#example-test}} exactly as they appear.
 4. Keep the JSON structure unchanged, only modify section content where required by the diff.
 5. Ensure updated target content is logically consistent with the source diff. If uncertain, prefer leaving a line unchanged rather than rewriting.{glossary_instruction}
 
@@ -290,7 +411,7 @@ Please return the complete updated JSON in the same format as target sections, w
     thread_safe_print(f"\n   📤 AI Update Prompt ({source_language} → {target_language}):")
     thread_safe_print(f"   " + "="*80)
     thread_safe_print(f"   Source Sections: {formatted_source_sections[:500]}...")
-    thread_safe_print(f"   PR Diff (first 500 chars): {pr_diff[:500]}...")
+    thread_safe_print(f"   PR Diff (first 500 chars): {prompt_pr_diff[:500]}...")
     thread_safe_print(f"   Target Sections: {formatted_target_sections[:500]}...")
     thread_safe_print(f"   " + "="*80)
 
@@ -1026,6 +1147,7 @@ def delete_sections_from_document(file_path, sections_to_delete, target_local_pa
 def process_single_file(file_path, source_sections, pr_diff, source_context_or_pr_url, github_client, ai_client, repo_config, max_non_system_sections=120, glossary_matcher=None, dry_run=False):
     """Process a single file - thread-safe function for parallel processing"""
     thread_id = threading.current_thread().name
+    source_mode = get_source_mode(source_context_or_pr_url)
     thread_safe_print(f"\n📄 [{thread_id}] Processing {file_path}")
     
     try:
@@ -1077,7 +1199,7 @@ def process_single_file(file_path, source_sections, pr_diff, source_context_or_p
                 
                 # Update sections with AI (get-updated-target-sections.py logic)
                 thread_safe_print(f"   [{thread_id}] 🤖 Getting updated sections from AI...")
-                updated_sections = get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_dict, ai_client, repo_config['source_language'], repo_config['target_language'], file_path, glossary_matcher=glossary_matcher, dry_run=dry_run)
+                updated_sections = get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_dict, ai_client, repo_config['source_language'], repo_config['target_language'], file_path, glossary_matcher=glossary_matcher, dry_run=dry_run, source_mode=source_mode)
                 if dry_run:
                     thread_safe_print(f"   [{thread_id}] ⏸️  Dry-run: prompt saved for {file_path}")
                     return True, {}
@@ -1251,7 +1373,7 @@ def process_single_file(file_path, source_sections, pr_diff, source_context_or_p
         
         # Update sections with AI (get-updated-target-sections.py logic)
         thread_safe_print(f"   [{thread_id}] 🤖 Getting updated sections from AI...")
-        updated_sections = get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_dict, ai_client, repo_config['source_language'], repo_config['target_language'], file_path, glossary_matcher=glossary_matcher, dry_run=dry_run)
+        updated_sections = get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_dict, ai_client, repo_config['source_language'], repo_config['target_language'], file_path, glossary_matcher=glossary_matcher, dry_run=dry_run, source_mode=source_mode)
         if dry_run:
             thread_safe_print(f"   [{thread_id}] ⏸️  Dry-run: prompt saved for {file_path}")
             return True, {}
@@ -1280,6 +1402,8 @@ def process_added_sections(added_sections, pr_diff, source_context_or_pr_url, gi
     if not added_sections:
         thread_safe_print("\n➕ No added sections to process")
         return
+
+    source_mode = get_source_mode(source_context_or_pr_url)
     
     thread_safe_print(f"\n➕ Processing added sections from {len(added_sections)} files...")
     
@@ -1335,7 +1459,8 @@ def process_added_sections(added_sections, pr_diff, source_context_or_pr_url, gi
             repo_config['source_language'], 
             repo_config['target_language'],
             file_path,
-            glossary_matcher=glossary_matcher
+            glossary_matcher=glossary_matcher,
+            source_mode=source_mode
         )
         
         if translated_sections:

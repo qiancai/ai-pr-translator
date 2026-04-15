@@ -73,19 +73,44 @@ def create_section_batches(file_content, max_lines_per_batch=200):
     
     return batches
 
-def translate_file_batch(batch_content, ai_client, source_language="English", target_language="Chinese", glossary_matcher=None):
+def preprocess_added_file_batch_for_heading_anchor_stability(batch_content, source_language, target_language, source_mode=""):
+    """Add anchors to non-top-level headings for commit-based English -> Chinese file additions."""
+    if not batch_content:
+        return batch_content
+
+    if (source_mode or "").lower() != "commit":
+        return batch_content
+
+    if (source_language or "").lower() != "english" or (target_language or "").lower() != "chinese":
+        return batch_content
+
+    from file_updater import add_heading_anchor_if_needed
+
+    processed_lines = []
+    for line in batch_content.splitlines():
+        processed_lines.append(add_heading_anchor_if_needed(line))
+    return "\n".join(processed_lines)
+
+
+def translate_file_batch(batch_content, ai_client, source_language="English", target_language="Chinese", glossary_matcher=None, source_mode=""):
     """Translate a single batch of file content using AI"""
     if not batch_content.strip():
         return batch_content
     
     thread_safe_print(f"   🤖 Translating batch ({len(batch_content.split())} words)...")
+    prompt_batch_content = preprocess_added_file_batch_for_heading_anchor_stability(
+        batch_content,
+        source_language,
+        target_language,
+        source_mode=source_mode,
+    )
 
     # Build glossary section for prompt if matcher is provided
     glossary_prompt_section = ""
     glossary_instruction = ""
     if glossary_matcher:
         from glossary import filter_terms_for_content, format_terms_for_prompt
-        matched_terms = filter_terms_for_content(glossary_matcher, batch_content, source_language=source_language)
+        matched_terms = filter_terms_for_content(glossary_matcher, prompt_batch_content, source_language=source_language)
         if matched_terms:
             glossary_text = format_terms_for_prompt(matched_terms)
             glossary_prompt_section = f"\n{glossary_text}\n"
@@ -97,19 +122,20 @@ def translate_file_batch(batch_content, ai_client, source_language="English", ta
 IMPORTANT INSTRUCTIONS:
 1. Preserve ALL Markdown formatting (headers, links, code blocks, tables, etc.)
 2. Do NOT translate:
-   - Code examples, SQL queries, configuration values, and doc variables wrapped in {{{ }}} such as {{{ .starter }}}.
+   - Code examples, SQL queries, configuration values, and doc variables wrapped in {{{{ }}}} such as {{{{ .starter }}}}.
    - Technical terms like "TiDB", "TiKV", "PD", API names, etc.
    - File paths, URLs, and command line examples
    - Variable names and system configuration parameters
 3. Translate only the descriptive text and explanations
 4. Maintain the exact structure and indentation
 5. Keep all special characters and formatting intact{glossary_instruction}
+6. Preserve explicit heading anchors such as {{#example-test}} exactly as they appear.
 
 Glossary for terms in {source_language} and {target_language}:
 {glossary_prompt_section}
 
 Content to translate:
-{batch_content}
+{prompt_batch_content}
 
 Please provide the translated content maintaining all formatting and structure."""
 
@@ -163,6 +189,8 @@ def process_added_files(added_files, source_context_or_pr_url, github_client, ai
     target_local_path = repo_config['target_local_path']
     source_language = repo_config['source_language']
     target_language = repo_config['target_language']
+    from file_updater import get_source_mode
+    source_mode = get_source_mode(source_context_or_pr_url)
     
     for file_path, file_content in added_files.items():
         thread_safe_print(f"\n📝 Processing new file: {file_path}")
@@ -194,7 +222,8 @@ def process_added_files(added_files, source_context_or_pr_url, github_client, ai
                 ai_client, 
                 source_language, 
                 target_language,
-                glossary_matcher=glossary_matcher
+                glossary_matcher=glossary_matcher,
+                source_mode=source_mode,
             )
             translated_batches.append(translated_batch)
         

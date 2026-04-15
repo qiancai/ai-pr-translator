@@ -8,10 +8,99 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from file_updater import update_target_document_from_match_data
+from file_updater import (
+    build_heading_anchor_slug,
+    preprocess_diff_for_heading_anchor_stability,
+    update_target_document_from_match_data,
+)
 
 
 class FileUpdaterRegressionTest(unittest.TestCase):
+    def test_build_heading_anchor_slug_keeps_visible_text_inside_span(self):
+        heading = '`txn-entry-size-limit` <span class="version-mark">New in v4.0.10 and v5.0.0</span>'
+        slug = build_heading_anchor_slug(heading)
+        self.assertEqual(slug, "txn-entry-size-limit-new-in-v4010-and-v500")
+
+    def test_preprocess_diff_adds_anchor_to_changed_non_top_level_heading(self):
+        pr_diff = "\n".join(
+            [
+                "File: ai/example.md",
+                "@@ -10,1 +10,1 @@",
+                "-## Example tests",
+                "+## Example test",
+                "-" * 80,
+            ]
+        )
+
+        processed = preprocess_diff_for_heading_anchor_stability(
+            pr_diff,
+            source_language="English",
+            target_language="Chinese",
+            source_mode="commit",
+        )
+
+        self.assertIn("+## Example test {#example-test}", processed)
+        self.assertNotIn("-## Example tests {#example-tests}", processed)
+
+    def test_preprocess_diff_keeps_existing_explicit_anchor(self):
+        pr_diff = "\n".join(
+            [
+                "File: ai/example.md",
+                "@@ -10,1 +10,1 @@",
+                "+## {{{ .starter }}} {#starter}",
+                "-" * 80,
+            ]
+        )
+
+        processed = preprocess_diff_for_heading_anchor_stability(
+            pr_diff,
+            source_language="English",
+            target_language="Chinese",
+            source_mode="commit",
+        )
+
+        self.assertIn("+## {{{ .starter }}} {#starter}", processed)
+        self.assertEqual(processed.count("{#starter}"), 1)
+
+    def test_preprocess_diff_is_disabled_for_pr_mode(self):
+        pr_diff = "\n".join(
+            [
+                "File: ai/example.md",
+                "@@ -10,1 +10,1 @@",
+                "+## Example test",
+                "-" * 80,
+            ]
+        )
+
+        processed = preprocess_diff_for_heading_anchor_stability(
+            pr_diff,
+            source_language="English",
+            target_language="Chinese",
+            source_mode="pr",
+        )
+
+        self.assertEqual(processed, pr_diff)
+
+    def test_preprocess_diff_does_not_add_anchor_for_heading_level_only_change(self):
+        pr_diff = "\n".join(
+            [
+                "File: ai/example.md",
+                "@@ -10,1 +10,1 @@",
+                "-## Example test",
+                "+### Example test",
+                "-" * 80,
+            ]
+        )
+
+        processed = preprocess_diff_for_heading_anchor_stability(
+            pr_diff,
+            source_language="English",
+            target_language="Chinese",
+            source_mode="commit",
+        )
+
+        self.assertEqual(processed, pr_diff)
+
     def test_insert_preserves_unmodified_line_endings(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
