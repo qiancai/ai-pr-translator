@@ -117,12 +117,14 @@ def translate_file_batch(batch_content, ai_client, source_language="English", ta
             glossary_instruction = "\n6. When translating terms listed in the glossary above, use the provided translations for consistency."
             thread_safe_print(f"   📚 Matched {len(matched_terms)} glossary terms for batch translation")
 
+    doc_variable_example = "{{{ .starter }}}"
+
     prompt = f"""You are a professional technical writer. Please translate the following {source_language} content to {target_language}.
 
 IMPORTANT INSTRUCTIONS:
 1. Preserve ALL Markdown formatting (headers, links, code blocks, tables, etc.)
 2. Do NOT translate:
-   - Code examples, SQL queries, configuration values, and doc variables wrapped in {{{{ }}}} such as {{{{ .starter }}}}.
+   - Code examples, SQL queries, configuration values, and doc variables/placeholders such as {doc_variable_example}. Preserve doc variables exactly as they appear, including triple braces and when they appear inside HTML attributes or tab labels.
    - Technical terms like "TiDB", "TiKV", "PD", API names, etc.
    - File paths, URLs, and command line examples
    - Variable names and system configuration parameters

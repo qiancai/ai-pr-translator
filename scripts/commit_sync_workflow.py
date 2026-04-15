@@ -372,7 +372,7 @@ def main():
     print(f"   🖼️  Modified images: {len(modified_images)} processed")
     print(f"   🖼️  Deleted images: {len(deleted_images)} processed")
     print("=" * 80)
-    print("🎉 The commit sync workflow completed successfully!")
+    print("🎉 The commit-based sync workflow completed successfully!")
     return 0
 
 

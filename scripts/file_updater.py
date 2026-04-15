@@ -41,6 +41,7 @@ def is_markdown_heading(line):
 
 EXPLICIT_HEADING_ANCHOR_RE = re.compile(r'\s+\{#([^}]+)\}\s*$')
 NON_TOP_LEVEL_HEADING_RE = re.compile(r'^(#{2,10})\s+(.+?)\s*$')
+DOC_VARIABLE_EXAMPLE = "{{{ .starter }}}"
 
 
 def has_explicit_heading_anchor(heading_line):
@@ -366,7 +367,7 @@ Instructions:
 1. Carefully analyze the PR diff to identify exactly which source lines and words changed in {source_language}.
 2. According to the diff, identify the lines that should be updated accordingly in {target_language}. For lines that needs to be updated in {target_language}, apply the corresponding minimal edits according to the diff. For lines not changed or not included in the diff, make sure to keep the corresponding target lines byte-for-byte identical (same wording, punctuation, spacing, indentation, list markers, and line breaks), which means Do Not add, remove, or modify lines not included in the diff. Never rewrite style, improve wording, or rephrase unaffected content.
 3. Translation rules:
-   - Keep doc variables wrapped in {{{{ }}}} such as {{{{ .starter }}}} in English.
+   - Preserve doc variables/placeholders exactly as they appear, including triple braces, such as {DOC_VARIABLE_EXAMPLE}. This also applies when they appear inside HTML attributes or tab labels.
    - Keep UI button/label names wrapped in ** such as **My TiDB** in English.
    - Preserve explicit heading anchors such as {{#example-test}} exactly as they appear.
 4. Keep the JSON structure unchanged, only modify section content where required by the diff.

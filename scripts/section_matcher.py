@@ -419,21 +419,31 @@ Please select the corresponding {number_of_sections} section(s) in {target_langu
 
 def parse_ai_response(ai_response):
     """Parse AI response to extract section names"""
-    sections = []
-    lines = ai_response.split('\n')
-    
-    for line in lines:
-        line = line.strip()
-        # Skip markdown code block markers and empty lines
-        if line and not line.startswith('```'):
-            # Remove leading "## " if present and clean up
-            if line.startswith('## '):
-                sections.append(line)
-            elif line.startswith('- '):
-                # Handle cases where AI returns a list
-                sections.append(line[2:].strip())
-    
-    return sections
+    fenced_sections = []
+    fallback_sections = []
+    in_code_block = False
+    saw_code_fence = False
+
+    for raw_line in ai_response.splitlines():
+        line = raw_line.strip()
+        if line.startswith('```'):
+            saw_code_fence = True
+            in_code_block = not in_code_block
+            continue
+
+        if not line:
+            continue
+
+        if line.startswith('- '):
+            # Handle cases where AI returns a list
+            line = line[2:].strip()
+
+        if in_code_block:
+            fenced_sections.append(line)
+        elif not saw_code_fence:
+            fallback_sections.append(line)
+
+    return fenced_sections if saw_code_fence else fallback_sections
 
 def find_matching_line_numbers(ai_sections, target_hierarchy_dict):
     """Find line numbers in target hierarchy dict that match AI sections"""
@@ -450,21 +460,128 @@ def find_matching_line_numbers(ai_sections, target_hierarchy_dict):
         
         if not found:
             # Look for partial matches (in case of slight differences)
+            partial_candidates = {}
             for line_num, hierarchy in target_hierarchy_dict.items():
                 # Remove common variations and compare
                 ai_clean = ai_section.replace('### ', '').replace('## ', '').strip()
                 hierarchy_clean = hierarchy.replace('### ', '').replace('## ', '').strip()
                 
                 if ai_clean in hierarchy_clean or hierarchy_clean in ai_clean:
-                    matched_dict[str(line_num)] = hierarchy
-                    thread_safe_print(f"      ≈ Partial match found at line {line_num}: {hierarchy}")
-                    found = True
-                    break
+                    partial_candidates[str(line_num)] = hierarchy
+                    thread_safe_print(f"      ≈ Partial match candidate at line {line_num}: {hierarchy}")
+            if partial_candidates:
+                matched_dict.update(partial_candidates)
+                found = True
         
         if not found:
             thread_safe_print(f"      ✗ No match found for: {ai_section}")
     
     return matched_dict
+
+
+def find_candidate_line_numbers_for_ai_section(ai_section, target_hierarchy_dict, used_lines=None):
+    """Find candidate target line numbers for a single AI-returned section."""
+    used_lines = used_lines or set()
+    matched_dict = {}
+
+    for line_num, hierarchy in target_hierarchy_dict.items():
+        line_num = str(line_num)
+        if line_num in used_lines:
+            continue
+        if hierarchy == ai_section:
+            matched_dict[line_num] = hierarchy
+
+    if matched_dict:
+        return matched_dict
+
+    ai_clean = (
+        ai_section.replace('### ', '')
+        .replace('## ', '')
+        .replace('# ', '')
+        .strip()
+    )
+    for line_num, hierarchy in target_hierarchy_dict.items():
+        line_num = str(line_num)
+        if line_num in used_lines:
+            continue
+        hierarchy_clean = (
+            hierarchy.replace('### ', '')
+            .replace('## ', '')
+            .replace('# ', '')
+            .strip()
+        )
+        if ai_clean == hierarchy_clean or ai_clean in hierarchy_clean or hierarchy_clean in ai_clean:
+            matched_dict[line_num] = hierarchy
+
+    return matched_dict
+
+
+def build_target_match_result(key, source_operation, target_line, target_hierarchy_str):
+    """Create a normalized match result entry for downstream processing."""
+    result = {
+        "target_line": str(target_line),
+        "target_hierarchy": format_target_hierarchy(target_hierarchy_str),
+    }
+    if source_operation == "added":
+        result["insertion_type"] = "before_reference"
+    return result
+
+
+def resolve_batched_ai_matches(source_sections, ai_sections, target_hierarchy_dict, source_diff_dict):
+    """Validate and resolve batched AI mapping results back to source keys."""
+    expected = len(source_sections)
+    if len(ai_sections) != expected:
+        thread_safe_print(
+            f"      ❌ Batched AI result count mismatch: expected {expected}, got {len(ai_sections)}"
+        )
+        return {}, list(source_sections.keys())
+
+    used_lines = set()
+    resolved = {}
+    failed_keys = []
+
+    for (key, source_hierarchy), ai_section in zip(source_sections.items(), ai_sections):
+        candidates = find_candidate_line_numbers_for_ai_section(
+            ai_section, target_hierarchy_dict, used_lines
+        )
+        if not candidates:
+            thread_safe_print(f"      ✗ No target hierarchy match found for batched AI section: {ai_section}")
+            failed_keys.append(key)
+            continue
+
+        target_line, target_hierarchy_str = choose_best_ai_match(candidates, source_hierarchy)
+        if not target_line or target_line in used_lines:
+            thread_safe_print(f"      ✗ Duplicate or invalid batched match for {key}: {ai_section}")
+            failed_keys.append(key)
+            continue
+
+        used_lines.add(target_line)
+        source_operation = source_diff_dict.get(key, {}).get("operation", "")
+        resolved[key] = build_target_match_result(
+            key, source_operation, target_line, target_hierarchy_str
+        )
+
+    return resolved, failed_keys
+
+
+def batch_match_sections_with_ai(source_sections, target_hierarchy, ai_client, repo_config, max_tokens=20000):
+    """Match multiple non-direct sections in one AI call."""
+    if not source_sections:
+        return [], []
+
+    ai_response = get_corresponding_sections(
+        list(source_sections.values()),
+        list(target_hierarchy.values()),
+        ai_client,
+        repo_config['source_language'],
+        repo_config['target_language'],
+        max_tokens,
+    )
+
+    if not ai_response:
+        return [], list(source_sections.keys())
+
+    return parse_ai_response(ai_response), []
 
 def get_heading_level(hierarchy):
     """Get markdown heading level from hierarchy string, if present."""
@@ -475,6 +592,56 @@ def get_heading_level(hierarchy):
     m = re.match(r'^(#{1,10})\s+\S', leaf)
     if m:
         return len(m.group(1))
+    return None
+
+
+def extract_step_number(title):
+    """Extract a tutorial step number from English/Chinese step headings."""
+    if not title:
+        return None
+    leaf_title = title.split(' > ')[-1] if ' > ' in title else title
+    cleaned = clean_title_for_matching(leaf_title)
+    match = re.match(r'^(?:Step|步骤)\s+(\d+)\b', cleaned, flags=re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def is_direct_match_candidate(hierarchy):
+    """Return True if the hierarchy should bypass batched AI matching."""
+    if not hierarchy:
+        return False
+    leaf_title = hierarchy.split(' > ')[-1] if ' > ' in hierarchy else hierarchy
+    return (
+        hierarchy == "frontmatter"
+        or leaf_title.startswith('# ')
+        or is_system_variable_or_config(leaf_title)
+    )
+
+
+def find_step_heading_fallback_match(source_hierarchy, target_hierarchy):
+    """Fallback-match tutorial step headings by level and step number."""
+    source_step = extract_step_number(source_hierarchy)
+    source_level = get_heading_level(source_hierarchy)
+    if source_step is None or source_level is None:
+        return None
+
+    candidates = []
+    for line_num, candidate_hierarchy in target_hierarchy.items():
+        if get_heading_level(candidate_hierarchy) != source_level:
+            continue
+        candidate_step = extract_step_number(candidate_hierarchy)
+        if candidate_step == source_step:
+            candidates.append((str(line_num), candidate_hierarchy))
+
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        thread_safe_print(
+            f"      ⚠️ Ambiguous step-heading fallback for {source_hierarchy}: "
+            f"{len(candidates)} candidates"
+        )
+
     return None
 
 def choose_best_ai_match(ai_matched, source_hierarchy):
@@ -676,11 +843,10 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
     from collections import OrderedDict
     all_matched_sections = OrderedDict()
     
-    # Categorize sections for processing strategy but maintain order
-    intro_section_sections = OrderedDict()  # New category for intro sections
+    # Categorize sections for processing strategy but maintain order.
+    intro_section_sections = OrderedDict()
     direct_match_sections = OrderedDict()
-    ai_match_sections = OrderedDict()
-    added_sections = OrderedDict()
+    batched_ai_sections = OrderedDict()
     bottom_sections = OrderedDict()  # Only bottom-added sections should be here
     
     for key, hierarchy in source_hierarchies.items():
@@ -690,27 +856,59 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
         # Only bottom-added sections should skip matching and append to end.
         elif hierarchy.startswith('bottom-added-'):
             bottom_sections[key] = hierarchy
-        # Check if this is an added section
-        elif key.startswith('added_'):
-            added_sections[key] = hierarchy
+        elif is_direct_match_candidate(hierarchy):
+            direct_match_sections[key] = hierarchy
         else:
-            # Extract the leaf title from hierarchy for checking
-            leaf_title = hierarchy.split(' > ')[-1] if ' > ' in hierarchy else hierarchy
-            
-            # Check if this is suitable for direct matching
-            if (hierarchy == "frontmatter" or 
-                leaf_title.startswith('# ') or  # Top-level titles
-                is_system_variable_or_config(leaf_title)):  # System variables/config
-                direct_match_sections[key] = hierarchy
-            else:
-                ai_match_sections[key] = hierarchy
+            batched_ai_sections[key] = hierarchy
     
     thread_safe_print(f"📊 Section categorization:")
     thread_safe_print(f"   📄 Intro section: {len(intro_section_sections)} section(s)")
     thread_safe_print(f"   🎯 Direct matching: {len(direct_match_sections)} sections")
-    thread_safe_print(f"   🤖 AI matching: {len(ai_match_sections)} sections")
-    thread_safe_print(f"   ➕ Added sections: {len(added_sections)} sections")
+    thread_safe_print(f"   🤖 Batched AI matching: {len(batched_ai_sections)} sections")
     thread_safe_print(f"   🔚 Bottom-added sections: {len(bottom_sections)} sections (no matching needed)")
+
+    batched_ai_results = {}
+    batched_ai_failures = set()
+    filtered_target_hierarchy = None
+
+    if batched_ai_sections:
+        filtered_target_hierarchy = filter_non_system_sections(target_hierarchy)
+        if len(filtered_target_hierarchy) <= max_non_system_sections:
+            thread_safe_print(
+                f"\n🤖 Batch-matching {len(batched_ai_sections)} non-direct sections in one AI call..."
+            )
+            ai_sections, batch_call_failures = batch_match_sections_with_ai(
+                batched_ai_sections,
+                filtered_target_hierarchy,
+                ai_client,
+                repo_config,
+                max_tokens,
+            )
+            if batch_call_failures:
+                batched_ai_failures.update(batch_call_failures)
+            elif ai_sections:
+                batched_ai_results, validation_failures = resolve_batched_ai_matches(
+                    batched_ai_sections,
+                    ai_sections,
+                    filtered_target_hierarchy,
+                    source_diff_dict,
+                )
+                batched_ai_failures.update(validation_failures)
+                thread_safe_print(
+                    f"   ✅ Batched AI matching resolved {len(batched_ai_results)} section(s)"
+                )
+                if validation_failures:
+                    thread_safe_print(
+                        f"   ↪ {len(validation_failures)} section(s) will fall back to individual matching"
+                    )
+            else:
+                batched_ai_failures.update(batched_ai_sections.keys())
+        else:
+            thread_safe_print(
+                f"   ❌ Target hierarchy too large for batched AI matching: "
+                f"{len(filtered_target_hierarchy)} > {max_non_system_sections}"
+            )
+            batched_ai_failures.update(batched_ai_sections.keys())
     
     # Process each section in original order
     thread_safe_print(f"\n🔄 Processing sections in original order...")
@@ -749,38 +947,76 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
                 "target_line": "-1",  # Special marker for bottom-added sections
                 "target_hierarchy": hierarchy
             }
-        elif key.startswith('added_'):
-            # Added section - find insertion point
-            thread_safe_print(f"      ➕ Added section - finding insertion point")
-            result = process_added_section(key, hierarchy, target_hierarchy, target_lines, ai_client, repo_config, max_non_system_sections, max_tokens)
+        elif key in batched_ai_results:
+            thread_safe_print(f"      🤖 Using batched AI match result")
+            result = batched_ai_results[key]
+        elif key in batched_ai_sections:
+            thread_safe_print(f"      ↪ Falling back to individual matching")
+            if key.startswith('added_'):
+                result = process_added_section(
+                    key,
+                    hierarchy,
+                    target_hierarchy,
+                    target_lines,
+                    ai_client,
+                    repo_config,
+                    max_non_system_sections,
+                    max_tokens,
+                )
+            else:
+                operation = source_diff_dict[key].get('operation', 'unknown')
+                effective_hierarchy = hierarchy
+                if hierarchy.startswith('bottom-modified-'):
+                    source_info = source_diff_dict.get(key, {})
+                    source_content = source_info.get('new_content') or source_info.get('old_content') or ''
+                    inferred_heading = extract_first_heading_from_content(source_content)
+                    if inferred_heading:
+                        effective_hierarchy = inferred_heading
+                        thread_safe_print(
+                            f"      🔚 Bottom-modified section - matching by inferred heading: {inferred_heading}"
+                        )
+                    else:
+                        thread_safe_print(
+                            f"      ⚠️  Bottom-modified section has no inferred heading, fallback to original hierarchy"
+                        )
+                thread_safe_print(f"      {operation.capitalize()} section - finding target match")
+                result = process_modified_or_deleted_section(
+                    key,
+                    effective_hierarchy,
+                    target_hierarchy,
+                    target_lines,
+                    ai_client,
+                    repo_config,
+                    max_non_system_sections,
+                    max_tokens,
+                )
         else:
-            # Modified or deleted section - find matching section
+            # Direct-match path.
             operation = source_diff_dict[key].get('operation', 'unknown')
-            effective_hierarchy = hierarchy
-
-            # bottom-modified means "last section in source file", not "append in target".
-            # Recover heading from source content and do normal matching.
-            if hierarchy.startswith('bottom-modified-'):
-                source_info = source_diff_dict.get(key, {})
-                source_content = source_info.get('new_content') or source_info.get('old_content') or ''
-                inferred_heading = extract_first_heading_from_content(source_content)
-                if inferred_heading:
-                    effective_hierarchy = inferred_heading
-                    thread_safe_print(f"      🔚 Bottom-modified section - matching by inferred heading: {inferred_heading}")
-                else:
-                    thread_safe_print(f"      ⚠️  Bottom-modified section has no inferred heading, fallback to original hierarchy")
-
-            thread_safe_print(f"      {operation.capitalize()} section - finding target match")
-            result = process_modified_or_deleted_section(
-                key,
-                effective_hierarchy,
-                target_hierarchy,
-                target_lines,
-                ai_client,
-                repo_config,
-                max_non_system_sections,
-                max_tokens
-            )
+            if key.startswith('added_'):
+                thread_safe_print(f"      ➕ Added section - finding insertion point")
+                result = process_added_section(
+                    key,
+                    hierarchy,
+                    target_hierarchy,
+                    target_lines,
+                    ai_client,
+                    repo_config,
+                    max_non_system_sections,
+                    max_tokens,
+                )
+            else:
+                thread_safe_print(f"      {operation.capitalize()} section - finding target match")
+                result = process_modified_or_deleted_section(
+                    key,
+                    hierarchy,
+                    target_hierarchy,
+                    target_lines,
+                    ai_client,
+                    repo_config,
+                    max_non_system_sections,
+                    max_tokens,
+                )
         
         if result:
             # Add source language information from source_diff_dict
@@ -910,6 +1146,17 @@ def process_modified_or_deleted_section(key, hierarchy, target_hierarchy, target
                         "target_line": target_line,
                         "target_hierarchy": formatted_hierarchy
                     }
+
+        fallback_match = find_step_heading_fallback_match(hierarchy, target_hierarchy)
+        if fallback_match:
+            target_line, target_hierarchy_str = fallback_match
+            thread_safe_print(
+                f"      ↪ Fallback step-heading match: {hierarchy} -> {target_hierarchy_str}"
+            )
+            return {
+                "target_line": target_line,
+                "target_hierarchy": format_target_hierarchy(target_hierarchy_str),
+            }
     
     return None
 

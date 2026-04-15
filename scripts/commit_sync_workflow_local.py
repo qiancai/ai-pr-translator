@@ -20,7 +20,7 @@ SOURCE_HEAD_REF = "7a75928211563b1c5632d8e2a7ece92608832cac"
 
 # Optional scope filters.
 SOURCE_FOLDER = "ai"
-SOURCE_FILES = "ai/examples/auto-embedding-with-pytidb.md" #Specify this field if you only want to translate specific files
+SOURCE_FILES = "ai/integrations/vector-search-integrate-with-jinaai-embedding.md" #Specify this field if you only want to translate specific files. Separate multiple files with commas.
 
 AI_PROVIDER = "deepseek"  # Options: "deepseek", "gemini", "openai", "azure"
 TARGET_REPO_PATH = "/Users/grcai/Documents/GitHub/docs-cn"
