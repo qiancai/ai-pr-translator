@@ -16,6 +16,7 @@ TARGET_PR_URL = os.getenv("TARGET_PR_URL")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 AI_PROVIDER = os.getenv("AI_PROVIDER", "deepseek")
 TARGET_REPO_PATH = os.getenv("TARGET_REPO_PATH")
+SKIP_GIT_ADD = os.getenv("SKIP_GIT_ADD", "false").lower() == "true"
 TIDB_CLOUD_ABSOLUTE_LINK_PREFIX = os.getenv(
     "TIDB_CLOUD_ABSOLUTE_LINK_PREFIX",
     "https://docs.pingcap.com/tidbcloud/",
@@ -134,6 +135,10 @@ def clean_temp_output_dir():
 
 def git_add_changes(target_repo_path):
     """Stage all current changes in the target repo so they survive a later failure."""
+    if SKIP_GIT_ADD:
+        thread_safe_print("   ⏭️  SKIP_GIT_ADD=true; skipping git add .")
+        return
+
     result = subprocess.run(
         ["git", "add", "."],
         cwd=target_repo_path,

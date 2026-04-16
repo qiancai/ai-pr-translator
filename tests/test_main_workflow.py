@@ -9,9 +9,31 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import main_workflow
+import main_workflow_local
 
 
 class MainWorkflowImageOnlyPrTest(unittest.TestCase):
+    def test_local_workflow_infers_target_pr_url(self):
+        docs_target = main_workflow_local._target_for_source_pr(
+            "https://github.com/pingcap/docs/pull/22655"
+        )
+        docs_cn_target = main_workflow_local._target_for_source_pr(
+            "https://github.com/pingcap/docs-cn/pull/22655"
+        )
+
+        self.assertEqual(docs_target["target_pr_url"], "https://github.com/pingcap/docs-cn/pull/0")
+        self.assertEqual(docs_target["target_repo_path"], main_workflow_local.DOCS_CN_LOCAL_PATH)
+        self.assertEqual(docs_cn_target["target_pr_url"], "https://github.com/pingcap/docs/pull/0")
+        self.assertEqual(docs_cn_target["target_repo_path"], main_workflow_local.DOCS_LOCAL_PATH)
+
+    def test_git_add_changes_can_be_disabled(self):
+        with mock.patch.object(main_workflow, "SKIP_GIT_ADD", True), mock.patch.object(
+            main_workflow.subprocess, "run"
+        ) as subprocess_run:
+            main_workflow.git_add_changes("/tmp/target")
+
+        subprocess_run.assert_not_called()
+
     def test_main_continues_when_pr_has_only_image_changes(self):
         repo_config = {
             "source_repo": "acme/docs",
