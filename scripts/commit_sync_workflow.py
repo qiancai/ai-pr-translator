@@ -324,7 +324,7 @@ def main():
                 continue
             print(f"   📊 File-specific diff: {len(file_specific_diff)} chars")
 
-            file_type = determine_file_processing_type(source_file_path, file_sections, SPECIAL_FILES)
+            file_type = determine_file_processing_type(source_file_path, file_sections, SPECIAL_FILES, IGNORE_FILES)
             print(f"   🔍 File processing type: {file_type}")
 
             if file_type == "special_file_toc":

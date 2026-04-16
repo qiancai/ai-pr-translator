@@ -13,6 +13,7 @@ import threading
 from typing import Optional
 from github import Github
 from log_sanitizer import sanitize_exception_message
+from special_file_utils import is_toc_file_name
 
 # Thread-safe printing
 print_lock = threading.Lock()
@@ -1601,11 +1602,15 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
         base_file_content_preloaded = None
         keyword_regular_only = False
 
+        special_files = special_files or []
+        is_keyword_file = basename == "keywords.md" and basename in special_files
+        is_toc_file = is_toc_file_name(file.filename, ignore_files)
+
         # Check if this is a special file requiring dedicated processing
-        if basename in special_files:
+        if is_keyword_file or is_toc_file:
             
             # --- keywords.md: keyword-specific processor ---
-            if basename == "keywords.md":
+            if is_keyword_file:
                 print(f"   📋 Detected keyword file: {file.filename}")
                 operations = analyze_diff_operations(file)
 
@@ -1729,8 +1734,8 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
 
                 keyword_regular_only = True
 
-            if basename != "keywords.md":
-                # --- TOC.md: TOC-specific processor ---
+            if is_toc_file:
+                # --- TOC files: TOC-specific processor ---
                 print(f"   📋 Detected special file: {file.filename}")
                 
                 # Get target file content for comparison

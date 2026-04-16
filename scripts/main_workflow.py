@@ -37,6 +37,7 @@ from keword_processor import process_keyword_files
 from section_matcher import match_source_diff_to_target
 from glossary import load_glossary, create_glossary_matcher
 from log_sanitizer import sanitize_exception_message
+from special_file_utils import is_toc_file_name
 
 # Skip dealing with cloud docs when translating to Chinese
 SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH = os.getenv("SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH", "true").lower() == "true"
@@ -320,17 +321,20 @@ def extract_file_diff_from_pr(pr_diff, source_file_path):
     
     return '\n'.join(filtered_lines)
 
-def determine_file_processing_type(source_file_path, file_sections, special_files=None):
+def determine_file_processing_type(source_file_path, file_sections, special_files=None, ignore_files=None):
     """Determine how to process a file based on operation type and file characteristics"""
+    basename = os.path.basename(source_file_path)
+    ignore_files = IGNORE_FILES if ignore_files is None else ignore_files
     
     # Check if this is a special file (like TOC.md or keywords.md)
-    if special_files and os.path.basename(source_file_path) in special_files:
-        basename = os.path.basename(source_file_path)
+    if is_toc_file_name(source_file_path, ignore_files):
+        return "special_file_toc"
+
+    if special_files and basename in special_files:
         if basename == "keywords.md":
             if isinstance(file_sections, dict) and file_sections.get("keyword_regular_only"):
                 return "regular_modified"
             return "special_file_keyword"
-        return "special_file_toc"
     
     # For all other modified files, use regular processing
     return "regular_modified"
@@ -702,7 +706,7 @@ def main():
             print(f"   📊 File-specific diff: {len(file_specific_diff)} chars")
             
             # Determine file processing approach for modified files
-            file_type = determine_file_processing_type(source_file_path, file_sections, SPECIAL_FILES)
+            file_type = determine_file_processing_type(source_file_path, file_sections, SPECIAL_FILES, IGNORE_FILES)
             print(f"   🔍 File processing type: {file_type}")
             
             if file_type == "special_file_toc":

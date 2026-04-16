@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from github import Github
 from openai import OpenAI
 from log_sanitizer import sanitize_exception_message
+from special_file_utils import source_scope_includes_folder
 
 # Thread-safe printing
 print_lock = threading.Lock()
@@ -130,8 +131,11 @@ def should_apply_tidb_cloud_link_rewrite(source_language, target_language, sourc
     if normalized_mode != "commit":
         return False
 
-    source_folder = os.getenv("SOURCE_FOLDER", "").strip("/").strip()
-    return source_folder == "ai"
+    return source_scope_includes_folder(
+        "ai",
+        source_folder=os.getenv("SOURCE_FOLDER", ""),
+        source_files=os.getenv("SOURCE_FILES", ""),
+    )
 
 
 def get_tidb_cloud_absolute_link_prefix():
