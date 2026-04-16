@@ -32,11 +32,18 @@ from image_processor import process_all_images
 from file_adder import process_added_files
 from file_deleter import process_deleted_files
 from file_updater import process_files_in_batches, process_added_sections, process_modified_sections, process_deleted_sections
-from toc_processor import process_toc_files
-from keword_processor import process_keyword_files
+from toc_processor import process_toc_file
+from keword_processor import process_keyword_file
 from section_matcher import match_source_diff_to_target
 from glossary import load_glossary, create_glossary_matcher
 from log_sanitizer import sanitize_exception_message
+from parallel_file_processor import (
+    count_unique_file_paths,
+    make_file_task,
+    make_task_result,
+    run_file_tasks,
+    should_parallelize_file_processing,
+)
 from special_file_utils import is_toc_file_name
 
 # Skip dealing with cloud docs when translating to Chinese
@@ -116,13 +123,13 @@ def clean_temp_output_dir():
     if os.path.exists(temp_dir):
         if os.path.isdir(temp_dir):
             shutil.rmtree(temp_dir)
-            print(f"🧹 Cleaned existing temp_output directory")
+            thread_safe_print(f"🧹 Cleaned existing temp_output directory")
         else:
             # Remove file if it exists
             os.remove(temp_dir)
-            print(f"🧹 Removed existing temp_output file")
+            thread_safe_print(f"🧹 Removed existing temp_output file")
     os.makedirs(temp_dir, exist_ok=True)
-    print(f"📁 Created temp_output directory: {temp_dir}")
+    thread_safe_print(f"📁 Created temp_output directory: {temp_dir}")
     return temp_dir
 
 def git_add_changes(target_repo_path):
@@ -133,9 +140,21 @@ def git_add_changes(target_repo_path):
         capture_output=True, text=True
     )
     if result.returncode == 0:
-        print(f"   ✅ git add . completed in {target_repo_path}")
+        thread_safe_print(f"   ✅ git add . completed in {target_repo_path}")
     else:
-        print(f"   ❌ git add . failed: {result.stderr}")
+        thread_safe_print(f"   ❌ git add . failed: {result.stderr}")
+
+def git_add_successful_task_changes(task_results, target_repo_path):
+    """Stage successful task writes after a parallel batch has finished."""
+    has_success = any(
+        result["ok"] and result["result"] and result["result"].get("status") == "success"
+        for result in task_results
+    )
+    if not has_success:
+        return
+
+    # Keep staging out of worker threads so git add never races with active file writes.
+    git_add_changes(target_repo_path)
 
 def estimate_tokens(text):
     """Calculate accurate token count using tiktoken (GPT-4/3.5 encoding)"""
@@ -270,10 +289,10 @@ def filter_diff_for_target_file(pr_diff, target_file, source_diff_dict):
                 source_files.add(source_file)
     
     if not source_files:
-        print(f"   ⚠️  No source files found in source_diff_dict, using complete PR diff")
+        thread_safe_print(f"   ⚠️  No source files found in source_diff_dict, using complete PR diff")
         return pr_diff
     
-    print(f"   📄 Source files contributing to {target_file}: {list(source_files)}")
+    thread_safe_print(f"   📄 Source files contributing to {target_file}: {list(source_files)}")
     
     # Filter PR diff to only include changes from these source files
     filtered_lines = []
@@ -293,7 +312,7 @@ def filter_diff_for_target_file(pr_diff, target_file, source_diff_dict):
             filtered_lines.append(line)
     
     file_specific_diff = '\n'.join(filtered_lines)
-    print(f"   📊 Filtered diff: {len(file_specific_diff)} chars (from {len(pr_diff)} chars)")
+    thread_safe_print(f"   📊 Filtered diff: {len(file_specific_diff)} chars (from {len(pr_diff)} chars)")
     
     return file_specific_diff if file_specific_diff.strip() else pr_diff
 
@@ -342,7 +361,7 @@ def determine_file_processing_type(source_file_path, file_sections, special_file
 def process_regular_modified_file(source_file_path, file_sections, file_diff, source_context_or_pr_url, github_client, ai_client, repo_config, max_sections, glossary_matcher=None):
     """Process a regular markdown file that has been modified"""
     try:
-        print(f"   📝 Processing as regular modified file: {source_file_path}")
+        thread_safe_print(f"   📝 Processing as regular modified file: {source_file_path}")
         
         # Extract the actual sections from the file_sections structure
         # file_sections contains: {'sections': {...}, 'original_hierarchy': {...}, 'current_hierarchy': {...}}
@@ -352,7 +371,7 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, so
             # Fallback: assume file_sections is already the sections dict
             actual_sections = file_sections
         
-        print(f"   📊 Extracted sections: {len(actual_sections)} sections")
+        thread_safe_print(f"   📊 Extracted sections: {len(actual_sections)} sections")
         
         # CRITICAL: Load the source-diff-dict.json and perform matching
         import json
@@ -367,19 +386,19 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, so
         if os.path.exists(source_diff_dict_file):
             with open(source_diff_dict_file, 'r', encoding='utf-8') as f:
                 source_diff_dict = json.load(f)
-            print(f"   📂 Loaded source diff dict with {len(source_diff_dict)} sections from {source_diff_dict_file}")
+            thread_safe_print(f"   📂 Loaded source diff dict with {len(source_diff_dict)} sections from {source_diff_dict_file}")
             
             # Check source token limit before proceeding with processing
-            print(f"   🔍 Checking source token limit...")
+            thread_safe_print(f"   🔍 Checking source token limit...")
             within_limit, total_tokens, token_limit = check_source_token_limit(source_diff_dict_file)
             if not within_limit:
-                print(f"   🚫 Skipping file processing: source content exceeds token limit")
-                print(f"      📊 Total tokens: {total_tokens:,} > Limit: {token_limit:,}")
-                print(f"      ⏭️  File {source_file_path} will not be processed")
+                thread_safe_print(f"   🚫 Skipping file processing: source content exceeds token limit")
+                thread_safe_print(f"      📊 Total tokens: {total_tokens:,} > Limit: {token_limit:,}")
+                thread_safe_print(f"      ⏭️  File {source_file_path} will not be processed")
                 return False
                 
         else:
-            print(f"   ❌ {source_diff_dict_file} not found")
+            thread_safe_print(f"   ❌ {source_diff_dict_file} not found")
             return False
         
         # Get target file hierarchy and content
@@ -393,13 +412,13 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, so
         )
         
         if not target_hierarchy or not target_lines:
-            print(f"   ❌ Could not get target file content for {source_file_path}")
+            thread_safe_print(f"   ❌ Could not get target file content for {source_file_path}")
             return False
         
-        print(f"   📖 Target file: {len(target_hierarchy)} sections, {len(target_lines)} lines")
+        thread_safe_print(f"   📖 Target file: {len(target_hierarchy)} sections, {len(target_lines)} lines")
         
         # Perform source diff to target matching
-        print(f"   🔗 Matching source diff to target...")
+        thread_safe_print(f"   🔗 Matching source diff to target...")
         enhanced_sections = match_source_diff_to_target(
             source_diff_dict, 
             target_hierarchy, 
@@ -411,19 +430,19 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, so
         )
         
         if not enhanced_sections:
-            print(f"   ❌ No sections matched")
+            thread_safe_print(f"   ❌ No sections matched")
             return False
         
-        print(f"   ✅ Matched {len(enhanced_sections)} sections")
+        thread_safe_print(f"   ✅ Matched {len(enhanced_sections)} sections")
         
         # Save the match result for reference
         match_file = os.path.join(temp_dir, f"{source_file_path.replace('/', '-').replace('.md', '')}-match_source_diff_to_target.json")
         with open(match_file, 'w', encoding='utf-8') as f:
             json.dump(enhanced_sections, f, ensure_ascii=False, indent=2)
-        print(f"   💾 Saved match result to: {match_file}")
+        thread_safe_print(f"   💾 Saved match result to: {match_file}")
         
         # Step 2: Get AI translation for the matched sections
-        print(f"   🤖 Getting AI translation for matched sections...")
+        thread_safe_print(f"   🤖 Getting AI translation for matched sections...")
         
         # Create file data structure with enhanced matching info
         # Wrap enhanced_sections in the expected format for process_single_file
@@ -441,7 +460,7 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, so
         if results and len(results) > 0:
             file_path, success, ai_updated_sections = results[0]  # Get first result
             if success and isinstance(ai_updated_sections, dict):
-                print(f"   📝 Step 3: Updating {match_file} with AI results...")
+                thread_safe_print(f"   📝 Step 3: Updating {match_file} with AI results...")
                 
                 # Load current match_source_diff_to_target.json
                 with open(match_file, 'r', encoding='utf-8') as f:
@@ -467,32 +486,80 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, so
                 with open(match_file, 'w', encoding='utf-8') as f:
                     json.dump(match_data, f, ensure_ascii=False, indent=2)
                 
-                print(f"   ✅ Updated {updated_count} sections with AI translations in {match_file}")
+                thread_safe_print(f"   ✅ Updated {updated_count} sections with AI translations in {match_file}")
                 
                 # Step 4: Apply updates to target document using update_target_document_from_match_data
-                print(f"   📝 Step 4: Applying updates to target document...")
+                thread_safe_print(f"   📝 Step 4: Applying updates to target document...")
                 from file_updater import update_target_document_from_match_data
                 
                 success = update_target_document_from_match_data(match_file, repo_config['target_local_path'], source_file_path)
                 if success:
-                    print(f"   🎉 Target document successfully updated!")
+                    thread_safe_print(f"   🎉 Target document successfully updated!")
                     return True
                 else:
-                    print(f"   ❌ Failed to update target document")
+                    thread_safe_print(f"   ❌ Failed to update target document")
                     return False
                     
             else:
-                print(f"   ⚠️  AI translation failed or returned invalid results")
+                thread_safe_print(f"   ⚠️  AI translation failed or returned invalid results")
                 return False
         else:
-            print(f"   ⚠️  No results from process_modified_sections")
+            thread_safe_print(f"   ⚠️  No results from process_modified_sections")
             return False
         
     except Exception as e:
-        print(
+        thread_safe_print(
             f"   ❌ Error processing regular modified file {source_file_path}: {sanitize_exception_message(e)}"
         )
         return False
+
+
+def _process_single_modified_file_for_pr(
+    source_file_path,
+    file_sections,
+    pr_diff,
+    source_context_or_pr_url,
+    github_client,
+    ai_client,
+    repo_config,
+    glossary_matcher,
+):
+    thread_safe_print(f"\n📄 Processing modified file: {source_file_path}")
+
+    thread_safe_print(f"   🔍 Extracting file-specific diff for: {source_file_path}")
+    file_specific_diff = extract_file_diff_from_pr(pr_diff, source_file_path) if pr_diff else ""
+
+    if not file_specific_diff:
+        if pr_diff:
+            return make_task_result("skipped", "No file-specific diff found")
+        return make_task_result("skipped", "No markdown patch text available for section-level translation")
+
+    thread_safe_print(f"   📊 File-specific diff: {len(file_specific_diff)} chars")
+
+    file_type = determine_file_processing_type(source_file_path, file_sections, SPECIAL_FILES, IGNORE_FILES)
+    thread_safe_print(f"   🔍 File processing type: {file_type}")
+
+    if file_type == "special_file_toc":
+        return make_task_result("skipped", "Special file already processed in Step 3.3")
+    if file_type == "special_file_keyword":
+        return make_task_result("skipped", "Keyword file already processed in Step 3.3b")
+    if file_type != "regular_modified":
+        return make_task_result("failure", f"Unknown file processing type: {file_type}")
+
+    success = process_regular_modified_file(
+        source_file_path,
+        file_sections,
+        file_specific_diff,
+        source_context_or_pr_url,
+        github_client,
+        ai_client,
+        repo_config,
+        MAX_NON_SYSTEM_SECTIONS_FOR_AI,
+        glossary_matcher=glossary_matcher,
+    )
+    if success:
+        return make_task_result("success")
+    return make_task_result("failure", "Regular modified file processor returned failure")
 
 
 def is_under_exclude_folder(file_path, folder_name):
@@ -525,9 +592,9 @@ def filter_docs_by_folder(folder_name, added_sections, modified_sections, delete
                 skipped.append(item)
 
     if skipped:
-        print(f"\n🚫 Skipping {len(skipped)} {label} doc entries under '{folder_name}/':")
+        thread_safe_print(f"\n🚫 Skipping {len(skipped)} {label} doc entries under '{folder_name}/':")
         for s in skipped:
-            print(f"   ⏭️  {s}")
+            thread_safe_print(f"   ⏭️  {s}")
 
     return (
         filter_dict(added_sections),
@@ -563,18 +630,18 @@ def main():
     
     # Validate environment variables
     if not all([SOURCE_PR_URL, TARGET_PR_URL, GITHUB_TOKEN, TARGET_REPO_PATH]):
-        print("❌ Missing required environment variables:")
-        print(f"   SOURCE_PR_URL: {SOURCE_PR_URL}")
-        print(f"   TARGET_PR_URL: {TARGET_PR_URL}")
-        print(f"   GITHUB_TOKEN: {'Set' if GITHUB_TOKEN else 'Not set'}")
-        print(f"   TARGET_REPO_PATH: {TARGET_REPO_PATH}")
+        thread_safe_print("❌ Missing required environment variables:")
+        thread_safe_print(f"   SOURCE_PR_URL: {SOURCE_PR_URL}")
+        thread_safe_print(f"   TARGET_PR_URL: {TARGET_PR_URL}")
+        thread_safe_print(f"   GITHUB_TOKEN: {'Set' if GITHUB_TOKEN else 'Not set'}")
+        thread_safe_print(f"   TARGET_REPO_PATH: {TARGET_REPO_PATH}")
         return
     
-    print(f"🔧 Auto PR Sync Tool (GitHub Workflow Version)")
-    print(f"📍 Source PR URL: {SOURCE_PR_URL}")
-    print(f"📍 Target PR URL: {TARGET_PR_URL}")
-    print(f"🤖 AI Provider: {AI_PROVIDER}")
-    print(f"📁 Target Repo Path: {TARGET_REPO_PATH}")
+    thread_safe_print(f"🔧 Auto PR Sync Tool (GitHub Workflow Version)")
+    thread_safe_print(f"📍 Source PR URL: {SOURCE_PR_URL}")
+    thread_safe_print(f"📍 Target PR URL: {TARGET_PR_URL}")
+    thread_safe_print(f"🤖 AI Provider: {AI_PROVIDER}")
+    thread_safe_print(f"📁 Target Repo Path: {TARGET_REPO_PATH}")
     
     # Clean and prepare temp_output directory
     clean_temp_output_dir()
@@ -583,11 +650,11 @@ def main():
     try:
         repo_configs = get_workflow_repo_configs()
         repo_config = get_workflow_repo_config(SOURCE_PR_URL, repo_configs)
-        print(f"📁 Source Repo: {repo_config['source_repo']} ({repo_config['source_language']})")
-        print(f"📁 Target Repo: {repo_config['target_repo']} ({repo_config['target_language']})")
-        print(f"📁 Target Path: {repo_config['target_local_path']}")
+        thread_safe_print(f"📁 Source Repo: {repo_config['source_repo']} ({repo_config['source_language']})")
+        thread_safe_print(f"📁 Target Repo: {repo_config['target_repo']} ({repo_config['target_language']})")
+        thread_safe_print(f"📁 Target Path: {repo_config['target_local_path']}")
     except ValueError as e:
-        print(f"❌ {sanitize_exception_message(e)}")
+        thread_safe_print(f"❌ {sanitize_exception_message(e)}")
         return
     
     # Initialize clients
@@ -608,22 +675,22 @@ def main():
         candidate = os.path.join(TARGET_REPO_PATH, "resources", "terms.md")
         if os.path.exists(candidate):
             terms_path = candidate
-    print(f"\n📚 Loading glossary from: {terms_path or '(not configured)'}")
+    thread_safe_print(f"\n📚 Loading glossary from: {terms_path or '(not configured)'}")
     glossary = load_glossary(terms_path) if terms_path else []
     glossary_matcher = create_glossary_matcher(glossary)
     
-    print(f"\n🚀 Starting auto-sync for PR: {SOURCE_PR_URL}")
+    thread_safe_print(f"\n🚀 Starting auto-sync for PR: {SOURCE_PR_URL}")
     
     # Step 1: Get PR diff
-    print(f"\n📋 Step 1: Getting PR diff...")
+    thread_safe_print(f"\n📋 Step 1: Getting PR diff...")
     pr_diff = get_pr_diff(SOURCE_PR_URL, github_client)
     if pr_diff is None:
-        print("❌ Could not get PR diff")
+        thread_safe_print("❌ Could not get PR diff")
         return
     if pr_diff:
-        print(f"✅ Got PR diff: {len(pr_diff)} characters")
+        thread_safe_print(f"✅ Got PR diff: {len(pr_diff)} characters")
     else:
-        print("⚠️  No markdown patch text found in this PR, continuing with file/image processing only")
+        thread_safe_print("⚠️  No markdown patch text found in this PR, continuing with file/image processing only")
     
     # Build list of folders to exclude early (before expensive per-file processing)
     exclude_folders = []
@@ -633,7 +700,7 @@ def main():
         exclude_folders.append(AI_DOCS_FOLDER_NAME)
     
     # Step 2: Analyze source changes with operation categorization
-    print(f"\n📊 Step 2: Analyzing source changes...")
+    thread_safe_print(f"\n📊 Step 2: Analyzing source changes...")
     added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images = analyze_source_changes(
         SOURCE_PR_URL, github_client, 
         special_files=SPECIAL_FILES, 
@@ -643,125 +710,190 @@ def main():
         pr_diff=pr_diff,
         exclude_folders=exclude_folders,
     )
+    diff_file_count = count_unique_file_paths(
+        added_sections,
+        modified_sections,
+        deleted_sections,
+        added_files,
+        deleted_files,
+        toc_files,
+        keyword_files,
+        added_images,
+        modified_images,
+        deleted_images,
+    )
+    parallel_file_processing = should_parallelize_file_processing(diff_file_count)
+    if parallel_file_processing:
+        thread_safe_print(f"⚡ Diff has {diff_file_count} files; file-level translation will use parallel chunks.")
     
     # Step 3: Process different types of files based on operation type
-    print(f"\n📋 Step 3: Processing files based on operation type...")
-    
-    # Import necessary functions
-    from file_updater import process_modified_sections, update_target_document_from_match_data
-    from toc_processor import process_toc_files
-    from keword_processor import process_keyword_files
+    thread_safe_print(f"\n📋 Step 3: Processing files based on operation type...")
     
     # Step 3.1: Process deleted files (file-level deletions)
     if deleted_files:
-        print(f"\n🗑️  Step 3.1: Processing {len(deleted_files)} deleted files...")
+        thread_safe_print(f"\n🗑️  Step 3.1: Processing {len(deleted_files)} deleted files...")
         process_deleted_files(deleted_files, github_client, repo_config)
-        print(f"   ✅ Deleted files processed")
+        thread_safe_print(f"   ✅ Deleted files processed")
         git_add_changes(TARGET_REPO_PATH)
     
     # Step 3.2: Process added files (file-level additions) one by one
     if added_files:
-        print(f"\n📄 Step 3.2: Processing {len(added_files)} added files...")
+        thread_safe_print(f"\n📄 Step 3.2: Processing {len(added_files)} added files...")
+
+        added_tasks = []
         for file_path, file_content in added_files.items():
-            process_added_files({file_path: file_content}, SOURCE_PR_URL, github_client, ai_client, repo_config, glossary_matcher=glossary_matcher)
-            git_add_changes(TARGET_REPO_PATH)
-        print(f"   ✅ Added files processed")
+            def run_added_file(path=file_path, content=file_content):
+                success = process_added_files(
+                    {path: content},
+                    SOURCE_PR_URL,
+                    github_client,
+                    ai_client,
+                    repo_config,
+                    glossary_matcher=glossary_matcher,
+                )
+                if success:
+                    return make_task_result("success")
+                return make_task_result("failure", "Added file processor returned failure")
+
+            added_tasks.append(make_file_task(file_path, run_added_file))
+
+        added_results = run_file_tasks(added_tasks, "added files", parallel_file_processing)
+        for result in added_results:
+            file_path = result["file_path"]
+            task_result = result["result"] or {}
+            if result["ok"] and task_result.get("status") == "success":
+                thread_safe_print(f"   ✅ Successfully processed added file {file_path}")
+            else:
+                reason = result["error"] or task_result.get("reason") or "Added file processor returned failure"
+                thread_safe_print(f"   ❌ Failed to process added file {file_path}: {reason}")
+        git_add_successful_task_changes(added_results, TARGET_REPO_PATH)
+        thread_safe_print(f"   ✅ Added files processed")
     
     # Step 3.3: Process special files (TOC.md and similar)
     if toc_files:
-        print(f"\n📋 Step 3.3: Processing {len(toc_files)} special files (TOC)...")
-        process_toc_files(toc_files, SOURCE_PR_URL, github_client, ai_client, repo_config)
-        print(f"   ✅ Special files processed")
-        git_add_changes(TARGET_REPO_PATH)
+        thread_safe_print(f"\n📋 Step 3.3: Processing {len(toc_files)} special files (TOC)...")
+
+        toc_tasks = []
+        for file_path, toc_data in toc_files.items():
+            def run_toc_file(path=file_path, data=toc_data):
+                if data.get("type") != "toc":
+                    return make_task_result("failure", f"Unknown TOC data type: {data.get('type')}")
+                success = process_toc_file(path, data, SOURCE_PR_URL, github_client, ai_client, repo_config)
+                if success:
+                    return make_task_result("success")
+                return make_task_result("failure", "TOC processor returned failure")
+
+            toc_tasks.append(make_file_task(file_path, run_toc_file))
+
+        toc_results = run_file_tasks(toc_tasks, "TOC files", parallel_file_processing)
+        for result in toc_results:
+            file_path = result["file_path"]
+            task_result = result["result"] or {}
+            if result["ok"] and task_result.get("status") == "success":
+                thread_safe_print(f"   ✅ Successfully processed TOC file {file_path}")
+            else:
+                reason = result["error"] or task_result.get("reason") or "TOC processor returned failure"
+                thread_safe_print(f"   ❌ Failed to process TOC file {file_path}: {reason}")
+        thread_safe_print(f"   ✅ Special files processed")
+        git_add_successful_task_changes(toc_results, TARGET_REPO_PATH)
     
     # Step 3.3b: Process keyword files (keywords.md)
     if keyword_files:
-        print(f"\n📋 Step 3.3b: Processing {len(keyword_files)} keyword files...")
-        keyword_success = process_keyword_files(keyword_files, SOURCE_PR_URL, github_client, ai_client, repo_config)
+        thread_safe_print(f"\n📋 Step 3.3b: Processing {len(keyword_files)} keyword files...")
+        keyword_tasks = []
+        for file_path, keyword_data in keyword_files.items():
+            def run_keyword_file(path=file_path, data=keyword_data):
+                if data.get("type") != "keyword":
+                    return make_task_result("failure", f"Unknown keyword data type: {data.get('type')}")
+                success = process_keyword_file(path, data, SOURCE_PR_URL, github_client, ai_client, repo_config)
+                if success:
+                    return make_task_result("success")
+                return make_task_result("failure", "Keyword processor returned failure")
+
+            keyword_tasks.append(make_file_task(file_path, run_keyword_file))
+
+        keyword_results = run_file_tasks(keyword_tasks, "keyword files", parallel_file_processing)
+        keyword_success = all(
+            result["ok"] and result["result"] and result["result"].get("status") == "success"
+            for result in keyword_results
+        )
         if not keyword_success:
-            print("   ❌ Keyword files processing failed, exiting workflow")
+            for result in keyword_results:
+                if result["ok"] and result["result"] and result["result"].get("status") == "success":
+                    continue
+                reason = result["error"] or (result["result"] or {}).get("reason") or "Keyword processor returned failure"
+                thread_safe_print(f"   ❌ Failed to process keyword file {result['file_path']}: {reason}")
+            thread_safe_print("   ❌ Keyword files processing failed, exiting workflow")
             return
-        print(f"   ✅ Keyword files processed")
-        git_add_changes(TARGET_REPO_PATH)
+        thread_safe_print(f"   ✅ Keyword files processed")
+        git_add_successful_task_changes(keyword_results, TARGET_REPO_PATH)
     
     # Step 3.4: Process modified files (section-level modifications)
     if modified_sections:
-        print(f"\n📝 Step 3.4: Processing {len(modified_sections)} modified files...")
-        
-        # Process each modified file separately
+        thread_safe_print(f"\n📝 Step 3.4: Processing {len(modified_sections)} modified files...")
+
+        modified_tasks = []
         for source_file_path, file_sections in modified_sections.items():
-            print(f"\n📄 Processing modified file: {source_file_path}")
-            
-            # Extract file-specific diff from the complete PR diff
-            print(f"   🔍 Extracting file-specific diff for: {source_file_path}")
-            file_specific_diff = extract_file_diff_from_pr(pr_diff, source_file_path) if pr_diff else ""
-            
-            if not file_specific_diff:
-                if pr_diff:
-                    print(f"   ⚠️  No diff found for {source_file_path}, skipping...")
-                else:
-                    print(f"   ⚠️  No markdown patch text available for {source_file_path}, skipping section-level translation.")
-                continue
-            
-            print(f"   📊 File-specific diff: {len(file_specific_diff)} chars")
-            
-            # Determine file processing approach for modified files
-            file_type = determine_file_processing_type(source_file_path, file_sections, SPECIAL_FILES, IGNORE_FILES)
-            print(f"   🔍 File processing type: {file_type}")
-            
-            if file_type == "special_file_toc":
-                # Special files should have been processed in Step 3.3, skip here
-                print(f"   ⏭️  Special file already processed in Step 3.3, skipping...")
-                continue
-            
-            elif file_type == "special_file_keyword":
-                print(f"   ⏭️  Keyword file already processed in Step 3.3b, skipping...")
-                continue
-            
-            elif file_type == "regular_modified":
-                # Regular markdown files with modifications
-                success = process_regular_modified_file(
-                    source_file_path, 
-                    file_sections, 
-                    file_specific_diff,
-                    SOURCE_PR_URL, 
-                    github_client, 
-                    ai_client, 
-                    repo_config, 
-                    MAX_NON_SYSTEM_SECTIONS_FOR_AI,
-                    glossary_matcher=glossary_matcher
+            def run_modified_file(path=source_file_path, sections=file_sections):
+                return _process_single_modified_file_for_pr(
+                    path,
+                    sections,
+                    pr_diff,
+                    SOURCE_PR_URL,
+                    github_client,
+                    ai_client,
+                    repo_config,
+                    glossary_matcher,
                 )
-                
-                if success:
-                    print(f"   ✅ Successfully processed {source_file_path}")
-                    git_add_changes(TARGET_REPO_PATH)
-                else:
-                    print(f"   ❌ Failed to process {source_file_path}")
-            
+
+            modified_tasks.append(
+                make_file_task(
+                    source_file_path,
+                    run_modified_file,
+                    resource_key=source_file_path.replace('/', '-').replace('.md', ''),
+                )
+            )
+
+        modified_results = run_file_tasks(modified_tasks, "modified files", parallel_file_processing)
+        for result in modified_results:
+            source_file_path = result["file_path"]
+            if not result["ok"]:
+                thread_safe_print(f"   ❌ Failed to process {source_file_path}: {result['error']}")
+                continue
+
+            task_result = result["result"] or {}
+            status = task_result.get("status", "failure")
+            reason = task_result.get("reason", "")
+            if status == "success":
+                thread_safe_print(f"   ✅ Successfully processed {source_file_path}")
+            elif status == "skipped":
+                thread_safe_print(f"   ⏭️  Skipped {source_file_path}: {reason}")
             else:
-                print(f"   ⚠️  Unknown file processing type: {file_type} for {source_file_path}, skipping...")
+                thread_safe_print(f"   ❌ Failed to process {source_file_path}: {reason}")
+
+        git_add_successful_task_changes(modified_results, TARGET_REPO_PATH)
     
     # Step 3.5: Process images (added, modified, deleted)
     if added_images or modified_images or deleted_images:
-        print(f"\n🖼️  Step 3.5: Processing images...")
+        thread_safe_print(f"\n🖼️  Step 3.5: Processing images...")
         process_all_images(added_images, modified_images, deleted_images, SOURCE_PR_URL, github_client, repo_config)
-        print(f"   ✅ Images processed")
+        thread_safe_print(f"   ✅ Images processed")
         git_add_changes(TARGET_REPO_PATH)
     
     # Final summary
-    print(f"\n" + "="*80)
-    print(f"📊 Final Summary:")
-    print(f"="*80)
-    print(f"   📄 Added files: {len(added_files)} processed")
-    print(f"   🗑️  Deleted files: {len(deleted_files)} processed")
-    print(f"   📋 TOC files: {len(toc_files)} processed")
-    print(f"   📋 Keyword files: {len(keyword_files)} processed")
-    print(f"   📝 Modified files: {len(modified_sections)} processed")
-    print(f"   🖼️  Added images: {len(added_images)} processed")
-    print(f"   🖼️  Modified images: {len(modified_images)} processed")
-    print(f"   🖼️  Deleted images: {len(deleted_images)} processed")
-    print(f"="*80)
-    print(f"🎉 Workflow completed successfully!")
+    thread_safe_print(f"\n" + "="*80)
+    thread_safe_print(f"📊 Final Summary:")
+    thread_safe_print(f"="*80)
+    thread_safe_print(f"   📄 Added files: {len(added_files)} processed")
+    thread_safe_print(f"   🗑️  Deleted files: {len(deleted_files)} processed")
+    thread_safe_print(f"   📋 TOC files: {len(toc_files)} processed")
+    thread_safe_print(f"   📋 Keyword files: {len(keyword_files)} processed")
+    thread_safe_print(f"   📝 Modified files: {len(modified_sections)} processed")
+    thread_safe_print(f"   🖼️  Added images: {len(added_images)} processed")
+    thread_safe_print(f"   🖼️  Modified images: {len(modified_images)} processed")
+    thread_safe_print(f"   🖼️  Deleted images: {len(deleted_images)} processed")
+    thread_safe_print(f"="*80)
+    thread_safe_print(f"🎉 Workflow completed successfully!")
 
 if __name__ == "__main__":
     main()

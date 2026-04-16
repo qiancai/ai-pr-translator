@@ -75,6 +75,8 @@ PROVIDER_MAX_TOKENS = {
 # Gemini rate-limiting state
 # ---------------------------------------------------------------------------
 _gemini_call_count = 0
+_gemini_cooldown_until = 0.0
+_gemini_rate_lock = threading.Lock()
 GEMINI_RATE_LIMIT_CALLS = 10
 GEMINI_RATE_LIMIT_SLEEP = 30
 
@@ -180,20 +182,38 @@ class UnifiedAIClient:
 
     # -----------------------------------------------------------------------
     def _gemini_chat(self, messages):
-        global _gemini_call_count
+        global _gemini_call_count, _gemini_cooldown_until
         try:
-            _gemini_call_count += 1
-            if _gemini_call_count > GEMINI_RATE_LIMIT_CALLS:
-                thread_safe_print(
-                    f"   ⏳ Rate limit: {GEMINI_RATE_LIMIT_CALLS} calls reached, "
-                    f"sleeping {GEMINI_RATE_LIMIT_SLEEP}s..."
-                )
-                time.sleep(GEMINI_RATE_LIMIT_SLEEP)
-                _gemini_call_count = 1
+            while True:
+                with _gemini_rate_lock:
+                    now = time.monotonic()
+                    if _gemini_cooldown_until > now:
+                        wait_seconds = _gemini_cooldown_until - now
+                        call_count = None
+                    else:
+                        _gemini_call_count += 1
+                        if _gemini_call_count > GEMINI_RATE_LIMIT_CALLS:
+                            _gemini_call_count = 1
+                            _gemini_cooldown_until = now + GEMINI_RATE_LIMIT_SLEEP
+                            wait_seconds = GEMINI_RATE_LIMIT_SLEEP
+                        else:
+                            wait_seconds = 0
+                        call_count = _gemini_call_count
+
+                if wait_seconds:
+                    thread_safe_print(
+                        f"   ⏳ Rate limit: {GEMINI_RATE_LIMIT_CALLS} calls reached, "
+                        f"sleeping {wait_seconds:.1f}s..."
+                    )
+                    time.sleep(wait_seconds)
+                    if call_count is None:
+                        continue
+
+                break
 
             prompt = self._convert_messages_to_prompt(messages)
             thread_safe_print(
-                f"   🔄 Calling Gemini API ({_gemini_call_count}/{GEMINI_RATE_LIMIT_CALLS})..."
+                f"   🔄 Calling Gemini API ({call_count}/{GEMINI_RATE_LIMIT_CALLS})..."
             )
 
             if _GEMINI_NEW_SDK:

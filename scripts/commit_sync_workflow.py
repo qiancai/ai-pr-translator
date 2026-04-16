@@ -43,6 +43,12 @@ from glossary import create_glossary_matcher, load_glossary
 from image_processor import process_all_images
 from keword_processor import process_keyword_file
 from log_sanitizer import sanitize_exception_message
+from parallel_file_processor import (
+    make_file_task,
+    make_task_result,
+    run_file_tasks,
+    should_parallelize_file_processing,
+)
 from main_workflow import (
     AI_DOCS_FOLDER_NAME,
     CLOUD_FOLDER_NAME,
@@ -55,6 +61,7 @@ from main_workflow import (
     determine_file_processing_type,
     extract_file_diff_from_pr,
     git_add_changes,
+    git_add_successful_task_changes,
     process_regular_modified_file,
 )
 from toc_processor import process_toc_file
@@ -81,20 +88,90 @@ class TranslationStats:
         self.skipped.append((file_path, reason))
 
     def print_summary(self):
-        print("\n📚 Translation attempt summary:")
-        print(f"   📄 Files attempted for translation: {self.total}")
-        print(f"   ✅ Successfully translated: {len(self.succeeded)}")
-        print(f"   ❌ Failed to translate: {len(self.failed)}")
+        thread_safe_print("\n📚 Translation attempt summary:")
+        thread_safe_print(f"   📄 Files attempted for translation: {self.total}")
+        thread_safe_print(f"   ✅ Successfully translated: {len(self.succeeded)}")
+        thread_safe_print(f"   ❌ Failed to translate: {len(self.failed)}")
 
         if self.failed:
-            print("   ❌ Failed files:")
+            thread_safe_print("   ❌ Failed files:")
             for file_path, reason in self.failed:
-                print(f"      - {file_path}: {reason}")
+                thread_safe_print(f"      - {file_path}: {reason}")
 
         if self.skipped:
-            print(f"   ⏭️  Skipped files: {len(self.skipped)}")
+            thread_safe_print(f"   ⏭️  Skipped files: {len(self.skipped)}")
             for file_path, reason in self.skipped:
-                print(f"      - {file_path}: {reason}")
+                thread_safe_print(f"      - {file_path}: {reason}")
+
+
+def _record_translation_task_result(task_result, translation_stats):
+    file_path = task_result["file_path"]
+    if not task_result["ok"]:
+        thread_safe_print(f"   ❌ Failed to process {file_path}: {task_result['error']}")
+        translation_stats.mark_failure(file_path, task_result["error"])
+        return False
+
+    result = task_result["result"] or {}
+    status = result.get("status", "failure")
+    reason = result.get("reason", "")
+
+    if status == "success":
+        thread_safe_print(f"   ✅ Successfully processed {file_path}")
+        translation_stats.mark_success(file_path)
+        return True
+    if status == "skipped":
+        thread_safe_print(f"   ⏭️  Skipped {file_path}: {reason}")
+        translation_stats.mark_skipped(file_path, reason)
+        return False
+
+    thread_safe_print(f"   ❌ Failed to process {file_path}: {reason}")
+    translation_stats.mark_failure(file_path, reason)
+    return False
+
+
+def _process_commit_modified_file(
+    source_file_path,
+    file_sections,
+    pr_diff,
+    diff_context,
+    github_client,
+    ai_client,
+    repo_config,
+    glossary_matcher,
+):
+    thread_safe_print(f"\n📄 Processing modified file: {source_file_path}")
+
+    file_specific_diff = extract_file_diff_from_pr(pr_diff, source_file_path) if pr_diff else ""
+    if not file_specific_diff:
+        if pr_diff:
+            return make_task_result("failure", "No file-specific diff found")
+        return make_task_result("failure", "No markdown patch text available")
+    thread_safe_print(f"   📊 File-specific diff: {len(file_specific_diff)} chars")
+
+    file_type = determine_file_processing_type(source_file_path, file_sections, SPECIAL_FILES, IGNORE_FILES)
+    thread_safe_print(f"   🔍 File processing type: {file_type}")
+
+    if file_type == "special_file_toc":
+        return make_task_result("skipped", "Already handled in TOC step")
+    if file_type == "special_file_keyword":
+        return make_task_result("skipped", "Already handled in keyword step")
+    if file_type != "regular_modified":
+        return make_task_result("failure", f"Unknown file processing type: {file_type}")
+
+    success = process_regular_modified_file(
+        source_file_path,
+        file_sections,
+        file_specific_diff,
+        diff_context,
+        github_client,
+        ai_client,
+        repo_config,
+        MAX_NON_SYSTEM_SECTIONS_FOR_AI,
+        glossary_matcher=glossary_matcher,
+    )
+    if success:
+        return make_task_result("success")
+    return make_task_result("failure", "Regular modified file processor returned failure")
 
 
 def get_commit_repo_config():
@@ -191,12 +268,12 @@ def build_exclude_folders(repo_config):
     exclude_folders = []
     if SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH and repo_config.get("target_language") == "Chinese":
         if source_filters_explicitly_include(CLOUD_FOLDER_NAME):
-            print(f"ℹ️  Explicit source filters include '{CLOUD_FOLDER_NAME}', skipping the default exclusion for commit sync.")
+            thread_safe_print(f"ℹ️  Explicit source filters include '{CLOUD_FOLDER_NAME}', skipping the default exclusion for commit sync.")
         else:
             exclude_folders.append(CLOUD_FOLDER_NAME)
     if SKIP_TRANSLATING_AI_DOCS_TO_ZH and repo_config.get("target_language") == "Chinese":
         if source_filters_explicitly_include(AI_DOCS_FOLDER_NAME):
-            print(f"ℹ️  Explicit source filters include '{AI_DOCS_FOLDER_NAME}', skipping the default exclusion for commit sync.")
+            thread_safe_print(f"ℹ️  Explicit source filters include '{AI_DOCS_FOLDER_NAME}', skipping the default exclusion for commit sync.")
         else:
             exclude_folders.append(AI_DOCS_FOLDER_NAME)
     return exclude_folders
@@ -218,25 +295,25 @@ def resolve_compare_range():
 def main():
     """Run the commit-based translation workflow."""
     if not all([SOURCE_REPO, TARGET_REPO, GITHUB_TOKEN, TARGET_REPO_PATH, SOURCE_BASE_REF.strip(), SOURCE_HEAD_REF.strip()]):
-        print("❌ Missing required environment variables:")
-        print(f"   SOURCE_REPO: {SOURCE_REPO}")
-        print(f"   TARGET_REPO: {TARGET_REPO}")
-        print(f"   GITHUB_TOKEN: {'Set' if GITHUB_TOKEN else 'Not set'}")
-        print(f"   TARGET_REPO_PATH: {TARGET_REPO_PATH}")
-        print(f"   SOURCE_BASE_REF: {SOURCE_BASE_REF or '(empty)'}")
-        print(f"   SOURCE_HEAD_REF: {SOURCE_HEAD_REF or '(empty)'}")
+        thread_safe_print("❌ Missing required environment variables:")
+        thread_safe_print(f"   SOURCE_REPO: {SOURCE_REPO}")
+        thread_safe_print(f"   TARGET_REPO: {TARGET_REPO}")
+        thread_safe_print(f"   GITHUB_TOKEN: {'Set' if GITHUB_TOKEN else 'Not set'}")
+        thread_safe_print(f"   TARGET_REPO_PATH: {TARGET_REPO_PATH}")
+        thread_safe_print(f"   SOURCE_BASE_REF: {SOURCE_BASE_REF or '(empty)'}")
+        thread_safe_print(f"   SOURCE_HEAD_REF: {SOURCE_HEAD_REF or '(empty)'}")
         return 1
 
-    print("🔧 Auto Commit Sync Tool")
-    print(f"📍 Source Repo: {SOURCE_REPO}")
-    print(f"📍 Target Repo: {TARGET_REPO}")
-    print(f"🌿 Source Branch: {SOURCE_BRANCH}")
-    print(f"🧭 Compare Range: {SOURCE_BASE_REF}...{SOURCE_HEAD_REF}")
-    print(f"📁 Source Folder Filter: {SOURCE_FOLDER or '(none)'}")
-    print(f"📄 Source File Filter: {SOURCE_FILES or '(none)'}")
-    print(f"📁 Target Repo Path: {TARGET_REPO_PATH}")
-    print(f"🤖 AI Provider: {AI_PROVIDER}")
-    print(f"🚦 Fail on Translation Error: {FAIL_ON_TRANSLATION_ERROR}")
+    thread_safe_print("🔧 Auto Commit Sync Tool")
+    thread_safe_print(f"📍 Source Repo: {SOURCE_REPO}")
+    thread_safe_print(f"📍 Target Repo: {TARGET_REPO}")
+    thread_safe_print(f"🌿 Source Branch: {SOURCE_BRANCH}")
+    thread_safe_print(f"🧭 Compare Range: {SOURCE_BASE_REF}...{SOURCE_HEAD_REF}")
+    thread_safe_print(f"📁 Source Folder Filter: {SOURCE_FOLDER or '(none)'}")
+    thread_safe_print(f"📄 Source File Filter: {SOURCE_FILES or '(none)'}")
+    thread_safe_print(f"📁 Target Repo Path: {TARGET_REPO_PATH}")
+    thread_safe_print(f"🤖 AI Provider: {AI_PROVIDER}")
+    thread_safe_print(f"🚦 Fail on Translation Error: {FAIL_ON_TRANSLATION_ERROR}")
 
     clean_temp_output_dir()
 
@@ -257,17 +334,17 @@ def main():
         candidate = os.path.join(TARGET_REPO_PATH, "resources", "terms.md")
         if os.path.exists(candidate):
             terms_path = candidate
-    print(f"\n📚 Loading glossary from: {terms_path or '(not configured)'}")
+    thread_safe_print(f"\n📚 Loading glossary from: {terms_path or '(not configured)'}")
     glossary = load_glossary(terms_path) if terms_path else []
     glossary_matcher = create_glossary_matcher(glossary)
 
     try:
         base_ref, head_ref = resolve_compare_range()
     except Exception as e:
-        print(f"❌ Failed to resolve compare range: {sanitize_exception_message(e)}")
+        thread_safe_print(f"❌ Failed to resolve compare range: {sanitize_exception_message(e)}")
         return 1
 
-    print(f"\n🚀 Starting commit-based sync for: {base_ref}...{head_ref}")
+    thread_safe_print(f"\n🚀 Starting commit-based sync for: {base_ref}...{head_ref}")
 
     try:
         diff_context = build_commit_diff_context(
@@ -280,7 +357,7 @@ def main():
         )
         diff_context["repo_config"] = repo_config
     except Exception as e:
-        print(f"❌ Failed to build commit diff context: {sanitize_exception_message(e)}")
+        thread_safe_print(f"❌ Failed to build commit diff context: {sanitize_exception_message(e)}")
         return 1
 
     filtered_changed_files = filter_changed_files(
@@ -290,16 +367,16 @@ def main():
     )
     diff_context["changed_files"] = filtered_changed_files
 
-    print(f"📊 Filtered changed files: {len(filtered_changed_files)}")
+    thread_safe_print(f"📊 Filtered changed files: {len(filtered_changed_files)}")
     if not filtered_changed_files:
-        print("ℹ️  No matching source changes found after folder/file filtering.")
+        thread_safe_print("ℹ️  No matching source changes found after folder/file filtering.")
         return 0
 
     pr_diff = build_diff_text(filtered_changed_files)
     if pr_diff:
-        print(f"✅ Built diff text: {len(pr_diff)} characters")
+        thread_safe_print(f"✅ Built diff text: {len(pr_diff)} characters")
     else:
-        print("ℹ️  No markdown patch text found; continuing in case there are file-level or image changes.")
+        thread_safe_print("ℹ️  No markdown patch text found; continuing in case there are file-level or image changes.")
 
     exclude_folders = build_exclude_folders(repo_config)
 
@@ -315,22 +392,28 @@ def main():
             exclude_folders=exclude_folders,
         )
     except Exception as e:
-        print(f"❌ Source diff analysis failed: {sanitize_exception_message(e)}")
+        thread_safe_print(f"❌ Source diff analysis failed: {sanitize_exception_message(e)}")
         return 1
+
+    diff_file_count = len({file.filename for file in filtered_changed_files if getattr(file, "filename", None)})
+    parallel_file_processing = should_parallelize_file_processing(diff_file_count)
+    if parallel_file_processing:
+        thread_safe_print(f"⚡ Diff has {diff_file_count} files; file-level translation will use parallel chunks.")
 
     translation_stats = TranslationStats()
 
     if deleted_files:
-        print(f"\n🗑️  Processing {len(deleted_files)} deleted files...")
+        thread_safe_print(f"\n🗑️  Processing {len(deleted_files)} deleted files...")
         process_deleted_files(deleted_files, github_client, repo_config)
         git_add_changes(TARGET_REPO_PATH)
 
     if added_files:
-        print(f"\n📄 Processing {len(added_files)} added files...")
+        thread_safe_print(f"\n📄 Processing {len(added_files)} added files...")
+        added_tasks = []
         for file_path, file_content in added_files.items():
-            try:
+            def run_added_file(path=file_path, content=file_content):
                 success, failure_reasons = process_added_files(
-                    {file_path: file_content},
+                    {path: content},
                     diff_context,
                     github_client,
                     ai_client,
@@ -338,135 +421,105 @@ def main():
                     glossary_matcher=glossary_matcher,
                     return_details=True,
                 )
-            except Exception as e:
-                reason = sanitize_exception_message(e)
-                print(f"   ❌ Failed to process added file {file_path}: {reason}")
-                translation_stats.mark_failure(file_path, reason)
-                continue
+                if success:
+                    return make_task_result("success")
+                return make_task_result(
+                    "failure",
+                    failure_reasons.get(path, "Added file processor returned failure"),
+                )
 
-            if success:
-                print(f"   ✅ Successfully processed added file {file_path}")
-                translation_stats.mark_success(file_path)
-                git_add_changes(TARGET_REPO_PATH)
-            else:
-                reason = failure_reasons.get(file_path, "Added file processor returned failure")
-                print(f"   ❌ Failed to process added file {file_path}")
-                translation_stats.mark_failure(file_path, reason)
+            added_tasks.append(make_file_task(file_path, run_added_file))
+
+        added_results = run_file_tasks(added_tasks, "added files", parallel_file_processing)
+        for result in added_results:
+            _record_translation_task_result(result, translation_stats)
+        git_add_successful_task_changes(added_results, TARGET_REPO_PATH)
 
     if toc_files:
-        print(f"\n📋 Processing {len(toc_files)} TOC files...")
+        thread_safe_print(f"\n📋 Processing {len(toc_files)} TOC files...")
+        toc_tasks = []
         for file_path, toc_data in toc_files.items():
-            if toc_data.get("type") != "toc":
-                reason = f"Unknown TOC data type: {toc_data.get('type')}"
-                print(f"   ⚠️  {reason} for {file_path}")
-                translation_stats.mark_failure(file_path, reason)
-                continue
+            def run_toc_file(path=file_path, data=toc_data):
+                if data.get("type") != "toc":
+                    return make_task_result("failure", f"Unknown TOC data type: {data.get('type')}")
 
-            success = process_toc_file(
-                file_path,
-                toc_data,
-                diff_context,
-                github_client,
-                ai_client,
-                repo_config,
-            )
-
-            if success:
-                print(f"   ✅ Successfully processed TOC file {file_path}")
-                translation_stats.mark_success(file_path)
-                git_add_changes(TARGET_REPO_PATH)
-            else:
-                reason = "TOC processor returned failure"
-                print(f"   ❌ Failed to process TOC file {file_path}")
-                translation_stats.mark_failure(file_path, reason)
-
-    if keyword_files:
-        print(f"\n📋 Processing {len(keyword_files)} keyword files...")
-        for file_path, keyword_data in keyword_files.items():
-            if keyword_data.get("type") != "keyword":
-                reason = f"Unknown keyword data type: {keyword_data.get('type')}"
-                print(f"   ⚠️  {reason} for {file_path}")
-                translation_stats.mark_failure(file_path, reason)
-                continue
-
-            success = process_keyword_file(
-                file_path,
-                keyword_data,
-                diff_context,
-                github_client,
-                ai_client,
-                repo_config,
-            )
-
-            if success:
-                print(f"   ✅ Successfully processed keyword file {file_path}")
-                translation_stats.mark_success(file_path)
-                git_add_changes(TARGET_REPO_PATH)
-            else:
-                reason = "Keyword processor returned failure"
-                print(f"   ❌ Failed to process keyword file {file_path}")
-                translation_stats.mark_failure(file_path, reason)
-
-    if modified_sections:
-        print(f"\n📝 Processing {len(modified_sections)} modified files...")
-        for source_file_path, file_sections in modified_sections.items():
-            print(f"\n📄 Processing modified file: {source_file_path}")
-
-            file_specific_diff = extract_file_diff_from_pr(pr_diff, source_file_path) if pr_diff else ""
-            if not file_specific_diff:
-                if pr_diff:
-                    print(f"   ⚠️  No diff found for {source_file_path}, skipping...")
-                    translation_stats.mark_failure(source_file_path, "No file-specific diff found")
-                else:
-                    print(f"   ⚠️  No markdown patch text available for {source_file_path}, skipping section-level translation.")
-                    translation_stats.mark_failure(source_file_path, "No markdown patch text available")
-                continue
-            print(f"   📊 File-specific diff: {len(file_specific_diff)} chars")
-
-            file_type = determine_file_processing_type(source_file_path, file_sections, SPECIAL_FILES, IGNORE_FILES)
-            print(f"   🔍 File processing type: {file_type}")
-
-            if file_type == "special_file_toc":
-                print("   ⏭️  Special file already processed in TOC step, skipping...")
-                translation_stats.mark_skipped(source_file_path, "Already handled in TOC step")
-                continue
-            if file_type == "special_file_keyword":
-                print("   ⏭️  Keyword file already processed in keyword step, skipping...")
-                translation_stats.mark_skipped(source_file_path, "Already handled in keyword step")
-                continue
-            if file_type != "regular_modified":
-                print(f"   ⚠️  Unknown file processing type: {file_type}, skipping...")
-                translation_stats.mark_failure(source_file_path, f"Unknown file processing type: {file_type}")
-                continue
-
-            try:
-                success = process_regular_modified_file(
-                    source_file_path,
-                    file_sections,
-                    file_specific_diff,
+                success = process_toc_file(
+                    path,
+                    data,
                     diff_context,
                     github_client,
                     ai_client,
                     repo_config,
-                    MAX_NON_SYSTEM_SECTIONS_FOR_AI,
-                    glossary_matcher=glossary_matcher,
                 )
-            except Exception as e:
-                reason = sanitize_exception_message(e)
-                print(f"   ❌ Failed to process {source_file_path}: {reason}")
-                translation_stats.mark_failure(source_file_path, reason)
-                continue
+                if success:
+                    return make_task_result("success")
+                return make_task_result("failure", "TOC processor returned failure")
 
-            if success:
-                print(f"   ✅ Successfully processed {source_file_path}")
-                translation_stats.mark_success(source_file_path)
-                git_add_changes(TARGET_REPO_PATH)
-            else:
-                print(f"   ❌ Failed to process {source_file_path}")
-                translation_stats.mark_failure(source_file_path, "Regular modified file processor returned failure")
+            toc_tasks.append(make_file_task(file_path, run_toc_file))
+
+        toc_results = run_file_tasks(toc_tasks, "TOC files", parallel_file_processing)
+        for result in toc_results:
+            _record_translation_task_result(result, translation_stats)
+        git_add_successful_task_changes(toc_results, TARGET_REPO_PATH)
+
+    if keyword_files:
+        thread_safe_print(f"\n📋 Processing {len(keyword_files)} keyword files...")
+        keyword_tasks = []
+        for file_path, keyword_data in keyword_files.items():
+            def run_keyword_file(path=file_path, data=keyword_data):
+                if data.get("type") != "keyword":
+                    return make_task_result("failure", f"Unknown keyword data type: {data.get('type')}")
+
+                success = process_keyword_file(
+                    path,
+                    data,
+                    diff_context,
+                    github_client,
+                    ai_client,
+                    repo_config,
+                )
+                if success:
+                    return make_task_result("success")
+                return make_task_result("failure", "Keyword processor returned failure")
+
+            keyword_tasks.append(make_file_task(file_path, run_keyword_file))
+
+        keyword_results = run_file_tasks(keyword_tasks, "keyword files", parallel_file_processing)
+        for result in keyword_results:
+            _record_translation_task_result(result, translation_stats)
+        git_add_successful_task_changes(keyword_results, TARGET_REPO_PATH)
+
+    if modified_sections:
+        thread_safe_print(f"\n📝 Processing {len(modified_sections)} modified files...")
+        modified_tasks = []
+        for source_file_path, file_sections in modified_sections.items():
+            def run_modified_file(path=source_file_path, sections=file_sections):
+                return _process_commit_modified_file(
+                    path,
+                    sections,
+                    pr_diff,
+                    diff_context,
+                    github_client,
+                    ai_client,
+                    repo_config,
+                    glossary_matcher,
+                )
+
+            modified_tasks.append(
+                make_file_task(
+                    source_file_path,
+                    run_modified_file,
+                    resource_key=source_file_path.replace("/", "-").replace(".md", ""),
+                )
+            )
+
+        modified_results = run_file_tasks(modified_tasks, "modified files", parallel_file_processing)
+        for result in modified_results:
+            _record_translation_task_result(result, translation_stats)
+        git_add_successful_task_changes(modified_results, TARGET_REPO_PATH)
 
     if added_images or modified_images or deleted_images:
-        print("\n🖼️  Processing images...")
+        thread_safe_print("\n🖼️  Processing images...")
         process_all_images(
             added_images,
             modified_images,
@@ -477,25 +530,25 @@ def main():
         )
         git_add_changes(TARGET_REPO_PATH)
 
-    print("\n" + "=" * 80)
-    print("📊 Final Summary:")
-    print("=" * 80)
-    print(f"   📄 Added files: {len(added_files)} processed")
-    print(f"   🗑️  Deleted files: {len(deleted_files)} processed")
-    print(f"   📋 TOC files: {len(toc_files)} processed")
-    print(f"   📋 Keyword files: {len(keyword_files)} processed")
-    print(f"   📝 Modified files: {len(modified_sections)} processed")
-    print(f"   🖼️  Added images: {len(added_images)} processed")
-    print(f"   🖼️  Modified images: {len(modified_images)} processed")
-    print(f"   🖼️  Deleted images: {len(deleted_images)} processed")
+    thread_safe_print("\n" + "=" * 80)
+    thread_safe_print("📊 Final Summary:")
+    thread_safe_print("=" * 80)
+    thread_safe_print(f"   📄 Added files: {len(added_files)} processed")
+    thread_safe_print(f"   🗑️  Deleted files: {len(deleted_files)} processed")
+    thread_safe_print(f"   📋 TOC files: {len(toc_files)} processed")
+    thread_safe_print(f"   📋 Keyword files: {len(keyword_files)} processed")
+    thread_safe_print(f"   📝 Modified files: {len(modified_sections)} processed")
+    thread_safe_print(f"   🖼️  Added images: {len(added_images)} processed")
+    thread_safe_print(f"   🖼️  Modified images: {len(modified_images)} processed")
+    thread_safe_print(f"   🖼️  Deleted images: {len(deleted_images)} processed")
     translation_stats.print_summary()
-    print("=" * 80)
+    thread_safe_print("=" * 80)
     if translation_stats.failed:
-        print("⚠️  The commit-based sync workflow completed with per-file translation failures.")
+        thread_safe_print("⚠️  The commit-based sync workflow completed with per-file translation failures.")
         if FAIL_ON_TRANSLATION_ERROR:
             return 1
     else:
-        print("🎉 The commit-based sync workflow completed successfully!")
+        thread_safe_print("🎉 The commit-based sync workflow completed successfully!")
     return 0
 
 
