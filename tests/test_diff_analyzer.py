@@ -12,6 +12,8 @@ from diff_analyzer import (
     build_commit_diff_context,
     build_diff_text,
     build_pr_diff_context,
+    build_hierarchy_dict,
+    build_source_diff_dict,
 )
 
 
@@ -148,6 +150,26 @@ class DiffAnalyzerContextTest(unittest.TestCase):
         source_diff = self.generated_file.read_text(encoding="utf-8")
         self.assertIn('"operation": "modified"', source_diff)
         self.assertIn("New text", source_diff)
+
+    def test_bottom_modified_keeps_matching_hierarchy_in_source_diff_dict(self):
+        base_content = "# Title\n\n## Section\nOld text\n"
+        head_content = "# Title\n\n## Section\nNew text\n"
+        base_hierarchy = build_hierarchy_dict(base_content)
+        head_hierarchy = build_hierarchy_dict(head_content)
+
+        source_diff_dict = build_source_diff_dict(
+            modified_sections={"3": "## Section"},
+            added_sections={},
+            deleted_sections={},
+            all_hierarchy_dict=head_hierarchy,
+            base_hierarchy_dict=base_hierarchy,
+            operations={"modified_lines": [{"line_number": 4, "is_header": False}]},
+            file_content=head_content,
+            base_file_content=base_content,
+        )
+
+        self.assertEqual(source_diff_dict["modified_3"]["original_hierarchy"], "bottom-modified-3")
+        self.assertEqual(source_diff_dict["modified_3"]["matching_hierarchy"], "## Section")
 
     def test_renamed_markdown_is_treated_as_delete_and_add(self):
         renamed_file = SimpleNamespace(

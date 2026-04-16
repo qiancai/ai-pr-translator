@@ -1327,13 +1327,17 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
             else:
                 final_original_hierarchy = original_hierarchy
             
-            source_diff_dict[f"modified_{line_num_str}"] = {
+            modified_entry = {
                 "new_line_number": line_num,
                 "original_hierarchy": final_original_hierarchy,
                 "operation": "modified",
                 "new_content": new_content,
                 "old_content": old_content
             }
+            if is_bottom_modified:
+                modified_entry["matching_hierarchy"] = original_hierarchy
+
+            source_diff_dict[f"modified_{line_num_str}"] = modified_entry
             print(f"   ✅ Real modification detected at line {line_num_str}: content changed")
         else:
             print(f"   🚫 Filtered out false positive at line {line_num_str}: content unchanged (likely line shift artifact)")

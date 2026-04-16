@@ -66,11 +66,17 @@ def clean_title_for_matching(title):
     
     return title
 
+def is_bottom_section_marker(title):
+    """Return True for internal bottom-section markers, not user-facing headings."""
+    return bool(title and re.match(r'^bottom-(?:added|modified)-\d+$', title))
+
 def is_system_variable_or_config(title):
     """Check if a title represents a system variable or configuration item"""
     cleaned_title = clean_title_for_matching(title)
     
     if not cleaned_title:
+        return False
+    if is_bottom_section_marker(cleaned_title):
         return False
     
     # Check if original title had backticks (indicating code/config item)
@@ -619,6 +625,32 @@ def is_direct_match_candidate(hierarchy):
     )
 
 
+def get_bottom_modified_matching_hierarchy(key, hierarchy, source_info):
+    """Resolve a bottom-modified marker to a real heading when content provides one."""
+    if not hierarchy or not hierarchy.startswith('bottom-modified-'):
+        return hierarchy
+
+    source_hierarchy = source_info.get('matching_hierarchy')
+    if source_hierarchy:
+        thread_safe_print(
+            f"   🔚 Bottom-modified section {key}: using source dict hierarchy for matching: {source_hierarchy}"
+        )
+        return source_hierarchy
+
+    source_content = source_info.get('new_content') or source_info.get('old_content') or ''
+    inferred_heading = extract_first_heading_from_content(source_content)
+    if inferred_heading:
+        thread_safe_print(
+            f"   🔚 Bottom-modified section {key}: inferred matching hierarchy from content: {inferred_heading}"
+        )
+        return inferred_heading
+
+    thread_safe_print(
+        f"   ⚠️  Bottom-modified section {key} has no inferred heading; keeping marker for fallback matching"
+    )
+    return hierarchy
+
+
 def find_step_heading_fallback_match(source_hierarchy, target_hierarchy):
     """Fallback-match tutorial step headings by level and step number."""
     source_step = extract_step_number(source_hierarchy)
@@ -842,24 +874,36 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
     # Initialize final matching results with ordered dict to preserve order
     from collections import OrderedDict
     all_matched_sections = OrderedDict()
+    source_entries = OrderedDict(
+        (key, dict(source_diff_dict.get(key, {})))
+        for key in source_hierarchies
+    )
     
     # Categorize sections for processing strategy but maintain order.
     intro_section_sections = OrderedDict()
     direct_match_sections = OrderedDict()
     batched_ai_sections = OrderedDict()
     bottom_sections = OrderedDict()  # Only bottom-added sections should be here
+    matching_hierarchies = OrderedDict()
     
     for key, hierarchy in source_hierarchies.items():
+        source_info = source_entries.get(key, {})
+        if hierarchy.startswith('bottom-modified-'):
+            matching_hierarchy = get_bottom_modified_matching_hierarchy(key, hierarchy, source_info)
+        else:
+            matching_hierarchy = hierarchy
+        matching_hierarchies[key] = matching_hierarchy
+
         # Check if this is an intro section (highest priority)
         if hierarchy == "intro_section" or key == "intro_section":
-            intro_section_sections[key] = hierarchy
+            intro_section_sections[key] = matching_hierarchy
         # Only bottom-added sections should skip matching and append to end.
         elif hierarchy.startswith('bottom-added-'):
             bottom_sections[key] = hierarchy
-        elif is_direct_match_candidate(hierarchy):
-            direct_match_sections[key] = hierarchy
+        elif is_direct_match_candidate(matching_hierarchy):
+            direct_match_sections[key] = matching_hierarchy
         else:
-            batched_ai_sections[key] = hierarchy
+            batched_ai_sections[key] = matching_hierarchy
     
     thread_safe_print(f"📊 Section categorization:")
     thread_safe_print(f"   📄 Intro section: {len(intro_section_sections)} section(s)")
@@ -891,7 +935,7 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
                     batched_ai_sections,
                     ai_sections,
                     filtered_target_hierarchy,
-                    source_diff_dict,
+                    source_entries,
                 )
                 batched_ai_failures.update(validation_failures)
                 thread_safe_print(
@@ -915,6 +959,7 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
     
     for key, hierarchy in source_hierarchies.items():
         thread_safe_print(f"   🔍 Processing {key}: {hierarchy}")
+        matching_hierarchy = matching_hierarchies.get(key, hierarchy)
         
         # Determine processing strategy based on section type and content
         if hierarchy == "intro_section" or key == "intro_section":
@@ -955,7 +1000,7 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
             if key.startswith('added_'):
                 result = process_added_section(
                     key,
-                    hierarchy,
+                    matching_hierarchy,
                     target_hierarchy,
                     target_lines,
                     ai_client,
@@ -964,25 +1009,11 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
                     max_tokens,
                 )
             else:
-                operation = source_diff_dict[key].get('operation', 'unknown')
-                effective_hierarchy = hierarchy
-                if hierarchy.startswith('bottom-modified-'):
-                    source_info = source_diff_dict.get(key, {})
-                    source_content = source_info.get('new_content') or source_info.get('old_content') or ''
-                    inferred_heading = extract_first_heading_from_content(source_content)
-                    if inferred_heading:
-                        effective_hierarchy = inferred_heading
-                        thread_safe_print(
-                            f"      🔚 Bottom-modified section - matching by inferred heading: {inferred_heading}"
-                        )
-                    else:
-                        thread_safe_print(
-                            f"      ⚠️  Bottom-modified section has no inferred heading, fallback to original hierarchy"
-                        )
+                operation = source_entries.get(key, {}).get('operation', 'unknown')
                 thread_safe_print(f"      {operation.capitalize()} section - finding target match")
                 result = process_modified_or_deleted_section(
                     key,
-                    effective_hierarchy,
+                    matching_hierarchy,
                     target_hierarchy,
                     target_lines,
                     ai_client,
@@ -992,12 +1023,12 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
                 )
         else:
             # Direct-match path.
-            operation = source_diff_dict[key].get('operation', 'unknown')
+            operation = source_entries.get(key, {}).get('operation', 'unknown')
             if key.startswith('added_'):
                 thread_safe_print(f"      ➕ Added section - finding insertion point")
                 result = process_added_section(
                     key,
-                    hierarchy,
+                    matching_hierarchy,
                     target_hierarchy,
                     target_lines,
                     ai_client,
@@ -1009,7 +1040,7 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
                 thread_safe_print(f"      {operation.capitalize()} section - finding target match")
                 result = process_modified_or_deleted_section(
                     key,
-                    hierarchy,
+                    matching_hierarchy,
                     target_hierarchy,
                     target_lines,
                     ai_client,
@@ -1020,7 +1051,7 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
         
         if result:
             # Add source language information from source_diff_dict
-            source_info = source_diff_dict.get(key, {})
+            source_info = source_entries.get(key, {})
             
             # Extract target content from target_lines
             target_line = result.get('target_line', 'unknown')
