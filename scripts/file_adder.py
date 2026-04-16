@@ -193,7 +193,15 @@ Please provide the translated content maintaining all formatting and structure."
         thread_safe_print(f"   ❌ Batch translation failed: {sanitize_exception_message(e)}")
         return batch_content  # Return original content if translation fails
 
-def process_added_files(added_files, source_context_or_pr_url, github_client, ai_client, repo_config, glossary_matcher=None):
+def process_added_files(
+    added_files,
+    source_context_or_pr_url,
+    github_client,
+    ai_client,
+    repo_config,
+    glossary_matcher=None,
+    return_details=False,
+):
     """Process newly added files by translating and creating them in target repository.
 
     source_context_or_pr_url is currently unused here, but the shared signature keeps
@@ -201,9 +209,11 @@ def process_added_files(added_files, source_context_or_pr_url, github_client, ai
     """
     if not added_files:
         thread_safe_print("\n📄 No new files to process")
-        return
+        return (True, {}) if return_details else True
     
     thread_safe_print(f"\n📄 Processing {len(added_files)} newly added files...")
+    all_success = True
+    failure_reasons = {}
     
     target_local_path = repo_config['target_local_path']
     source_language = repo_config['source_language']
@@ -225,7 +235,10 @@ def process_added_files(added_files, source_context_or_pr_url, github_client, ai
         
         # Check if file already exists
         if os.path.exists(target_file_path):
-            thread_safe_print(f"   ⚠️  Target file already exists: {target_file_path}")
+            reason = f"Target file already exists: {target_file_path}"
+            thread_safe_print(f"   ⚠️  {reason}")
+            failure_reasons[file_path] = reason
+            all_success = False
             continue
         
         # Create section batches for translation
@@ -257,8 +270,12 @@ def process_added_files(added_files, source_context_or_pr_url, github_client, ai
             thread_safe_print(f"   ✅ Created translated file: {target_file_path}")
             
         except Exception as e:
+            reason = f"Error creating file {target_file_path}: {sanitize_exception_message(e)}"
             thread_safe_print(
-                f"   ❌ Error creating file {target_file_path}: {sanitize_exception_message(e)}"
+                f"   ❌ {reason}"
             )
+            failure_reasons[file_path] = reason
+            all_success = False
     
     thread_safe_print(f"\n✅ Completed processing all new files")
+    return (all_success, failure_reasons) if return_details else all_success

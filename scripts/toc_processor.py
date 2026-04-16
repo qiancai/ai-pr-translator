@@ -333,7 +333,11 @@ Return format:
         return {}
 
 def process_toc_file(file_path, toc_data, source_context_or_pr_url, github_client, ai_client, repo_config):
-    """Process a single TOC.md file with special logic"""
+    """Process a single TOC.md file with special logic.
+
+    Returns:
+      bool: True if the TOC file is processed successfully, else False.
+    """
     thread_safe_print(f"\n📋 Processing TOC file: {file_path}")
     
     try:
@@ -417,23 +421,37 @@ def process_toc_file(file_path, toc_data, source_context_or_pr_url, github_clien
             f.write(updated_content)
         
         thread_safe_print(f"   ✅ TOC file updated: {file_path}")
+        return True
         
     except Exception as e:
         thread_safe_print(
             f"   ❌ Error processing TOC file {file_path}: {sanitize_exception_message(e)}"
         )
+        return False
 
 def process_toc_files(toc_files, source_context_or_pr_url, github_client, ai_client, repo_config):
-    """Process all TOC files"""
+    """Process all TOC files.
+
+    Returns:
+      bool: True if all TOC files are processed successfully, else False.
+    """
     if not toc_files:
-        return
+        return True
     
     thread_safe_print(f"\n📋 Processing {len(toc_files)} TOC files...")
+    all_success = True
     
     for file_path, toc_data in toc_files.items():
         if toc_data['type'] == 'toc':
-            process_toc_file(file_path, toc_data, source_context_or_pr_url, github_client, ai_client, repo_config)
+            success = process_toc_file(file_path, toc_data, source_context_or_pr_url, github_client, ai_client, repo_config)
+            if not success:
+                all_success = False
         else:
             thread_safe_print(f"   ⚠️  Unknown TOC data type: {toc_data['type']} for {file_path}")
+            all_success = False
     
-    thread_safe_print(f"   ✅ All TOC files processed")
+    if all_success:
+        thread_safe_print(f"   ✅ All TOC files processed")
+    else:
+        thread_safe_print(f"   ⚠️  Some TOC files failed to process")
+    return all_success
