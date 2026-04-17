@@ -235,6 +235,36 @@ class FileUpdaterRegressionTest(unittest.TestCase):
             )
             self.assertEqual(updated_content.count("\r\n"), 2)
 
+    def test_update_trims_extra_blank_lines_at_eof(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            target_file = tmp_path / "example.md"
+            match_file = tmp_path / "example-match_source_diff_to_target.json"
+
+            target_file.write_text("# Example\n\n## Last section\n\nOld content\n", encoding="utf-8")
+            match_file.write_text(
+                json.dumps(
+                    {
+                        "modified_3": {
+                            "source_operation": "modified",
+                            "target_line": "3",
+                            "target_hierarchy": "## Last section",
+                            "target_new_content": "## Last section\n\nNew content\n\n",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            success = update_target_document_from_match_data(
+                str(match_file), str(tmp_path), "example.md"
+            )
+
+            self.assertTrue(success)
+            updated_content = target_file.read_text(encoding="utf-8")
+            self.assertTrue(updated_content.endswith("New content\n"))
+            self.assertFalse(updated_content.endswith("New content\n\n"))
+
 
 if __name__ == "__main__":
     unittest.main()

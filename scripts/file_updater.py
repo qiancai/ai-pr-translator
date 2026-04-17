@@ -28,9 +28,30 @@ def read_text_lines_preserve_newlines(file_path):
         return f.readlines()
 
 def write_text_lines_preserve_newlines(file_path, lines):
-    """Write text lines back exactly as provided."""
+    """Write text lines while preserving line endings and trimming EOF blanks."""
+    lines = normalize_trailing_blank_lines(lines)
     with open(file_path, 'w', encoding='utf-8', newline='') as f:
         f.writelines(lines)
+
+def normalize_trailing_blank_lines(lines):
+    """Remove blank-only lines at EOF while preserving a single final newline."""
+    normalized = list(lines)
+    preferred_newline = "\n"
+    for line in reversed(normalized):
+        if line.endswith("\r\n"):
+            preferred_newline = "\r\n"
+            break
+        if line.endswith("\n"):
+            preferred_newline = "\n"
+            break
+
+    while normalized and not normalized[-1].strip():
+        normalized.pop()
+
+    if normalized and not normalized[-1].endswith("\n"):
+        normalized[-1] += preferred_newline
+
+    return normalized
 
 def is_markdown_heading(line):
     """Return True only for real markdown headings at column 0."""
