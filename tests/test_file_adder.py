@@ -98,6 +98,22 @@ class FileAdderRegressionTest(unittest.TestCase):
 
         self.assertEqual(processed, batch)
 
+    def test_preprocess_added_file_batch_rewrites_tidb_cloud_links_for_ai_commit_scope(self):
+        batch = "See [Private Endpoints](/tidb-cloud/test/set-up-private-endpoint-connections-serverless2.md)."
+
+        with mock.patch.dict(os.environ, {"SOURCE_FOLDER": "ai"}, clear=False):
+            processed = preprocess_added_file_batch_for_heading_anchor_stability(
+                batch,
+                source_language="English",
+                target_language="Chinese",
+                source_mode="commit",
+            )
+
+        self.assertEqual(
+            processed,
+            "See [Private Endpoints](https://docs.pingcap.com/tidbcloud/set-up-private-endpoint-connections-serverless2).",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

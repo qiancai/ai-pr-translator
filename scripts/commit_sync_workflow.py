@@ -5,6 +5,7 @@ This workflow keeps the existing PR-based pipeline untouched and adds a
 parallel entrypoint for translation based on an explicit commit compare range.
 """
 
+import json
 import os
 
 from github import Auth, Github
@@ -16,6 +17,9 @@ SOURCE_BASE_REF = os.getenv("SOURCE_BASE_REF", "")
 SOURCE_HEAD_REF = os.getenv("SOURCE_HEAD_REF", "")
 SOURCE_FOLDER = os.getenv("SOURCE_FOLDER", "")
 SOURCE_FILES = os.getenv("SOURCE_FILES", "")
+SOURCE_REPO_PATH = os.getenv("SOURCE_REPO_PATH", "")
+TARGET_REF = os.getenv("TARGET_REF", "")
+PREFER_LOCAL_TARGET_FOR_READ = os.getenv("PREFER_LOCAL_TARGET_FOR_READ", "false").lower() == "true"
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 AI_PROVIDER = os.getenv("AI_PROVIDER", "deepseek")
 TARGET_REPO_PATH = os.getenv("TARGET_REPO_PATH")
@@ -33,7 +37,9 @@ os.environ.setdefault(
 from ai_client import UnifiedAIClient, thread_safe_print
 from diff_analyzer import (
     build_commit_diff_context,
+    build_local_commit_diff_context,
     build_diff_text,
+    get_source_file_content,
     infer_language_direction,
     analyze_source_changes,
 )
@@ -103,6 +109,41 @@ class TranslationStats:
             for file_path, reason in self.skipped:
                 thread_safe_print(f"      - {file_path}: {reason}")
 
+    def write_failure_report(self, output_dir):
+        """Write per-file failures for workflow PR descriptions."""
+        os.makedirs(output_dir, exist_ok=True)
+        markdown_path = os.path.join(output_dir, "translation-failures.md")
+        json_path = os.path.join(output_dir, "translation-failures.json")
+
+        if not self.failed:
+            for path in (markdown_path, json_path):
+                if os.path.exists(path):
+                    os.remove(path)
+            return
+
+        with open(markdown_path, "w", encoding="utf-8") as f:
+            f.write("### Translation failures\n\n")
+            f.write(
+                "The following files were not translated automatically and must be handled manually before merging.\n\n"
+            )
+            for file_path, reason in self.failed:
+                f.write(f"- `{file_path}`: {reason}\n")
+
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(
+                [
+                    {
+                        "file_path": file_path,
+                        "reason": reason,
+                    }
+                    for file_path, reason in self.failed
+                ],
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+            f.write("\n")
+
 
 def _record_translation_task_result(task_result, translation_stats):
     file_path = task_result["file_path"]
@@ -148,7 +189,41 @@ def _process_commit_modified_file(
         return make_task_result("failure", "No markdown patch text available")
     thread_safe_print(f"   📊 File-specific diff: {len(file_specific_diff)} chars")
 
-    file_type = determine_file_processing_type(source_file_path, file_sections, SPECIAL_FILES, IGNORE_FILES)
+    if should_process_modified_file_as_added(source_file_path, repo_config, github_client):
+        thread_safe_print(
+            f"   🆕 Target file is missing; processing {source_file_path} as a newly added file"
+        )
+        try:
+            source_content = get_source_file_content(
+                source_file_path,
+                diff_context,
+                github_client,
+                ref_name="head_ref",
+            )
+        except Exception as e:
+            return make_task_result(
+                "failure",
+                f"Could not get source file content for added-file fallback: {sanitize_exception_message(e)}",
+            )
+
+        success, failure_reasons = process_added_files(
+            {source_file_path: source_content},
+            diff_context,
+            github_client,
+            ai_client,
+            repo_config,
+            glossary_matcher=glossary_matcher,
+            return_details=True,
+        )
+        if success:
+            return make_task_result("success")
+        return make_task_result(
+            "failure",
+            failure_reasons.get(source_file_path, "Added-file fallback returned failure"),
+        )
+
+    ignore_files = repo_config.get("ignore_files", IGNORE_FILES)
+    file_type = determine_file_processing_type(source_file_path, file_sections, SPECIAL_FILES, ignore_files)
     thread_safe_print(f"   🔍 File processing type: {file_type}")
 
     if file_type == "special_file_toc":
@@ -181,7 +256,8 @@ def get_commit_repo_config():
         "source_repo": SOURCE_REPO,
         "target_repo": TARGET_REPO,
         "target_local_path": TARGET_REPO_PATH,
-        "prefer_local_target_for_read": False,
+        "target_ref": TARGET_REF,
+        "prefer_local_target_for_read": PREFER_LOCAL_TARGET_FOR_READ,
         "source_language": source_language,
         "target_language": target_language,
     }
@@ -263,6 +339,44 @@ def source_filters_explicitly_include(folder_name):
     )
 
 
+def get_commit_ignore_files():
+    """Keep PR-mode ignore defaults except for files explicitly requested in commit sync."""
+    normalized_files = normalize_source_files(SOURCE_FILES, SOURCE_FOLDER)
+    if not normalized_files:
+        return IGNORE_FILES
+
+    normalized_requested = {path.strip("/").strip() for path in normalized_files}
+    requested_basenames = {os.path.basename(path) for path in normalized_requested}
+
+    return [
+        ignore_file
+        for ignore_file in IGNORE_FILES
+        if ignore_file.strip("/").strip() not in normalized_requested
+        and os.path.basename(ignore_file.strip("/").strip()) not in requested_basenames
+    ]
+
+
+def should_process_modified_file_as_added(source_file_path, repo_config, github_client):
+    """Return True when a modified source file has no writable target baseline."""
+    target_local_path = repo_config.get("target_local_path")
+    if target_local_path:
+        target_file_path = os.path.join(target_local_path, source_file_path)
+        if os.path.exists(target_file_path):
+            return False
+        return True
+
+    target_ref = repo_config.get("target_ref")
+    if not target_ref:
+        return False
+
+    try:
+        target_repo = github_client.get_repo(repo_config["target_repo"])
+        target_repo.get_contents(source_file_path, ref=target_ref)
+        return False
+    except Exception:
+        return True
+
+
 def build_exclude_folders(repo_config):
     """Build the early-exclusion folder list using existing env-driven behavior."""
     exclude_folders = []
@@ -311,6 +425,9 @@ def main():
     thread_safe_print(f"🧭 Compare Range: {SOURCE_BASE_REF}...{SOURCE_HEAD_REF}")
     thread_safe_print(f"📁 Source Folder Filter: {SOURCE_FOLDER or '(none)'}")
     thread_safe_print(f"📄 Source File Filter: {SOURCE_FILES or '(none)'}")
+    thread_safe_print(f"📦 Source Repo Path: {SOURCE_REPO_PATH or '(remote compare API)'}")
+    thread_safe_print(f"🎯 Target Ref: {TARGET_REF or '(default branch)'}")
+    thread_safe_print(f"📖 Prefer Local Target Read: {PREFER_LOCAL_TARGET_FOR_READ}")
     thread_safe_print(f"📁 Target Repo Path: {TARGET_REPO_PATH}")
     thread_safe_print(f"🤖 AI Provider: {AI_PROVIDER}")
     thread_safe_print(f"🚦 Fail on Translation Error: {FAIL_ON_TRANSLATION_ERROR}")
@@ -328,6 +445,13 @@ def main():
     except Exception as e:
         thread_safe_print(f"❌ Failed to initialize AI client: {sanitize_exception_message(e)}")
         return 1
+
+    commit_ignore_files = get_commit_ignore_files()
+    if commit_ignore_files != IGNORE_FILES:
+        restored_files = sorted(set(IGNORE_FILES) - set(commit_ignore_files))
+        thread_safe_print(f"📋 Commit sync will process explicitly requested TOC file(s): {', '.join(restored_files)}")
+    repo_config["ignore_files"] = commit_ignore_files
+    repo_configs[SOURCE_REPO]["ignore_files"] = commit_ignore_files
 
     terms_path = TERMS_PATH
     if not terms_path and TARGET_REPO_PATH:
@@ -347,14 +471,24 @@ def main():
     thread_safe_print(f"\n🚀 Starting commit-based sync for: {base_ref}...{head_ref}")
 
     try:
-        diff_context = build_commit_diff_context(
-            SOURCE_REPO,
-            TARGET_REPO,
-            base_ref,
-            head_ref,
-            github_client,
-            repo_configs,
-        )
+        if SOURCE_REPO_PATH:
+            diff_context = build_local_commit_diff_context(
+                SOURCE_REPO,
+                TARGET_REPO,
+                base_ref,
+                head_ref,
+                SOURCE_REPO_PATH,
+                repo_configs,
+            )
+        else:
+            diff_context = build_commit_diff_context(
+                SOURCE_REPO,
+                TARGET_REPO,
+                base_ref,
+                head_ref,
+                github_client,
+                repo_configs,
+            )
         diff_context["repo_config"] = repo_config
     except Exception as e:
         thread_safe_print(f"❌ Failed to build commit diff context: {sanitize_exception_message(e)}")
@@ -385,7 +519,7 @@ def main():
             diff_context,
             github_client,
             special_files=SPECIAL_FILES,
-            ignore_files=IGNORE_FILES,
+            ignore_files=commit_ignore_files,
             repo_configs=repo_configs,
             max_non_system_sections=MAX_NON_SYSTEM_SECTIONS_FOR_AI,
             pr_diff=pr_diff,
@@ -542,6 +676,7 @@ def main():
     thread_safe_print(f"   🖼️  Modified images: {len(modified_images)} processed")
     thread_safe_print(f"   🖼️  Deleted images: {len(deleted_images)} processed")
     translation_stats.print_summary()
+    translation_stats.write_failure_report(os.path.join(os.path.dirname(__file__), "temp_output"))
     thread_safe_print("=" * 80)
     if translation_stats.failed:
         thread_safe_print("⚠️  The commit-based sync workflow completed with per-file translation failures.")

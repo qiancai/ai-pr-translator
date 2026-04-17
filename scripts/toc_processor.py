@@ -18,13 +18,203 @@ def thread_safe_print(*args, **kwargs):
     with print_lock:
         print(*args, **kwargs)
 
+
+TOC_LIST_TEXT_LINE_RE = re.compile(r'^(\s*-\s+)(.*)$')
+TOC_HEADING_LINE_RE = re.compile(r'^(#{1,10}\s+)(.+)$')
+
+
+def find_matching_bracket(text, open_index):
+    depth = 0
+    index = open_index
+    while index < len(text):
+        char = text[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return -1
+
+
+def parse_toc_markdown_link_line(line):
+    prefix_match = re.match(r'^(\s*-\s*)', line)
+    if not prefix_match:
+        return None
+
+    prefix = prefix_match.group(1)
+    rest = line[len(prefix):]
+    if not rest.startswith("["):
+        return None
+
+    close_bracket_index = find_matching_bracket(rest, 0)
+    if close_bracket_index == -1:
+        return None
+
+    if close_bracket_index + 1 >= len(rest) or rest[close_bracket_index + 1] != "(":
+        return None
+
+    close_paren_index = rest.find(")", close_bracket_index + 2)
+    if close_paren_index == -1:
+        return None
+
+    return {
+        "type": "link",
+        "prefix": prefix,
+        "text": rest[1:close_bracket_index],
+        "link": rest[close_bracket_index + 2:close_paren_index],
+        "suffix": rest[close_paren_index + 1:],
+    }
+
+
+def parse_toc_line(line):
+    """Parse a TOC line into the small subset we need for stable syncing."""
+    link_entry = parse_toc_markdown_link_line(line)
+    if link_entry:
+        return link_entry
+
+    list_match = TOC_LIST_TEXT_LINE_RE.match(line)
+    if list_match:
+        return {
+            "type": "list_text",
+            "prefix": list_match.group(1),
+            "text": list_match.group(2),
+        }
+
+    heading_match = TOC_HEADING_LINE_RE.match(line)
+    if heading_match:
+        return {
+            "type": "heading",
+            "prefix": heading_match.group(1),
+            "text": heading_match.group(2),
+        }
+
+    return {"type": "other", "text": line}
+
+
+def compose_toc_line_with_target_text(source_line, target_line):
+    """Use source structure while preserving the translated target display text."""
+    source_entry = parse_toc_line(source_line)
+    target_entry = parse_toc_line(target_line)
+
+    if source_entry["type"] == "link" and target_entry["type"] == "link":
+        return (
+            f"{source_entry['prefix']}[{target_entry['text']}]"
+            f"({source_entry['link']}){source_entry['suffix']}"
+        )
+
+    if source_entry["type"] == "list_text" and target_entry["type"] == "list_text":
+        return f"{source_entry['prefix']}{target_entry['text']}"
+
+    if source_entry["type"] == "heading" and target_entry["type"] == "heading":
+        return f"{source_entry['prefix']}{target_entry['text']}"
+
+    return target_line
+
+
+def plain_translation_key(entry):
+    if entry["type"] == "heading":
+        return ("heading", entry["prefix"].strip(), entry["text"])
+    if entry["type"] == "list_text":
+        return ("list_text", entry["text"])
+    return None
+
+
+def build_toc_translation_memory(source_base_lines, target_lines):
+    """Build link and plain-line translation memory from the current target TOC."""
+    base_link_entries = {}
+    target_link_lines = {}
+
+    for line in source_base_lines:
+        entry = parse_toc_line(line)
+        if entry["type"] == "link":
+            base_link_entries.setdefault(entry["link"], entry)
+
+    for line in target_lines:
+        entry = parse_toc_line(line)
+        if entry["type"] == "link":
+            target_link_lines.setdefault(entry["link"], line)
+
+    base_plain_entries = []
+    target_plain_lines = []
+
+    for line in source_base_lines:
+        entry = parse_toc_line(line)
+        if plain_translation_key(entry):
+            base_plain_entries.append((entry, line))
+
+    for line in target_lines:
+        entry = parse_toc_line(line)
+        if plain_translation_key(entry):
+            target_plain_lines.append((entry, line))
+
+    plain_line_map = {}
+    for (base_entry, _), (target_entry, target_line) in zip(base_plain_entries, target_plain_lines):
+        if base_entry["type"] != target_entry["type"]:
+            continue
+        key = plain_translation_key(base_entry)
+        if key:
+            plain_line_map.setdefault(key, target_line)
+
+    return {
+        "base_link_entries": base_link_entries,
+        "target_link_lines": target_link_lines,
+        "plain_line_map": plain_line_map,
+    }
+
+
+def plan_synced_toc_lines(source_base_content, source_head_content, target_content, source_added_line_numbers=None):
+    """Plan a full TOC rewrite that follows source head structure.
+
+    Existing target translations are reused when the source display text did not
+    change. New or renamed TOC rows are returned for batched AI translation.
+    """
+    source_base_lines = source_base_content.split("\n")
+    source_head_lines = source_head_content.split("\n")
+    target_lines = target_content.split("\n")
+    memory = build_toc_translation_memory(source_base_lines, target_lines)
+    source_added_line_numbers = set(source_added_line_numbers or [])
+
+    planned_lines = []
+    lines_to_translate = []
+
+    for source_line_num, source_line in enumerate(source_head_lines, 1):
+        entry = parse_toc_line(source_line)
+
+        if entry["type"] == "link":
+            base_entry = memory["base_link_entries"].get(entry["link"])
+            target_line = memory["target_link_lines"].get(entry["link"])
+            if target_line and base_entry and base_entry["text"] == entry["text"]:
+                planned_lines.append(compose_toc_line_with_target_text(source_line, target_line))
+            else:
+                planned_lines.append(None)
+                lines_to_translate.append((len(planned_lines) - 1, source_line))
+            continue
+
+        key = plain_translation_key(entry)
+        if key and source_line_num in source_added_line_numbers:
+            planned_lines.append(None)
+            lines_to_translate.append((len(planned_lines) - 1, source_line))
+        elif key and key in memory["plain_line_map"]:
+            planned_lines.append(compose_toc_line_with_target_text(source_line, memory["plain_line_map"][key]))
+        elif entry["type"] in ("heading", "list_text"):
+            planned_lines.append(None)
+            lines_to_translate.append((len(planned_lines) - 1, source_line))
+        else:
+            planned_lines.append(source_line)
+
+    return planned_lines, lines_to_translate
+
+
 def extract_toc_link_from_line(line):
     """Extract the link part (including parentheses) from a TOC line"""
-    # Pattern to match [text](link) format
-    pattern = r'\[([^\]]+)\]\(([^)]+)\)'
-    match = re.search(pattern, line)
-    if match:
-        return f"({match.group(2)})"  # Return (link) including parentheses
+    entry = parse_toc_line(line)
+    if entry["type"] == "link":
+        return f"({entry['link']})"
     return None
 
 def is_toc_translation_needed(line):
@@ -332,6 +522,101 @@ Return format:
         thread_safe_print(f"   ❌ AI translation failed: {sanitize_exception_message(e)}")
         return {}
 
+
+def translate_toc_full_lines(lines_to_translate, ai_client, repo_config):
+    """Translate full TOC lines while preserving list structure and links."""
+    if not lines_to_translate:
+        return {}
+
+    thread_safe_print(f"   🤖 Translating {len(lines_to_translate)} new or renamed TOC lines...")
+
+    content_dict = {
+        f"line_{i}": line
+        for i, (_, line) in enumerate(lines_to_translate)
+    }
+    source_lang = repo_config["source_language"]
+    target_lang = repo_config["target_language"]
+
+    prompt = f"""You are a professional translator. Please translate the following Table of Contents lines from {source_lang} to {target_lang}.
+
+IMPORTANT INSTRUCTIONS:
+1. Preserve indentation, list markers, markdown links, image links, URLs, anchors, and trailing markers exactly.
+2. Translate only human-readable TOC text.
+3. Keep template placeholders such as {{{{ .dedicated }}}} unchanged.
+4. Keep product names and technical terms unchanged when they should not be localized.
+5. Return valid JSON only.
+
+Input lines to translate:
+{json.dumps(content_dict, indent=2, ensure_ascii=False)}
+
+Return format:
+{{
+  "line_0": "translated line with preserved formatting",
+  "line_1": "translated line with preserved formatting"
+}}"""
+
+    try:
+        ai_response = ai_client.chat_completion(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+        )
+        json_start = ai_response.find("{")
+        json_end = ai_response.rfind("}") + 1
+        if json_start == -1 or json_end <= json_start:
+            return {}
+
+        translated_lines = json.loads(ai_response[json_start:json_end])
+        translation_mapping = {}
+        for i, (line_index, _) in enumerate(lines_to_translate):
+            key = f"line_{i}"
+            if key in translated_lines:
+                translation_mapping[line_index] = translated_lines[key]
+
+        thread_safe_print(f"   ✅ Successfully translated {len(translation_mapping)} TOC lines")
+        return translation_mapping
+    except Exception as e:
+        thread_safe_print(f"   ❌ TOC full-line translation failed: {sanitize_exception_message(e)}")
+        return {}
+
+
+def process_toc_file_by_source_snapshot(file_path, toc_data, ai_client, repo_config, target_file_path):
+    """Rewrite target TOC to mirror source head structure with target translations."""
+    with open(target_file_path, "r", encoding="utf-8") as f:
+        target_content = f.read()
+
+    planned_lines, lines_to_translate = plan_synced_toc_lines(
+        toc_data["source_base_content"],
+        toc_data["source_head_content"],
+        target_content,
+        source_added_line_numbers=toc_data.get("source_added_line_numbers", []),
+    )
+    translations = translate_toc_full_lines(lines_to_translate, ai_client, repo_config)
+
+    missing_translations = []
+    for line_index, source_line in lines_to_translate:
+        if line_index in translations:
+            planned_lines[line_index] = translations[line_index]
+        else:
+            planned_lines[line_index] = source_line
+            missing_translations.append(source_line.strip())
+
+    if missing_translations:
+        thread_safe_print(
+            f"   ❌ {len(missing_translations)} TOC line(s) were not translated"
+        )
+        for missing_line in missing_translations[:10]:
+            thread_safe_print(f"      - {missing_line}")
+        if len(missing_translations) > 10:
+            thread_safe_print(f"      ... and {len(missing_translations) - 10} more")
+        return False
+
+    with open(target_file_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(planned_lines))
+
+    thread_safe_print(f"   ✅ TOC file synced from source snapshot: {file_path}")
+    return True
+
+
 def process_toc_file(file_path, toc_data, source_context_or_pr_url, github_client, ai_client, repo_config):
     """Process a single TOC.md file with special logic.
 
@@ -343,6 +628,15 @@ def process_toc_file(file_path, toc_data, source_context_or_pr_url, github_clien
     try:
         target_local_path = repo_config['target_local_path']
         target_file_path = os.path.join(target_local_path, file_path)
+
+        if toc_data.get("source_base_content") and toc_data.get("source_head_content"):
+            return process_toc_file_by_source_snapshot(
+                file_path,
+                toc_data,
+                ai_client,
+                repo_config,
+                target_file_path,
+            )
         
         # Read current target file
         with open(target_file_path, 'r', encoding='utf-8') as f:

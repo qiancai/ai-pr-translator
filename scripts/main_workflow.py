@@ -414,6 +414,7 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, so
             target_repo,
             repo_config.get('target_local_path'),
             repo_config.get('prefer_local_target_for_read', False),
+            repo_config.get('target_ref'),
         )
         
         if not target_hierarchy or not target_lines:

@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -60,6 +61,125 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
 
         self.assertNotIn("ai", exclude_folders)
         self.assertIn("tidb-cloud", exclude_folders)
+
+    def test_commit_repo_config_includes_target_ref_and_local_read_preference(self):
+        with mock.patch.object(workflow, "SOURCE_REPO", "pingcap/docs"), mock.patch.object(
+            workflow, "TARGET_REPO", "pingcap/docs"
+        ), mock.patch.object(workflow, "TARGET_REPO_PATH", "/tmp/docs"), mock.patch.object(
+            workflow, "TARGET_REF", "i18n-zh-release-8.5"
+        ), mock.patch.object(
+            workflow, "PREFER_LOCAL_TARGET_FOR_READ", True
+        ):
+            repo_config = workflow.get_commit_repo_config()
+
+        self.assertEqual(repo_config["target_ref"], "i18n-zh-release-8.5")
+        self.assertTrue(repo_config["prefer_local_target_for_read"])
+        self.assertEqual(repo_config["target_local_path"], "/tmp/docs")
+
+    def test_commit_ignore_files_allows_explicit_cloud_toc_files(self):
+        with mock.patch.object(
+            workflow,
+            "IGNORE_FILES",
+            ["TOC-tidb-cloud.md", "TOC-tidb-cloud-starter.md"],
+        ), mock.patch.object(workflow, "SOURCE_FOLDER", ""), mock.patch.object(
+            workflow,
+            "SOURCE_FILES",
+            "TOC-tidb-cloud.md,tidb-cloud/example.md",
+        ):
+            ignore_files = workflow.get_commit_ignore_files()
+
+        self.assertNotIn("TOC-tidb-cloud.md", ignore_files)
+        self.assertIn("TOC-tidb-cloud-starter.md", ignore_files)
+
+    def test_commit_ignore_files_allows_prefixed_explicit_cloud_toc_files(self):
+        with mock.patch.object(
+            workflow,
+            "IGNORE_FILES",
+            ["TOC-tidb-cloud.md", "TOC-tidb-cloud-starter.md"],
+        ), mock.patch.object(workflow, "SOURCE_FOLDER", "docs"), mock.patch.object(
+            workflow,
+            "SOURCE_FILES",
+            "TOC-tidb-cloud.md",
+        ):
+            ignore_files = workflow.get_commit_ignore_files()
+
+        self.assertNotIn("TOC-tidb-cloud.md", ignore_files)
+        self.assertEqual(
+            workflow.determine_file_processing_type(
+                "docs/TOC-tidb-cloud.md",
+                {},
+                workflow.SPECIAL_FILES,
+                ignore_files,
+            ),
+            "special_file_toc",
+        )
+
+    def test_process_modified_file_as_added_when_target_file_is_missing(self):
+        pr_diff = "\n".join(
+            [
+                "File: guide.md",
+                "@@ -1,1 +1,1 @@",
+                "-Old",
+                "+New",
+                "-" * 80,
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.object(
+            workflow,
+            "get_source_file_content",
+            return_value="# Guide\n\nNew content\n",
+        ) as get_source_file_content, mock.patch.object(
+            workflow,
+            "process_added_files",
+            return_value=(True, {}),
+        ) as process_added_files:
+            result = workflow._process_commit_modified_file(
+                "guide.md",
+                {},
+                pr_diff,
+                {"mode": "commit", "source_repo": "acme/docs", "base_ref": "base", "head_ref": "head", "changed_files": []},
+                object(),
+                object(),
+                {
+                    "target_repo": "acme/docs",
+                    "target_local_path": tmpdir,
+                    "prefer_local_target_for_read": True,
+                    "source_language": "English",
+                    "target_language": "Chinese",
+                    "ignore_files": [],
+                },
+                None,
+            )
+
+        self.assertEqual(result["status"], "success")
+        get_source_file_content.assert_called_once()
+        process_added_files.assert_called_once()
+        self.assertEqual(
+            process_added_files.call_args.args[0],
+            {"guide.md": "# Guide\n\nNew content\n"},
+        )
+
+    def test_translation_stats_writes_failure_report(self):
+        stats = workflow.TranslationStats()
+        stats.mark_failure("cloud.md", "Matcher failed")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stats.write_failure_report(tmpdir)
+            report = Path(tmpdir, "translation-failures.md").read_text(encoding="utf-8")
+
+        self.assertIn("### Translation failures", report)
+        self.assertIn("- `cloud.md`: Matcher failed", report)
+
+    def test_translation_stats_removes_stale_failure_report_when_no_failures(self):
+        stats = workflow.TranslationStats()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_path = Path(tmpdir, "translation-failures.md")
+            report_path.write_text("stale", encoding="utf-8")
+            stats.write_failure_report(tmpdir)
+
+            self.assertFalse(report_path.exists())
 
 
 if __name__ == "__main__":

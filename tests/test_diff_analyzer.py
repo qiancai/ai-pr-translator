@@ -1,4 +1,6 @@
 import sys
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,10 +12,13 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 from diff_analyzer import (
     analyze_source_changes,
     build_commit_diff_context,
+    build_local_commit_diff_context,
     build_diff_text,
     build_pr_diff_context,
     build_hierarchy_dict,
     build_source_diff_dict,
+    get_target_file_content,
+    get_target_hierarchy_and_content,
 )
 
 
@@ -225,6 +230,189 @@ class DiffAnalyzerContextTest(unittest.TestCase):
         self.assertEqual(added_images, [])
         self.assertEqual(modified_images, [])
         self.assertEqual(deleted_images, [])
+
+    def test_target_hierarchy_prefers_local_target_checkout(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target_file = Path(tmpdir) / "guide.md"
+            target_file.write_text("# Local title\n\n## Local section\n", encoding="utf-8")
+
+            repository = FakeRepository(
+                {("guide.md", "i18n-zh-release-8.5"): "# Remote title\n"},
+                FakePR([], "Empty", "base123", "head123"),
+                {},
+            )
+            github = FakeGithub({"acme/docs-cn": repository})
+
+            hierarchy, lines = get_target_hierarchy_and_content(
+                "guide.md",
+                github,
+                "acme/docs-cn",
+                target_local_path=tmpdir,
+                prefer_local_target_for_read=True,
+                target_ref="i18n-zh-release-8.5",
+            )
+
+        self.assertIn(1, hierarchy)
+        self.assertEqual(hierarchy[1], "# Local title")
+        self.assertEqual(lines[0], "# Local title")
+
+    def test_target_hierarchy_uses_target_ref_before_default_branch(self):
+        repository = FakeRepository(
+            {
+                ("guide.md", "master"): "# Master title\n",
+                ("guide.md", "i18n-zh-release-8.5"): "# Target title\n",
+            },
+            FakePR([], "Empty", "base123", "head123"),
+            {},
+        )
+        github = FakeGithub({"acme/docs-cn": repository})
+
+        hierarchy, lines = get_target_hierarchy_and_content(
+            "guide.md",
+            github,
+            "acme/docs-cn",
+            target_ref="i18n-zh-release-8.5",
+        )
+
+        self.assertEqual(hierarchy[1], "# Target title")
+        self.assertEqual(lines[0], "# Target title")
+
+    def test_target_hierarchy_does_not_fallback_to_default_branch_with_explicit_target_ref(self):
+        repository = FakeRepository(
+            {
+                ("guide.md", "master"): "# Master title\n",
+            },
+            FakePR([], "Empty", "base123", "head123"),
+            {},
+        )
+        github = FakeGithub({"acme/docs-cn": repository})
+
+        hierarchy, lines = get_target_hierarchy_and_content(
+            "guide.md",
+            github,
+            "acme/docs-cn",
+            target_ref="i18n-zh-release-8.5",
+        )
+
+        self.assertEqual(hierarchy, {})
+        self.assertEqual(lines, [])
+
+    def test_target_file_content_uses_default_branch_without_explicit_target_ref(self):
+        repository = FakeRepository(
+            {
+                ("guide.md", "master"): "# Master title\n",
+            },
+            FakePR([], "Empty", "base123", "head123"),
+            {},
+        )
+        github = FakeGithub({"acme/docs-cn": repository})
+
+        content, source = get_target_file_content("guide.md", github, "acme/docs-cn")
+
+        self.assertEqual(content, "# Master title\n")
+        self.assertEqual(source, "remote:acme/docs-cn@master")
+
+    def test_keyword_tabs_fallbacks_to_remote_when_local_blocks_are_empty(self):
+        patch = "\n".join(
+            [
+                "@@ -5,1 +5,1 @@",
+                "- - apple",
+                "+ - apple updated",
+            ]
+        )
+        changed_file = SimpleNamespace(
+            filename="keywords.md",
+            status="modified",
+            patch=patch,
+            previous_filename=None,
+        )
+        base_content = "# Keywords\n\n<TabsPanel>\n<a id=\"A\" class=\"letter\" href=\"#A\">A</a>\n- apple\n"
+        head_content = "# Keywords\n\n<TabsPanel>\n<a id=\"A\" class=\"letter\" href=\"#A\">A</a>\n- apple updated\n"
+        target_content = "# 关键字\n\n<TabsPanel>\n<a id=\"A\" class=\"letter\" href=\"#A\">A</a>\n- 苹果\n"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "keywords.md").write_text("# 关键字\n\nNo tabs yet\n", encoding="utf-8")
+            repo_configs = {
+                "acme/docs": {
+                    "target_repo": "acme/docs-cn",
+                    "target_local_path": tmpdir,
+                    "prefer_local_target_for_read": True,
+                    "target_ref": "i18n",
+                    "source_language": "English",
+                    "target_language": "Chinese",
+                }
+            }
+            source_repo = FakeRepository(
+                {
+                    ("keywords.md", "base123"): base_content,
+                    ("keywords.md", "head123"): head_content,
+                },
+                FakePR([changed_file], "Update keywords", "base123", "head123"),
+                {("base123", "head123"): [changed_file]},
+            )
+            target_repo = FakeRepository(
+                {
+                    ("keywords.md", "i18n"): target_content,
+                },
+                FakePR([], "Empty", "base123", "head123"),
+                {},
+            )
+            github = FakeGithub({"acme/docs": source_repo, "acme/docs-cn": target_repo})
+            commit_context = build_commit_diff_context(
+                "acme/docs",
+                "acme/docs-cn",
+                "base123",
+                "head123",
+                github,
+                repo_configs,
+            )
+
+            result = analyze_source_changes(
+                commit_context,
+                github,
+                special_files=["keywords.md"],
+                ignore_files=[],
+                repo_configs=repo_configs,
+            )
+
+        keyword_files = result[6]
+        self.assertIn("keywords.md", keyword_files)
+        self.assertIn("- 苹果", keyword_files["keywords.md"]["tabs_changes"]["A"]["target_old_block"])
+
+    def test_local_commit_context_reads_all_changed_files_from_git_diff(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+
+            (repo / "guide.md").write_text("# Guide\n\nOld\n", encoding="utf-8")
+            (repo / "old-name.md").write_text("# Old\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            base_ref = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+            (repo / "guide.md").write_text("# Guide\n\nNew\n", encoding="utf-8")
+            (repo / "new-name.md").write_text((repo / "old-name.md").read_text(encoding="utf-8"), encoding="utf-8")
+            (repo / "old-name.md").unlink()
+            subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "head"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            head_ref = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+            context = build_local_commit_diff_context(
+                "acme/docs",
+                "acme/docs-cn",
+                base_ref,
+                head_ref,
+                str(repo),
+                self.repo_configs,
+            )
+
+        files = {file.filename: file for file in context["changed_files"]}
+        self.assertEqual(files["guide.md"].status, "modified")
+        self.assertIn("+New", files["guide.md"].patch)
+        self.assertEqual(files["new-name.md"].status, "renamed")
+        self.assertEqual(files["new-name.md"].previous_filename, "old-name.md")
 
 
 if __name__ == "__main__":

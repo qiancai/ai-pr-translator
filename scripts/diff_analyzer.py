@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import json
 import os
 import re
+import subprocess
 import threading
 from typing import Optional
 from github import Github
@@ -155,6 +156,95 @@ def build_commit_diff_context(source_repo, target_repo, base_ref, head_ref, gith
     }
 
 
+def _run_git(repo_path, args):
+    return subprocess.check_output(
+        ["git", "-C", repo_path, *args],
+        text=True,
+        stderr=subprocess.STDOUT,
+    )
+
+
+def _parse_git_name_status_line(line):
+    parts = line.rstrip("\n").split("\t")
+    if not parts or not parts[0]:
+        return None
+
+    status_code = parts[0]
+    status_prefix = status_code[0]
+    if status_prefix == "R" and len(parts) >= 3:
+        return {
+            "status": "renamed",
+            "filename": parts[2],
+            "previous_filename": parts[1],
+        }
+    if status_prefix == "A" and len(parts) >= 2:
+        status = "added"
+    elif status_prefix == "D" and len(parts) >= 2:
+        status = "removed"
+    else:
+        status = "modified"
+
+    if len(parts) < 2:
+        return None
+    return {
+        "status": status,
+        "filename": parts[1],
+        "previous_filename": None,
+    }
+
+
+def build_local_commit_diff_context(
+    source_repo,
+    target_repo,
+    base_ref,
+    head_ref,
+    source_repo_path,
+    repo_configs,
+):
+    """Build a normalized diff context from a local source checkout.
+
+    The GitHub Compare API truncates file lists at 300 files. The local checkout
+    path lets scheduled commit syncs use `git diff` instead, while keeping the
+    rest of the analyzer contract identical.
+    """
+    repo_config = get_repo_config_from_source_repo(source_repo, repo_configs, target_repo_override=target_repo)
+    name_status = _run_git(source_repo_path, ["diff", "--name-status", "-M", base_ref, head_ref])
+    changed_files = []
+
+    for line in name_status.splitlines():
+        parsed = _parse_git_name_status_line(line)
+        if not parsed:
+            continue
+
+        patch_paths = [parsed["filename"]]
+        if parsed["previous_filename"]:
+            patch_paths.insert(0, parsed["previous_filename"])
+        patch = _run_git(
+            source_repo_path,
+            ["diff", "--find-renames", "--unified=3", base_ref, head_ref, "--", *patch_paths],
+        )
+        changed_files.append(
+            DiffFile(
+                filename=parsed["filename"],
+                status=parsed["status"],
+                patch=patch,
+                previous_filename=parsed["previous_filename"],
+            )
+        )
+
+    return {
+        "mode": "commit",
+        "source_repo": source_repo,
+        "target_repo": target_repo,
+        "base_ref": base_ref,
+        "head_ref": head_ref,
+        "changed_files": changed_files,
+        "repo_config": repo_config,
+        "source_url": f"https://github.com/{source_repo}/compare/{base_ref}...{head_ref}",
+        "source_description": f"local compare {base_ref}...{head_ref}",
+    }
+
+
 def get_pr_diff(pr_url, github_client):
     """Get the diff content from a GitHub PR."""
     try:
@@ -199,6 +289,45 @@ def get_source_file_bytes(file_path, source_context_or_pr_url, github_client, re
     source_repo, ref = resolve_source_repo_and_ref(source_context_or_pr_url, github_client, ref_name=ref_name)
     repository = github_client.get_repo(source_repo)
     return repository.get_contents(file_path, ref=ref).decoded_content
+
+
+def get_target_file_content(
+    file_path,
+    github_client,
+    target_repo,
+    target_local_path=None,
+    prefer_local_target_for_read=False,
+    target_ref=None,
+):
+    """Read target file content from local checkout, target ref, or default branch."""
+    if prefer_local_target_for_read and target_local_path:
+        local_file_path = os.path.join(target_local_path, file_path)
+        if os.path.exists(local_file_path):
+            try:
+                with open(local_file_path, 'r', encoding='utf-8') as f:
+                    return f.read(), f"local:{local_file_path}"
+            except Exception as e:
+                print(
+                    f"   ⚠️  Error reading local target file {local_file_path}: {sanitize_exception_message(e)}"
+                )
+
+    repository = github_client.get_repo(target_repo)
+    if target_ref:
+        refs_to_try = [target_ref]
+    else:
+        refs_to_try = [repository.default_branch]
+
+    last_error = None
+    for ref in refs_to_try:
+        try:
+            content = repository.get_contents(file_path, ref=ref).decoded_content.decode('utf-8')
+            return content, f"remote:{target_repo}@{ref}"
+        except Exception as e:
+            last_error = e
+
+    if last_error:
+        raise last_error
+    raise FileNotFoundError(file_path)
 
 def get_changed_line_ranges(file):
     """Get the ranges of lines that were changed in the PR"""
@@ -912,31 +1041,24 @@ def get_target_hierarchy_and_content(
     target_repo,
     target_local_path=None,
     prefer_local_target_for_read=False,
+    target_ref=None,
 ):
     """Get target hierarchy and content"""
-    if prefer_local_target_for_read and target_local_path:
-        local_file_path = os.path.join(target_local_path, file_path)
-        if os.path.exists(local_file_path):
-            try:
-                with open(local_file_path, 'r', encoding='utf-8') as f:
-                    file_content = f.read()
-                lines = file_content.split('\n')
-                hierarchy = build_hierarchy_dict(file_content)
-                return hierarchy, lines
-            except Exception as e:
-                print(
-                    f"   ⚠️  Error reading local target file {local_file_path}: {sanitize_exception_message(e)}"
-                )
-
     try:
-        repository = github_client.get_repo(target_repo)
-        target_ref = repository.default_branch
-        file_content = repository.get_contents(file_path, ref=target_ref).decoded_content.decode('utf-8')
+        file_content, target_source = get_target_file_content(
+            file_path,
+            github_client,
+            target_repo,
+            target_local_path=target_local_path,
+            prefer_local_target_for_read=prefer_local_target_for_read,
+            target_ref=target_ref,
+        )
         lines = file_content.split('\n')
-        
+
         # Build hierarchy using same method
         hierarchy = build_hierarchy_dict(file_content)
-        
+
+        print(f"   📌 Target baseline source: {target_source}")
         return hierarchy, lines
     except Exception as e:
         print(f"   ❌ Error getting target file: {sanitize_exception_message(e)}")
@@ -1640,43 +1762,37 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
                 if changed_letters:
                     target_blocks = {}
                     target_blocks_source = "none"
-                    prefer_local_target_for_read = bool(
-                        repo_config.get('prefer_local_target_for_read', False)
-                    )
 
-                    # For local workflow, prefer local target baseline;
-                    # for workflow entry, use remote baseline.
-                    target_local_root = repo_config.get('target_local_path')
-                    if prefer_local_target_for_read and target_local_root:
-                        local_target_file = os.path.join(target_local_root, file.filename)
-                        if os.path.exists(local_target_file):
-                            try:
-                                with open(local_target_file, 'r', encoding='utf-8') as f:
-                                    target_file_content = f.read()
-                                target_lines = target_file_content.split('\n')
-                                target_tabs_region = find_tabs_region(target_lines)
-                                target_blocks = parse_letter_blocks(target_lines, target_tabs_region)
-                                target_blocks_source = f"local:{local_target_file}"
-                            except Exception as e:
-                                print(
-                                    f"   ⚠️  Could not read local target keyword file: {sanitize_exception_message(e)}"
-                                )
+                    try:
+                        target_file_content, target_blocks_source = get_target_file_content(
+                            file.filename,
+                            github_client,
+                            repo_config['target_repo'],
+                            target_local_path=repo_config.get('target_local_path'),
+                            prefer_local_target_for_read=bool(
+                                repo_config.get('prefer_local_target_for_read', False)
+                            ),
+                            target_ref=repo_config.get('target_ref'),
+                        )
+                        target_lines = target_file_content.split('\n')
+                        target_tabs_region = find_tabs_region(target_lines)
+                        target_blocks = parse_letter_blocks(target_lines, target_tabs_region)
 
-                    # Fallback to remote target repo if local file is unavailable.
-                    if not target_blocks:
-                        try:
-                            target_repository = github_client.get_repo(repo_config['target_repo'])
-                            target_ref = target_repository.default_branch
-                            target_file_content = target_repository.get_contents(file.filename, ref=target_ref).decoded_content.decode('utf-8')
+                        if not target_blocks and target_blocks_source.startswith("local:"):
+                            target_file_content, target_blocks_source = get_target_file_content(
+                                file.filename,
+                                github_client,
+                                repo_config['target_repo'],
+                                target_ref=repo_config.get('target_ref'),
+                            )
                             target_lines = target_file_content.split('\n')
                             target_tabs_region = find_tabs_region(target_lines)
                             target_blocks = parse_letter_blocks(target_lines, target_tabs_region)
-                            target_blocks_source = f"remote:{repo_config['target_repo']}@{target_ref}"
-                        except Exception as e:
-                            print(
-                                f"   ⚠️  Could not get target keyword file content for tabs changes: {sanitize_exception_message(e)}"
-                            )
-                            target_blocks = {}
+                    except Exception as e:
+                        print(
+                            f"   ⚠️  Could not get target keyword file content for tabs changes: {sanitize_exception_message(e)}"
+                        )
+                        target_blocks = {}
 
                     print(f"   📌 Keyword target baseline source: {target_blocks_source}")
 
@@ -1741,46 +1857,83 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
             if is_toc_file:
                 # --- TOC files: TOC-specific processor ---
                 print(f"   📋 Detected special file: {file.filename}")
-                
+
                 # Get target file content for comparison
                 try:
-                    target_repository = github_client.get_repo(repo_config['target_repo'])
-                    target_file_content = target_repository.get_contents(file.filename, ref="master").decoded_content.decode('utf-8')
+                    target_file_content, target_source = get_target_file_content(
+                        file.filename,
+                        github_client,
+                        repo_config['target_repo'],
+                        target_local_path=repo_config.get('target_local_path'),
+                        prefer_local_target_for_read=bool(
+                            repo_config.get('prefer_local_target_for_read', False)
+                        ),
+                        target_ref=repo_config.get('target_ref'),
+                    )
                     target_lines = target_file_content.split('\n')
+                    print(f"   📌 TOC target baseline source: {target_source}")
                 except Exception as e:
                     print(f"   ⚠️  Could not get target file content: {sanitize_exception_message(e)}")
                     continue
-                
+
                 # Analyze diff operations for TOC.md
                 operations = analyze_diff_operations(file)
                 source_lines = file_content.split('\n')
-                
-                # Process with special TOC logic
-                toc_results = process_toc_operations(file.filename, operations, source_lines, target_lines, "")  # Local path will be determined later
-                
-                # Store TOC operations for later processing
-                if any([toc_results['added'], toc_results['modified'], toc_results['deleted']]):
-                    # Combine all operations for processing
-                    all_toc_operations = []
-                    all_toc_operations.extend(toc_results['added'])
-                    all_toc_operations.extend(toc_results['modified']) 
-                    all_toc_operations.extend(toc_results['deleted'])
-                    
-                    # Add to special TOC processing queue (separate from regular sections)
+
+                try:
+                    source_base_content = repository.get_contents(file.filename, ref=base_ref).decoded_content.decode('utf-8')
+                except Exception as e:
+                    print(f"   ⚠️  Could not get base TOC content: {sanitize_exception_message(e)}")
+                    source_base_content = None
+
+                has_toc_diff = any([
+                    operations['added_lines'],
+                    operations['modified_lines'],
+                    operations['deleted_lines']
+                ])
+
+                if has_toc_diff and source_base_content is not None:
+                    # Use full source snapshots for TOC files. This handles
+                    # unlinked TOC group rows and moved nested sections more
+                    # reliably than operation-by-operation insertion.
                     toc_files[file.filename] = {
                         'type': 'toc',
-                        'operations': all_toc_operations
+                        'operations': [],
+                        'source_base_content': source_base_content,
+                        'source_head_content': file_content,
+                        'source_added_line_numbers': [
+                            line['line_number']
+                            for line in operations['added_lines']
+                        ]
                     }
-                    
-                    print(f"   📋 TOC operations queued for processing:")
-                    if toc_results['added']:
-                        print(f"      ➕ Added: {len(toc_results['added'])} entries")
-                    if toc_results['modified']:
-                        print(f"      ✏️  Modified: {len(toc_results['modified'])} entries") 
-                    if toc_results['deleted']:
-                        print(f"      ❌ Deleted: {len(toc_results['deleted'])} entries")
+                    print(f"   📋 TOC snapshot sync queued for processing")
                 else:
-                    print(f"   ℹ️  No TOC operations found")
+                    # Fallback to legacy operation-level processing.
+                    toc_results = process_toc_operations(file.filename, operations, source_lines, target_lines, "")  # Local path will be determined later
+
+                    # Store TOC operations for later processing
+                    if any([toc_results['added'], toc_results['modified'], toc_results['deleted']]):
+                        # Combine all operations for processing
+                        all_toc_operations = []
+                        all_toc_operations.extend(toc_results['added'])
+                        all_toc_operations.extend(toc_results['modified'])
+                        all_toc_operations.extend(toc_results['deleted'])
+
+                        # Add to special TOC processing queue (separate from regular sections)
+                        toc_files[file.filename] = {
+                            'type': 'toc',
+                            'operations': all_toc_operations
+                        }
+
+                        print(f"   📋 TOC operations queued for processing:")
+                        if toc_results['added']:
+                            print(f"      ➕ Added: {len(toc_results['added'])} entries")
+                        if toc_results['modified']:
+                            print(f"      ✏️  Modified: {len(toc_results['modified'])} entries")
+                        if toc_results['deleted']:
+                            print(f"      ❌ Deleted: {len(toc_results['deleted'])} entries")
+                    else:
+                        print(f"   ℹ️  No TOC operations found")
                 
                 continue  # Skip regular processing for special files
         

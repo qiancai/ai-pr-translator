@@ -167,6 +167,30 @@ class FileUpdaterRegressionTest(unittest.TestCase):
 
         self.assertEqual(processed, pr_diff)
 
+    def test_preprocess_diff_does_not_rewrite_tidb_cloud_links_for_cloud_commit_scope(self):
+        pr_diff = "\n".join(
+            [
+                "File: tidb-cloud/example.md",
+                "@@ -1,1 +1,1 @@",
+                "+See [Private Endpoints](/tidb-cloud/test/set-up-private-endpoint-connections-serverless2.md).",
+                "-" * 80,
+            ]
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {"SOURCE_FOLDER": "", "SOURCE_FILES": "tidb-cloud/example.md"},
+            clear=False,
+        ):
+            processed = preprocess_diff_for_heading_anchor_stability(
+                pr_diff,
+                source_language="English",
+                target_language="Chinese",
+                source_mode="commit",
+            )
+
+        self.assertEqual(processed, pr_diff)
+
     def test_preprocess_diff_rewrites_tidb_cloud_links_for_ai_commit_scope(self):
         pr_diff = "\n".join(
             [

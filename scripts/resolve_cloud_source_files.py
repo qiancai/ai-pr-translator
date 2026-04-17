@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""Resolve commit-sync SOURCE_FILES for Cloud translation workflows."""
+
+import os
+import re
+import subprocess
+from pathlib import Path
+
+try:
+    from markdown_it import MarkdownIt
+except ImportError:
+    MarkdownIt = None
+
+MARKDOWN_LINK_RE = re.compile(r'!?\[[^\]]*\]\(([^)]+)\)')
+
+
+def parse_list(value):
+    return [item.strip() for item in (value or "").split(",") if item.strip()]
+
+
+def normalize_doc_path(value):
+    rel = str(value or "").strip().replace("\\", "/")
+    if not rel:
+        return ""
+    rel = rel.split("#", 1)[0].split("?", 1)[0].strip()
+    if rel.startswith("<") and rel.endswith(">"):
+        rel = rel[1:-1].strip()
+    rel = rel.lstrip("/")
+    if rel.startswith("./"):
+        rel = rel[2:]
+    if rel.startswith("docs/"):
+        rel = rel[5:]
+    return rel
+
+
+def extract_markdown_doc_links_with_regex(markdown):
+    links = []
+    for match in MARKDOWN_LINK_RE.finditer(markdown or ""):
+        url = match.group(1).strip()
+        if " " in url:
+            url = url.split(None, 1)[0]
+        rel = normalize_doc_path(url)
+        if rel.endswith(".md") or rel.endswith(".mdx"):
+            links.append(rel)
+    return links
+
+
+def get_token_attr(token, name):
+    attrs = getattr(token, "attrs", None)
+    if isinstance(attrs, dict):
+        return attrs.get(name)
+    for key, value in attrs or []:
+        if key == name:
+            return value
+    return None
+
+
+def extract_markdown_doc_links(markdown):
+    if MarkdownIt is None:
+        return extract_markdown_doc_links_with_regex(markdown)
+
+    links = []
+    parser = MarkdownIt("commonmark")
+    for token in parser.parse(markdown or ""):
+        if token.type != "inline":
+            continue
+        for child in token.children or []:
+            if child.type != "link_open":
+                continue
+            rel = normalize_doc_path(get_token_attr(child, "href"))
+            if rel.endswith(".md") or rel.endswith(".mdx"):
+                links.append(rel)
+    return links
+
+
+def build_allowed_files(docs_source_path, toc_files):
+    allowed = set(toc_files)
+    source_root = Path(docs_source_path)
+
+    for toc_file in toc_files:
+        toc_path = source_root / toc_file
+        if not toc_path.exists():
+            raise FileNotFoundError(f"Cloud TOC file not found: {toc_path}")
+        allowed.update(extract_markdown_doc_links(toc_path.read_text(encoding="utf-8")))
+
+    return allowed
+
+
+def resolve_requested_file(value, allowed):
+    rel = normalize_doc_path(value)
+    if not rel or rel in allowed or "/" in rel:
+        return rel
+
+    candidates = sorted(item for item in allowed if os.path.basename(item) == rel)
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        raise ValueError(f'Ambiguous Cloud file name "{rel}": {", ".join(candidates)}')
+    return rel
+
+
+def parse_git_name_status(output):
+    rows = []
+    for line in (output or "").splitlines():
+        parts = line.split("\t")
+        if not parts or not parts[0]:
+            continue
+        status = parts[0][0]
+        if status == "R" and len(parts) >= 3:
+            rows.append(
+                {
+                    "filename": normalize_doc_path(parts[2]),
+                    "previous_filename": normalize_doc_path(parts[1]),
+                }
+            )
+        elif len(parts) >= 2:
+            rows.append(
+                {
+                    "filename": normalize_doc_path(parts[1]),
+                    "previous_filename": "",
+                }
+            )
+    return rows
+
+
+def list_changed_files(docs_source_path, base_ref, head_ref):
+    output = subprocess.check_output(
+        ["git", "-C", docs_source_path, "diff", "--name-status", "-M", base_ref, head_ref],
+        text=True,
+        stderr=subprocess.STDOUT,
+    )
+    return parse_git_name_status(output)
+
+
+def add_unique(items, item):
+    if item and item not in items:
+        items.append(item)
+
+
+def resolve_source_files(allowed, input_file_names="", changed_rows=None):
+    requested = [
+        resolve_requested_file(item, allowed)
+        for item in parse_list(input_file_names)
+    ]
+    requested = [item for item in requested if item]
+
+    resolved = []
+    if requested:
+        invalid = [item for item in requested if item not in allowed]
+        if invalid:
+            raise ValueError(
+                "The following files are not in the configured Cloud TOC scope: "
+                + ", ".join(invalid)
+            )
+        for rel in requested:
+            add_unique(resolved, rel)
+        return resolved
+
+    for row in changed_rows or []:
+        filename = row.get("filename", "")
+        previous_filename = row.get("previous_filename", "")
+        if filename in allowed:
+            add_unique(resolved, filename)
+        if previous_filename in allowed:
+            add_unique(resolved, previous_filename)
+    return resolved
+
+
+def append_github_output(output_path, values):
+    if not output_path:
+        return
+    with open(output_path, "a", encoding="utf-8") as f:
+        for key, value in values.items():
+            f.write(f"{key}={value}\n")
+
+
+def main():
+    docs_source_path = os.environ["DOCS_SOURCE_PATH"]
+    toc_files = parse_list(os.environ["CLOUD_TOC_FILES"])
+    input_file_names = os.getenv("INPUT_FILE_NAMES", "")
+    base_ref = os.environ["BASE_REF"]
+    head_ref = os.environ["HEAD_REF"]
+
+    allowed = build_allowed_files(docs_source_path, toc_files)
+    changed_rows = [] if input_file_names.strip() else list_changed_files(docs_source_path, base_ref, head_ref)
+    resolved = resolve_source_files(allowed, input_file_names=input_file_names, changed_rows=changed_rows)
+
+    append_github_output(
+        os.getenv("GITHUB_OUTPUT", ""),
+        {
+            "files": ",".join(resolved),
+            "has_source_changes": "true" if resolved else "false",
+            "allowed_count": str(len(allowed)),
+        },
+    )
+
+    if resolved:
+        print(f"Resolved {len(resolved)} source file(s): {','.join(resolved)}")
+    else:
+        print("No Cloud TOC-scoped source changes detected.")
+
+
+if __name__ == "__main__":
+    main()

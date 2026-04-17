@@ -1132,6 +1132,7 @@ def process_single_file_deletion(file_path, source_sections, source_context_or_p
         repo_config['target_repo'],
         repo_config.get('target_local_path'),
         repo_config.get('prefer_local_target_for_read', False),
+        repo_config.get('target_ref'),
     )
     
     if not target_hierarchy:
@@ -1371,6 +1372,7 @@ def process_single_file(file_path, source_sections, pr_diff, source_context_or_p
             repo_config['target_repo'],
             repo_config.get('target_local_path'),
             repo_config.get('prefer_local_target_for_read', False),
+            repo_config.get('target_ref'),
         )
         if not target_hierarchy:
             thread_safe_print(f"   [{thread_id}] ⚠️  Could not get target content")
@@ -1571,6 +1573,7 @@ def process_added_sections(added_sections, pr_diff, source_context_or_pr_url, gi
             repo_config['target_repo'],
             repo_config.get('target_local_path'),
             repo_config.get('prefer_local_target_for_read', False),
+            repo_config.get('target_ref'),
         )
         
         if not target_hierarchy:
