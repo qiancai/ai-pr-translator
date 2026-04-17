@@ -16,11 +16,11 @@ SOURCE_BRANCH = "release-8.5"
 
 # Set these two refs explicitly for local verification.
 SOURCE_BASE_REF = "b7469123c65aa8409bf754e4a7909e16d8ed3082"
-SOURCE_HEAD_REF = "7a75928211563b1c5632d8e2a7ece92608832cac"
+SOURCE_HEAD_REF = "9c3dec15e4e65344c0e60ec3e6752f11e8036d34"
 
 # Optional scope filters.
 SOURCE_FOLDER = "ai"
-SOURCE_FILES = "ai/integrations/vector-search-integrate-with-jinaai-embedding.md" #Specify this field if you only want to translate specific files. Separate multiple files with commas.
+SOURCE_FILES = "ai/integrations/vector-search-integrate-with-django-orm.md" #Specify this field if you only want to translate specific files. Separate multiple files with commas.
 
 AI_PROVIDER = "deepseek"  # Options: "deepseek", "gemini", "openai", "azure"
 TARGET_REPO_PATH = "/Users/grcai/Documents/GitHub/docs-cn"
@@ -32,6 +32,9 @@ TERMS_PATH = "/Users/grcai/Documents/GitHub/docs/resources/terms.md"
 # Keep existing PR-mode defaults unless you explicitly want to translate excluded folders.
 SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH = True
 SKIP_TRANSLATING_AI_DOCS_TO_ZH = False
+
+# Local verification should leave translated files unstaged for easy review.
+SKIP_GIT_ADD = True
 
 
 def main():
@@ -49,6 +52,7 @@ def main():
         "TIDB_CLOUD_ABSOLUTE_LINK_PREFIX": TIDB_CLOUD_ABSOLUTE_LINK_PREFIX,
         "SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH": str(SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH).lower(),
         "SKIP_TRANSLATING_AI_DOCS_TO_ZH": str(SKIP_TRANSLATING_AI_DOCS_TO_ZH).lower(),
+        "SKIP_GIT_ADD": str(SKIP_GIT_ADD).lower(),
     }
 
     missing_refs = [name for name in ("SOURCE_BASE_REF", "SOURCE_HEAD_REF") if not required[name].strip()]
