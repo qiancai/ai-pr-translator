@@ -12,6 +12,6 @@
     "tidb-cloud",
     "ai"
   ],
-  "COMMIT_BASED_MODE_IGNORE_FILES": ["system-variables.md"],
+  "COMMIT_BASED_MODE_IGNORE_FILES": [],
   "COMMIT_BASED_MODE_IGNORE_FOLDERS": []
 }
