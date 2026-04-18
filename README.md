@@ -101,6 +101,10 @@ export TERMS_PATH="/path/to/terms.md"  # auto-detected from TARGET_REPO_PATH if 
 export MAX_NON_SYSTEM_SECTIONS_FOR_AI=120
 export SOURCE_TOKEN_LIMIT=5000
 export AI_MAX_TOKENS=20000
+
+# Optional: File-level parallelism
+export DIFF_PARALLEL_FILE_THRESHOLD=6  # parallelize when changed file count is greater than this
+export DIFF_PARALLEL_WORKERS=4
 ```
 
 #### Commit-based mode (`commit_sync_workflow.py`)

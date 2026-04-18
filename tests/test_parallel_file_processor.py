@@ -9,6 +9,8 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from parallel_file_processor import (
     count_unique_file_paths,
+    get_parallel_file_threshold,
+    get_parallel_file_workers,
     make_file_task,
     run_file_tasks,
     should_parallelize_file_processing,
@@ -28,6 +30,12 @@ class ParallelFileProcessorTest(unittest.TestCase):
         )
 
     def test_should_parallelize_uses_threshold_and_worker_env(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(get_parallel_file_threshold(), 6)
+            self.assertEqual(get_parallel_file_workers(), 4)
+            self.assertFalse(should_parallelize_file_processing(6))
+            self.assertTrue(should_parallelize_file_processing(7))
+
         with mock.patch.dict(
             "os.environ",
             {

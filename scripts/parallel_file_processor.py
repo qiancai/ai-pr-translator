@@ -8,8 +8,8 @@ from ai_client import thread_safe_print
 from log_sanitizer import sanitize_exception_message
 
 
-DEFAULT_PARALLEL_FILE_THRESHOLD = 10
-DEFAULT_PARALLEL_FILE_WORKERS = 3
+DEFAULT_PARALLEL_FILE_THRESHOLD = 6
+DEFAULT_PARALLEL_FILE_WORKERS = 4
 
 
 def _positive_int_from_env(name, default):
