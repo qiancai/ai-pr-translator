@@ -436,6 +436,102 @@ class FileUpdaterRegressionTest(unittest.TestCase):
         finally:
             self._cleanup_chunk_test_outputs(prefix)
 
+    def test_modified_glossary_matching_ignores_source_and_target_sections(self):
+        class FakeAIClient:
+            def chat_completion(self, messages, temperature=0.1):
+                return json.dumps({"modified_1": "translated modified_1"})
+
+        prefix = "modified-glossary-unit"
+        self._cleanup_chunk_test_outputs(prefix)
+        seen_glossary_inputs = []
+
+        def glossary_matcher(text, source_language=None):
+            seen_glossary_inputs.append(text)
+            return []
+
+        try:
+            get_updated_sections_from_ai(
+                "\n".join([
+                    "File: example.md",
+                    "@@ -1,3 +1,3 @@",
+                    "-old content",
+                    "+DiffOnlyTerm",
+                    " context",
+                ]),
+                {
+                    "modified_1": "### TargetOnlyTerm\n\n旧中文内容。",
+                },
+                {
+                    "modified_1": "### SourceOnlyTerm\n\nOld English content.",
+                },
+                FakeAIClient(),
+                "English",
+                "Chinese",
+                "modified-glossary-unit.md",
+                glossary_matcher=glossary_matcher,
+            )
+
+            self.assertEqual(len(seen_glossary_inputs), 1)
+            self.assertIn("DiffOnlyTerm", seen_glossary_inputs[0])
+            self.assertNotIn("SourceOnlyTerm", seen_glossary_inputs[0])
+            self.assertNotIn("TargetOnlyTerm", seen_glossary_inputs[0])
+        finally:
+            self._cleanup_chunk_test_outputs(prefix)
+
+    def test_chunk_glossary_matching_ignores_chunk_source_and_target_sections(self):
+        class FakeAIClient:
+            def chat_completion(self, messages, temperature=0.1):
+                prompt = messages[0]["content"]
+                keys = list(dict.fromkeys(re.findall(r'"(modified_\d+)"\s*:', prompt)))
+                return json.dumps({key: f"translated {key}" for key in keys})
+
+        prefix = "chunk-glossary-ignore-unit"
+        self._cleanup_chunk_test_outputs(prefix)
+        try:
+            source_sections, target_sections = self._build_system_sections(25)
+            source_sections["modified_1"] += "\nSourceOnlyTerm1\n"
+            target_sections["modified_1"] += "\nTargetOnlyTerm1\n"
+            source_sections["modified_25"] += "\nSourceOnlyTerm25\n"
+            target_sections["modified_25"] += "\nTargetOnlyTerm25\n"
+            seen_glossary_inputs = []
+
+            def glossary_matcher(text, source_language=None):
+                seen_glossary_inputs.append(text)
+                return []
+
+            get_updated_sections_from_ai(
+                "\n".join([
+                    "File: system-variables.md",
+                    "@@ -1,3 +1,3 @@",
+                    "-old content 1",
+                    "+DiffOnlyTerm1",
+                    " context",
+                    "@@ -25,3 +25,3 @@",
+                    "-old content 25",
+                    "+DiffOnlyTerm25",
+                    " context",
+                ]),
+                target_sections,
+                source_sections,
+                FakeAIClient(),
+                "English",
+                "Chinese",
+                "chunk-glossary-ignore-unit.md",
+                glossary_matcher=glossary_matcher,
+            )
+
+            self.assertEqual(len(seen_glossary_inputs), 2)
+            self.assertIn("DiffOnlyTerm1", seen_glossary_inputs[0])
+            self.assertNotIn("DiffOnlyTerm25", seen_glossary_inputs[0])
+            self.assertNotIn("SourceOnlyTerm1", seen_glossary_inputs[0])
+            self.assertNotIn("TargetOnlyTerm1", seen_glossary_inputs[0])
+            self.assertIn("DiffOnlyTerm25", seen_glossary_inputs[1])
+            self.assertNotIn("DiffOnlyTerm1", seen_glossary_inputs[1])
+            self.assertNotIn("SourceOnlyTerm25", seen_glossary_inputs[1])
+            self.assertNotIn("TargetOnlyTerm25", seen_glossary_inputs[1])
+        finally:
+            self._cleanup_chunk_test_outputs(prefix)
+
     def test_chunk_failure_is_attached_to_translation_result(self):
         class FakeAIClient:
             def __init__(self):

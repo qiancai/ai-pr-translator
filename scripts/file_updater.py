@@ -701,12 +701,9 @@ def _prepare_translation_prompt(
     glossary_instruction = ""
     if glossary_matcher:
         from glossary import filter_terms_for_content, format_terms_for_prompt
-        source_text = '\n'.join(str(v) for v in source_sections.values() if v)
-        target_text = '\n'.join(str(v) for v in target_sections.values() if v)
-        glossary_match_parts = [source_text, target_text, prompt_pr_diff or '']
         matched_terms = filter_terms_for_content(
             glossary_matcher,
-            *glossary_match_parts,
+            prompt_pr_diff or '',
             source_language=source_language,
         )
         if matched_terms:
