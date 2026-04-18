@@ -56,12 +56,7 @@ from parallel_file_processor import (
     should_parallelize_file_processing,
 )
 from main_workflow import (
-    AI_DOCS_FOLDER_NAME,
-    CLOUD_FOLDER_NAME,
-    IGNORE_FILES,
     MAX_NON_SYSTEM_SECTIONS_FOR_AI,
-    SKIP_TRANSLATING_AI_DOCS_TO_ZH,
-    SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH,
     SPECIAL_FILES,
     clean_temp_output_dir,
     determine_file_processing_type,
@@ -71,6 +66,11 @@ from main_workflow import (
     process_regular_modified_file,
 )
 from toc_processor import process_toc_file
+from workflow_ignore_config import load_workflow_ignore_config
+
+WORKFLOW_IGNORE_CONFIG = load_workflow_ignore_config()
+COMMIT_BASED_MODE_IGNORE_FILES = WORKFLOW_IGNORE_CONFIG["COMMIT_BASED_MODE_IGNORE_FILES"]
+COMMIT_BASED_MODE_IGNORE_FOLDERS = WORKFLOW_IGNORE_CONFIG["COMMIT_BASED_MODE_IGNORE_FOLDERS"]
 
 
 class TranslationStats:
@@ -222,7 +222,7 @@ def _process_commit_modified_file(
             failure_reasons.get(source_file_path, "Added-file fallback returned failure"),
         )
 
-    ignore_files = repo_config.get("ignore_files", IGNORE_FILES)
+    ignore_files = repo_config.get("ignore_files", COMMIT_BASED_MODE_IGNORE_FILES)
     file_type = determine_file_processing_type(source_file_path, file_sections, SPECIAL_FILES, ignore_files)
     thread_safe_print(f"   🔍 File processing type: {file_type}")
 
@@ -344,20 +344,17 @@ def source_filters_explicitly_include(folder_name):
 
 
 def get_commit_ignore_files():
-    """Keep PR-mode ignore defaults except for files explicitly requested in commit sync."""
-    normalized_files = normalize_source_files(SOURCE_FILES, SOURCE_FOLDER)
-    if not normalized_files:
-        return IGNORE_FILES
+    """Return commit-mode ignore files.
 
-    normalized_requested = {path.strip("/").strip() for path in normalized_files}
-    requested_basenames = {os.path.basename(path) for path in normalized_requested}
+    PR-mode TOC ignores are intentionally not inherited here because commit sync
+    can be scoped to exactly the files that should be mirrored.
+    """
+    return list(COMMIT_BASED_MODE_IGNORE_FILES)
 
-    return [
-        ignore_file
-        for ignore_file in IGNORE_FILES
-        if ignore_file.strip("/").strip() not in normalized_requested
-        and os.path.basename(ignore_file.strip("/").strip()) not in requested_basenames
-    ]
+
+def get_commit_ignore_folders():
+    """Return commit-mode ignore folders."""
+    return list(COMMIT_BASED_MODE_IGNORE_FOLDERS)
 
 
 def should_process_modified_file_as_added(source_file_path, repo_config, github_client):
@@ -382,18 +379,19 @@ def should_process_modified_file_as_added(source_file_path, repo_config, github_
 
 
 def build_exclude_folders(repo_config):
-    """Build the early-exclusion folder list using existing env-driven behavior."""
+    """Build the early-exclusion folder list for commit sync."""
     exclude_folders = []
-    if SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH and repo_config.get("target_language") == "Chinese":
-        if source_filters_explicitly_include(CLOUD_FOLDER_NAME):
-            thread_safe_print(f"ℹ️  Explicit source filters include '{CLOUD_FOLDER_NAME}', skipping the default exclusion for commit sync.")
+    if repo_config.get("target_language") != "Chinese":
+        return exclude_folders
+
+    for folder_name in get_commit_ignore_folders():
+        folder_name = folder_name.strip("/").strip()
+        if not folder_name:
+            continue
+        if source_filters_explicitly_include(folder_name):
+            thread_safe_print(f"ℹ️  Explicit source filters include '{folder_name}', skipping the default exclusion for commit sync.")
         else:
-            exclude_folders.append(CLOUD_FOLDER_NAME)
-    if SKIP_TRANSLATING_AI_DOCS_TO_ZH and repo_config.get("target_language") == "Chinese":
-        if source_filters_explicitly_include(AI_DOCS_FOLDER_NAME):
-            thread_safe_print(f"ℹ️  Explicit source filters include '{AI_DOCS_FOLDER_NAME}', skipping the default exclusion for commit sync.")
-        else:
-            exclude_folders.append(AI_DOCS_FOLDER_NAME)
+            exclude_folders.append(folder_name)
     return exclude_folders
 
 
@@ -451,9 +449,6 @@ def main():
         return 1
 
     commit_ignore_files = get_commit_ignore_files()
-    if commit_ignore_files != IGNORE_FILES:
-        restored_files = sorted(set(IGNORE_FILES) - set(commit_ignore_files))
-        thread_safe_print(f"📋 Commit sync will process explicitly requested TOC file(s): {', '.join(restored_files)}")
     repo_config["ignore_files"] = commit_ignore_files
     repo_configs[SOURCE_REPO]["ignore_files"] = commit_ignore_files
 

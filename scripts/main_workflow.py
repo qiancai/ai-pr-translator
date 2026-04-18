@@ -47,14 +47,7 @@ from parallel_file_processor import (
     should_parallelize_file_processing,
 )
 from special_file_utils import is_toc_file_name
-
-# Skip dealing with cloud docs when translating to Chinese
-SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH = os.getenv("SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH", "true").lower() == "true"
-CLOUD_FOLDER_NAME = os.getenv("CLOUD_FOLDER_NAME", "tidb-cloud")
-
-# Skip dealing with AI docs when translating to Chinese
-SKIP_TRANSLATING_AI_DOCS_TO_ZH = os.getenv("SKIP_TRANSLATING_AI_DOCS_TO_ZH", "true").lower() == "true"
-AI_DOCS_FOLDER_NAME = os.getenv("AI_DOCS_FOLDER_NAME", "ai")
+from workflow_ignore_config import load_workflow_ignore_config
 
 # Glossary terms path (optional, defaults to resources/terms.md in the docs repo)
 TERMS_PATH = os.getenv("TERMS_PATH", "")
@@ -66,7 +59,9 @@ AI_MAX_TOKENS = PROVIDER_MAX_TOKENS.get(AI_PROVIDER, 8192)
 
 # Special file configuration
 SPECIAL_FILES = ["TOC.md", "keywords.md"]
-IGNORE_FILES = ["TOC-tidb-cloud.md","TOC-tidb-cloud-starter.md","TOC-tidb-cloud-essential.md","TOC-tidb-cloud-premium.md"]
+WORKFLOW_IGNORE_CONFIG = load_workflow_ignore_config()
+PR_MODE_IGNORE_FILES = WORKFLOW_IGNORE_CONFIG["PR_MODE_IGNORE_FILES"]
+PR_MODE_IGNORE_FOLDERS = WORKFLOW_IGNORE_CONFIG["PR_MODE_IGNORE_FOLDERS"]
 
 # Repository configuration for workflow
 def get_workflow_repo_configs():
@@ -403,7 +398,7 @@ def extract_file_diff_from_pr(pr_diff, source_file_path):
 def determine_file_processing_type(source_file_path, file_sections, special_files=None, ignore_files=None):
     """Determine how to process a file based on operation type and file characteristics"""
     basename = os.path.basename(source_file_path)
-    ignore_files = IGNORE_FILES if ignore_files is None else ignore_files
+    ignore_files = PR_MODE_IGNORE_FILES if ignore_files is None else ignore_files
     
     # Check if this is a special file (like TOC.md or keywords.md)
     if is_toc_file_name(source_file_path, ignore_files):
@@ -633,7 +628,7 @@ def _process_single_modified_file_for_pr(
 
     thread_safe_print(f"   📊 File-specific diff: {len(file_specific_diff)} chars")
 
-    file_type = determine_file_processing_type(source_file_path, file_sections, SPECIAL_FILES, IGNORE_FILES)
+    file_type = determine_file_processing_type(source_file_path, file_sections, SPECIAL_FILES, PR_MODE_IGNORE_FILES)
     thread_safe_print(f"   🔍 File processing type: {file_type}")
 
     if file_type == "special_file_toc":
@@ -795,17 +790,15 @@ def main():
     
     # Build list of folders to exclude early (before expensive per-file processing)
     exclude_folders = []
-    if SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH and repo_config.get('target_language') == 'Chinese':
-        exclude_folders.append(CLOUD_FOLDER_NAME)
-    if SKIP_TRANSLATING_AI_DOCS_TO_ZH and repo_config.get('target_language') == 'Chinese':
-        exclude_folders.append(AI_DOCS_FOLDER_NAME)
+    if repo_config.get('target_language') == 'Chinese':
+        exclude_folders = PR_MODE_IGNORE_FOLDERS
     
     # Step 2: Analyze source changes with operation categorization
     thread_safe_print(f"\n📊 Step 2: Analyzing source changes...")
     added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images = analyze_source_changes(
         SOURCE_PR_URL, github_client, 
         special_files=SPECIAL_FILES, 
-        ignore_files=IGNORE_FILES, 
+        ignore_files=PR_MODE_IGNORE_FILES,
         repo_configs=repo_configs,
         max_non_system_sections=MAX_NON_SYSTEM_SECTIONS_FOR_AI,
         pr_diff=pr_diff,

@@ -40,8 +40,6 @@ TEST_CONFIGS = {
         "TARGET_REF": "",
         "PREFER_LOCAL_TARGET_FOR_READ": False,
         "TERMS_PATH": "/Users/grcai/Documents/GitHub/docs/resources/terms.md",
-        "SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH": True,
-        "SKIP_TRANSLATING_AI_DOCS_TO_ZH": False,
     },
     "cloud": {
         "SOURCE_REPO": "pingcap/docs",
@@ -66,8 +64,6 @@ TEST_CONFIGS = {
         "TARGET_REF": "i18n-zh-release-8.5",
         "PREFER_LOCAL_TARGET_FOR_READ": True,
         "TERMS_PATH": "/Users/grcai/Documents/GitHub/terms.md",
-        "SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH": False,
-        "SKIP_TRANSLATING_AI_DOCS_TO_ZH": True,
     },
 }
 

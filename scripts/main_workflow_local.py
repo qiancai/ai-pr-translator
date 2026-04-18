@@ -17,12 +17,6 @@ DOCS_LOCAL_PATH = "/Users/grcai/Documents/GitHub/docs"
 TERMS_PATH = "/Users/grcai/Documents/GitHub/docs/resources/terms.md"
 TIDB_CLOUD_ABSOLUTE_LINK_PREFIX = "https://docs.pingcap.com/tidbcloud/"
 
-SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH = True
-CLOUD_FOLDER_NAME = "tidb-cloud"
-
-SKIP_TRANSLATING_AI_DOCS_TO_ZH = True
-AI_DOCS_FOLDER_NAME = "ai"
-
 # Local verification should leave translated files unstaged for easy review.
 SKIP_GIT_ADD = True
 
@@ -71,10 +65,6 @@ def main():
         "AI_PROVIDER": AI_PROVIDER,
         "TERMS_PATH": TERMS_PATH,
         "TIDB_CLOUD_ABSOLUTE_LINK_PREFIX": TIDB_CLOUD_ABSOLUTE_LINK_PREFIX,
-        "SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH": str(SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH).lower(),
-        "CLOUD_FOLDER_NAME": CLOUD_FOLDER_NAME,
-        "SKIP_TRANSLATING_AI_DOCS_TO_ZH": str(SKIP_TRANSLATING_AI_DOCS_TO_ZH).lower(),
-        "AI_DOCS_FOLDER_NAME": AI_DOCS_FOLDER_NAME,
         "SKIP_GIT_ADD": str(SKIP_GIT_ADD).lower(),
     }
 

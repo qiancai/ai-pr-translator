@@ -286,14 +286,21 @@ AI_MAX_TOKENS = 20000                  # Max tokens per AI request
 
 ### Special file configuration
 
-Customize handling for specific files:
+Customize handling for specific files and folders in `scripts/workflow_ignore_config.json`:
 
-```python
-SPECIAL_FILES = ["TOC.md"]  # Files requiring special processing
-IGNORE_FILES = [             # Files to skip
-    "faq/ddl-faq.md",
-    "command-line-flags-for-tidb-configuration.md"
-]
+```json
+{
+  "PR_MODE_IGNORE_FILES": [
+    "TOC-tidb-cloud.md",
+    "TOC-ai.md"
+  ],
+  "PR_MODE_IGNORE_FOLDERS": [
+    "tidb-cloud",
+    "ai"
+  ],
+  "COMMIT_BASED_MODE_IGNORE_FILES": [],
+  "COMMIT_BASED_MODE_IGNORE_FOLDERS": []
+}
 ```
 
 ### Section matching strategies

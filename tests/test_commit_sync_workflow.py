@@ -50,17 +50,20 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
     def test_build_exclude_folders_keeps_explicit_commit_target_folder(self):
         repo_config = {"target_language": "Chinese"}
 
-        with mock.patch.object(workflow, "SKIP_TRANSLATING_AI_DOCS_TO_ZH", True), mock.patch.object(
-            workflow, "SKIP_TRANSLATING_CLOUD_DOCS_TO_ZH", True
+        with mock.patch.object(
+            workflow,
+            "COMMIT_BASED_MODE_IGNORE_FOLDERS",
+            ("ai", "tidb-cloud"),
         ), mock.patch.object(workflow, "SOURCE_FOLDER", "ai"), mock.patch.object(
             workflow, "SOURCE_FILES", ""
-        ), mock.patch.object(workflow, "AI_DOCS_FOLDER_NAME", "ai"), mock.patch.object(
-            workflow, "CLOUD_FOLDER_NAME", "tidb-cloud"
         ):
             exclude_folders = workflow.build_exclude_folders(repo_config)
 
         self.assertNotIn("ai", exclude_folders)
         self.assertIn("tidb-cloud", exclude_folders)
+
+    def test_commit_ignore_folders_do_not_inherit_pr_mode_defaults(self):
+        self.assertEqual(workflow.get_commit_ignore_folders(), [])
 
     def test_commit_repo_config_includes_target_ref_and_local_read_preference(self):
         with mock.patch.object(workflow, "SOURCE_REPO", "pingcap/docs"), mock.patch.object(
@@ -76,34 +79,19 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
         self.assertTrue(repo_config["prefer_local_target_for_read"])
         self.assertEqual(repo_config["target_local_path"], "/tmp/docs")
 
-    def test_commit_ignore_files_allows_explicit_cloud_toc_files(self):
-        with mock.patch.object(
-            workflow,
-            "IGNORE_FILES",
-            ["TOC-tidb-cloud.md", "TOC-tidb-cloud-starter.md"],
-        ), mock.patch.object(workflow, "SOURCE_FOLDER", ""), mock.patch.object(
+    def test_commit_ignore_files_do_not_inherit_pr_mode_defaults(self):
+        with mock.patch.object(workflow, "SOURCE_FOLDER", ""), mock.patch.object(
             workflow,
             "SOURCE_FILES",
-            "TOC-tidb-cloud.md,tidb-cloud/example.md",
+            "",
         ):
             ignore_files = workflow.get_commit_ignore_files()
 
-        self.assertNotIn("TOC-tidb-cloud.md", ignore_files)
-        self.assertIn("TOC-tidb-cloud-starter.md", ignore_files)
+        self.assertEqual(ignore_files, [])
 
-    def test_commit_ignore_files_allows_prefixed_explicit_cloud_toc_files(self):
-        with mock.patch.object(
-            workflow,
-            "IGNORE_FILES",
-            ["TOC-tidb-cloud.md", "TOC-tidb-cloud-starter.md"],
-        ), mock.patch.object(workflow, "SOURCE_FOLDER", "docs"), mock.patch.object(
-            workflow,
-            "SOURCE_FILES",
-            "TOC-tidb-cloud.md",
-        ):
-            ignore_files = workflow.get_commit_ignore_files()
+    def test_commit_mode_treats_pr_ignored_toc_files_as_special_toc_files(self):
+        ignore_files = workflow.get_commit_ignore_files()
 
-        self.assertNotIn("TOC-tidb-cloud.md", ignore_files)
         self.assertEqual(
             workflow.determine_file_processing_type(
                 "docs/TOC-tidb-cloud.md",

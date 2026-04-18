@@ -1,0 +1,17 @@
+{
+  "PR_MODE_IGNORE_FILES": [
+    "TOC-tidb-cloud.md",
+    "TOC-tidb-cloud-starter.md",
+    "TOC-tidb-cloud-essential.md",
+    "TOC-tidb-cloud-premium.md",
+    "TOC-tidb-cloud-releases.md",
+    "TOC-ai.md",
+    "TOC-pingkai.md"
+  ],
+  "PR_MODE_IGNORE_FOLDERS": [
+    "tidb-cloud",
+    "ai"
+  ],
+  "COMMIT_BASED_MODE_IGNORE_FILES": ["system-variables.md"],
+  "COMMIT_BASED_MODE_IGNORE_FOLDERS": []
+}
