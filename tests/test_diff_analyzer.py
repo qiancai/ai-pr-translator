@@ -10,6 +10,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from diff_analyzer import (
+    analyze_diff_operations,
     analyze_source_changes,
     build_commit_diff_context,
     build_local_commit_diff_context,
@@ -175,6 +176,143 @@ class DiffAnalyzerContextTest(unittest.TestCase):
 
         self.assertEqual(source_diff_dict["modified_3"]["original_hierarchy"], "bottom-modified-3")
         self.assertEqual(source_diff_dict["modified_3"]["matching_hierarchy"], "## Section")
+
+    def test_numbered_heading_rename_is_treated_as_modified(self):
+        patch = "\n".join(
+            [
+                "@@ -12,9 +12,9 @@",
+                " Intro text",
+                "-## Step 1: Create a TiDB cluster",
+                "+## Step 1: Create a {{{ .starter }}} instance {#step-1-create-a-starter-instance}",
+                " ",
+                "-Old body",
+                "+New body",
+                " ## Step 2: Try AI-assisted SQL Editor",
+            ]
+        )
+        changed_file = SimpleNamespace(filename="quickstart.md", status="modified", patch=patch)
+
+        operations = analyze_diff_operations(changed_file)
+
+        self.assertEqual([], [line["content"] for line in operations["added_lines"] if line["is_header"]])
+        self.assertEqual([], [line["content"] for line in operations["deleted_lines"] if line["is_header"]])
+        self.assertEqual(
+            ["## Step 1: Create a {{{ .starter }}} instance {#step-1-create-a-starter-instance}"],
+            [line["content"] for line in operations["modified_lines"] if line["is_header"]],
+        )
+        self.assertEqual(
+            "## Step 1: Create a TiDB cluster",
+            next(line for line in operations["modified_lines"] if line["is_header"])["original_content"],
+        )
+
+    def test_keyword_overlapping_heading_rename_is_treated_as_modified(self):
+        patch = "\n".join(
+            [
+                "@@ -144,8 +198,8 @@",
+                " Some context",
+                "-### Invite an organization member",
+                "+### Invite a user to your organization",
+                " ",
+                "-Old body",
+                "+New body",
+                " ### Remove an organization member",
+            ]
+        )
+        changed_file = SimpleNamespace(filename="manage-user-access.md", status="modified", patch=patch)
+
+        operations = analyze_diff_operations(changed_file)
+
+        self.assertEqual([], [line["content"] for line in operations["added_lines"] if line["is_header"]])
+        self.assertEqual([], [line["content"] for line in operations["deleted_lines"] if line["is_header"]])
+        self.assertEqual(
+            ["### Invite a user to your organization"],
+            [line["content"] for line in operations["modified_lines"] if line["is_header"]],
+        )
+        self.assertEqual(
+            "### Invite an organization member",
+            next(line for line in operations["modified_lines"] if line["is_header"])["original_content"],
+        )
+
+    def test_short_heading_rename_with_shared_leading_keyword_is_modified(self):
+        patch = "\n".join(
+            [
+                "@@ -43,9 +43,9 @@",
+                " ### External storage",
+                " ",
+                "-### Downstream cluster",
+                "+### Downstream TiDB Cloud",
+                " ",
+                " The sharded schemas and tables are merged into the table `store.sales`.",
+            ]
+        )
+        changed_file = SimpleNamespace(filename="migrate-sql-shards.md", status="modified", patch=patch)
+
+        operations = analyze_diff_operations(changed_file)
+
+        self.assertEqual([], [line["content"] for line in operations["added_lines"] if line["is_header"]])
+        self.assertEqual([], [line["content"] for line in operations["deleted_lines"] if line["is_header"]])
+        self.assertEqual(
+            ["### Downstream TiDB Cloud"],
+            [line["content"] for line in operations["modified_lines"] if line["is_header"]],
+        )
+        self.assertEqual(
+            "### Downstream cluster",
+            next(line for line in operations["modified_lines"] if line["is_header"])["original_content"],
+        )
+
+    def test_adjacent_same_level_heading_rename_without_keyword_overlap_is_modified(self):
+        patch = "\n".join(
+            [
+                "@@ -240,8 +240,8 @@",
+                " ## Incremental replication",
+                " ",
+                "-### Prerequisites",
+                "+### Before you begin",
+                " ",
+                "-Old body",
+                "+New body",
+            ]
+        )
+        changed_file = SimpleNamespace(filename="guide.md", status="modified", patch=patch)
+
+        operations = analyze_diff_operations(changed_file)
+
+        self.assertEqual([], [line["content"] for line in operations["added_lines"] if line["is_header"]])
+        self.assertEqual([], [line["content"] for line in operations["deleted_lines"] if line["is_header"]])
+        self.assertEqual(
+            ["### Before you begin"],
+            [line["content"] for line in operations["modified_lines"] if line["is_header"]],
+        )
+        self.assertEqual(
+            "### Prerequisites",
+            next(line for line in operations["modified_lines"] if line["is_header"])["original_content"],
+        )
+
+    def test_adjacent_delete_add_heading_blocks_are_not_paired_as_renames(self):
+        patch = "\n".join(
+            [
+                "@@ -20,8 +20,8 @@",
+                " ## Parent",
+                "-### Old one",
+                "-### Old two",
+                "+### New three",
+                "+### New four",
+                " ## Next",
+            ]
+        )
+        changed_file = SimpleNamespace(filename="guide.md", status="modified", patch=patch)
+
+        operations = analyze_diff_operations(changed_file)
+
+        self.assertEqual(
+            ["### New three", "### New four"],
+            [line["content"] for line in operations["added_lines"] if line["is_header"]],
+        )
+        self.assertEqual(
+            ["### Old one", "### Old two"],
+            [line["content"] for line in operations["deleted_lines"] if line["is_header"]],
+        )
+        self.assertEqual([], [line["content"] for line in operations["modified_lines"] if line["is_header"]])
 
     def test_renamed_markdown_is_treated_as_delete_and_add(self):
         renamed_file = SimpleNamespace(

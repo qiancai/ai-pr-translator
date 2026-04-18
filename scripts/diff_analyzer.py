@@ -422,15 +422,137 @@ def analyze_diff_operations(file):
     used_added_indices = set()
     used_deleted_indices = set()
     
+    def heading_level(title):
+        match = re.match(r'^(#{1,10})\s+', title.strip())
+        return len(match.group(1)) if match else None
+
+    def normalize_heading_title(title):
+        cleaned = re.sub(r'^#{1,10}\s*', '', title.strip())
+        cleaned = cleaned.replace('`', '')
+        cleaned = re.sub(r'\s*\{#[^}]+\}\s*$', '', cleaned)
+        cleaned = re.sub(r'\{\{\{\s*\.([A-Za-z0-9_-]+)\s*\}\}\}', r'\1', cleaned)
+        cleaned = re.sub(r'[：:：.。]+', ':', cleaned)
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        return cleaned
+
+    def extract_numbered_heading_prefix(title):
+        cleaned = normalize_heading_title(title)
+        match = re.match(
+            r'^(?P<label>step|option|phase|part|chapter|section)\s*(?P<number>\d+)\b',
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return (match.group('label').lower(), int(match.group('number')))
+        return None
+
+    def heading_keywords(title):
+        stop_words = {
+            'a', 'an', 'and', 'are', 'as', 'at', 'by', 'for', 'from', 'in',
+            'into', 'of', 'on', 'or', 'the', 'to', 'with', 'your',
+        }
+        words = re.findall(r'[A-Za-z0-9]+', normalize_heading_title(title).lower())
+        return {word for word in words if word not in stop_words}
+
+    def heading_keyword_list(title):
+        stop_words = {
+            'a', 'an', 'and', 'are', 'as', 'at', 'by', 'for', 'from', 'in',
+            'into', 'of', 'on', 'or', 'the', 'to', 'with', 'your',
+        }
+        words = re.findall(r'[A-Za-z0-9]+', normalize_heading_title(title).lower())
+        return [word for word in words if word not in stop_words]
+
+    header_diff_events = sorted(
+        [('deleted', header) for header in deleted_headers]
+        + [('added', header) for header in added_headers],
+        key=lambda item: item[1]['diff_index'],
+    )
+
+    def diff_line_is_heading(index):
+        if index < 0 or index >= len(lines):
+            return False
+        line = lines[index]
+        if not line or line.startswith(('@@', '+++', '---')):
+            return False
+        if line[0] not in (' ', '+', '-'):
+            return False
+        return heading_level(line[1:].strip()) is not None
+
+    def has_intervening_heading(old_header, new_header):
+        start = min(old_header['diff_index'], new_header['diff_index']) + 1
+        end = max(old_header['diff_index'], new_header['diff_index'])
+        return any(diff_line_is_heading(index) for index in range(start, end))
+
+    def is_likely_header_batch_boundary(old_header, new_header):
+        """Detect a delete-block/add-block boundary, such as -A -B +C +D."""
+        old_index = old_header['diff_index']
+        new_index = new_header['diff_index']
+        adjacent_index = None
+        for event_index, (_, header) in enumerate(header_diff_events):
+            if header['diff_index'] == old_index:
+                adjacent_index = event_index
+                break
+
+        if adjacent_index is None or adjacent_index + 1 >= len(header_diff_events):
+            return False
+        if header_diff_events[adjacent_index + 1][1]['diff_index'] != new_index:
+            return False
+
+        previous_event = header_diff_events[adjacent_index - 1] if adjacent_index > 0 else None
+        next_event = (
+            header_diff_events[adjacent_index + 2]
+            if adjacent_index + 2 < len(header_diff_events)
+            else None
+        )
+        previous_is_nearby_delete = (
+            previous_event is not None
+            and previous_event[0] == 'deleted'
+            and old_index - previous_event[1]['diff_index'] <= 5
+        )
+        next_is_nearby_add = (
+            next_event is not None
+            and next_event[0] == 'added'
+            and next_event[1]['diff_index'] - new_index <= 5
+        )
+        return previous_is_nearby_delete and next_is_nearby_add
+
     # Helper function for semantic similarity
     def are_headers_similar(old, new):
+        if heading_level(old) != heading_level(new):
+            return False
+
         # Remove markdown markers
-        old_clean = old.replace('#', '').replace('`', '').strip()
-        new_clean = new.replace('#', '').replace('`', '').strip()
+        old_clean = normalize_heading_title(old)
+        new_clean = normalize_heading_title(new)
         
         # Check if one is a substring/extension of the other
         if old_clean in new_clean or new_clean in old_clean:
             return True
+
+        # Treat tutorial-style heading renames as modifications when the
+        # structural step prefix is preserved, even if the wording changed a lot.
+        old_prefix = extract_numbered_heading_prefix(old)
+        new_prefix = extract_numbered_heading_prefix(new)
+        if old_prefix and old_prefix == new_prefix:
+            return True
+
+        old_keywords = heading_keywords(old)
+        new_keywords = heading_keywords(new)
+        if old_keywords and new_keywords:
+            overlap = len(old_keywords & new_keywords)
+            smaller_keyword_count = min(len(old_keywords), len(new_keywords))
+            if overlap >= 2 and overlap / smaller_keyword_count >= 0.6:
+                return True
+
+        old_keyword_list = heading_keyword_list(old)
+        new_keyword_list = heading_keyword_list(new)
+        if old_keyword_list and new_keyword_list:
+            same_leading_keyword = old_keyword_list[0] == new_keyword_list[0]
+            short_heading = min(len(old_keyword_list), len(new_keyword_list)) <= 2
+            overlap = len(set(old_keyword_list) & set(new_keyword_list))
+            smaller_keyword_count = min(len(old_keyword_list), len(new_keyword_list))
+            if same_leading_keyword and short_heading and overlap / smaller_keyword_count >= 0.5:
+                return True
         
         # Check for similar patterns (like appending -pu, -new, etc.)
         old_base = old_clean.split('-')[0]
@@ -455,12 +577,23 @@ def analyze_diff_operations(file):
             # Check if they are close in the diff sequence (GitHub's approach)
             diff_distance = abs(added_header['diff_index'] - deleted_header['diff_index'])
             is_close_in_diff = diff_distance <= 5  # Allow small gap for context lines
+
+            same_heading_level = heading_level(deleted_content) == heading_level(added_content)
+            has_no_intervening_heading = not has_intervening_heading(deleted_header, added_header)
+            is_batch_boundary = is_likely_header_batch_boundary(deleted_header, added_header)
+            is_structural_rename = (
+                same_heading_level
+                and has_no_intervening_heading
+                and not is_batch_boundary
+            )
             
             # Check semantic similarity
             is_similar = are_headers_similar(deleted_content, added_content)
             
-            # GitHub-like logic: prioritize diff proximity + semantic similarity
-            if is_close_in_diff and is_similar:
+            # GitHub-like logic: adjacent same-level headings are usually a line
+            # replacement even when the wording changes substantially. Keep
+            # semantic matching as a fallback for close but less tidy diffs.
+            if is_close_in_diff and (is_structural_rename or is_similar):
                 modified_pairs.append({
                     'deleted': deleted_header,
                     'added': added_header,
