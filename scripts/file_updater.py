@@ -22,6 +22,13 @@ def thread_safe_print(*args, **kwargs):
     with print_lock:
         print(*args, **kwargs)
 
+def verbose_logging_enabled():
+    return os.getenv("VERBOSE_WORKFLOW_LOGS", "false").lower() in ("1", "true", "yes", "on")
+
+def verbose_thread_safe_print(*args, **kwargs):
+    if verbose_logging_enabled():
+        thread_safe_print(*args, **kwargs)
+
 def read_text_lines_preserve_newlines(file_path):
     """Read text lines without normalizing existing line endings."""
     with open(file_path, 'r', encoding='utf-8', newline='') as f:
@@ -762,12 +769,16 @@ def _execute_ai_translation(
     except Exception:
         formatted_target_preview = "(preview unavailable)"
 
-    thread_safe_print(f"\n   📤 AI Update Prompt ({source_language} → {target_language}):")
-    thread_safe_print(f"   " + "="*80)
-    thread_safe_print(f"   Source Sections: {formatted_source_preview}...")
-    thread_safe_print(f"   PR Diff (first 500 chars): {pr_diff[:500] if pr_diff else '(none)'}...")
-    thread_safe_print(f"   Target Sections: {formatted_target_preview}...")
-    thread_safe_print(f"   " + "="*80)
+    target_section_count = len(target_sections) if hasattr(target_sections, "__len__") else 0
+    thread_safe_print(
+        f"\n   📤 AI update request ({source_language} → {target_language}): "
+        f"{target_section_count} target section(s), {len(prompt):,} prompt chars"
+    )
+    verbose_thread_safe_print(f"   " + "="*80)
+    verbose_thread_safe_print(f"   Source Sections: {formatted_source_preview}...")
+    verbose_thread_safe_print(f"   PR Diff (first 500 chars): {pr_diff[:500] if pr_diff else '(none)'}...")
+    verbose_thread_safe_print(f"   Target Sections: {formatted_target_preview}...")
+    verbose_thread_safe_print(f"   " + "="*80)
 
     try:
         from main import print_token_estimation
@@ -794,8 +805,8 @@ def _execute_ai_translation(
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
         )
-        thread_safe_print(f"   📝 AI translation response received")
-        thread_safe_print(f"   📋 AI response (first 500 chars): {ai_response[:500]}...")
+        thread_safe_print(f"   📝 AI translation response received ({len(ai_response or ''):,} chars)")
+        verbose_thread_safe_print(f"   📋 AI response (first 500 chars): {(ai_response or '')[:500]}...")
 
         result = parse_updated_sections(ai_response)
         result = enforce_minimal_target_updates(target_sections, result, pr_diff)
@@ -1060,8 +1071,8 @@ def parse_updated_sections(ai_response):
         cleaned_response = cleaned_response.strip()
         
         print(f"   📝 Cleaned response length: {len(cleaned_response)} characters")
-        print(f"   📝 First 200 chars: {cleaned_response[:200]}...")
-        print(f"   📝 Last 200 chars: ...{cleaned_response[-200:]}")
+        verbose_thread_safe_print(f"   📝 First 200 chars: {cleaned_response[:200]}...")
+        verbose_thread_safe_print(f"   📝 Last 200 chars: ...{cleaned_response[-200:]}")
         
         # Try to find JSON content between curly braces
         start_idx = cleaned_response.find('{')
@@ -2264,36 +2275,37 @@ def update_target_document_from_match_data(match_file_path, target_local_path, t
         thread_safe_print("❌ No valid sections found for update")
         return False
     
-    thread_safe_print(f"\n📊 Detailed processing order:")
-    for i, (key, section_data, line_num) in enumerate(all_sections, 1):
-        operation = section_data.get('source_operation', '')
-        hierarchy = section_data.get('target_hierarchy', '')
-        insertion_type = section_data.get('insertion_type', '')
-        
-        # Extract source line number for display
-        source_line_num = int(key.split('_')[1]) if '_' in key and key.split('_')[1].isdigit() else 'N/A'
-        
-        # Display target_line with special handling for bottom sections
-        target_display = "END" if line_num == -1 else str(line_num)
-        
-        # Determine section group
-        if hierarchy.startswith('bottom-modified-'):
-            group = "BotMod"
-        elif hierarchy.startswith('bottom-added-'):
-            group = "BotAdd"
-        else:
-            group = "Regular"
-        
-        if operation == 'deleted':
-            action = "delete"
-        elif insertion_type == "before_reference":
-            action = "insert"
-        elif line_num == -1:
-            action = "append"
-        else:
-            action = "replace"
-        
-        thread_safe_print(f"   {i:2}. [{group:7}] Target:{target_display:>3} Src:{source_line_num:3} | {key:15} ({operation:8}) | {action:7} | {hierarchy}")
+    if verbose_logging_enabled():
+        thread_safe_print(f"\n📊 Detailed processing order:")
+        for i, (key, section_data, line_num) in enumerate(all_sections, 1):
+            operation = section_data.get('source_operation', '')
+            hierarchy = section_data.get('target_hierarchy', '')
+            insertion_type = section_data.get('insertion_type', '')
+
+            # Extract source line number for display
+            source_line_num = int(key.split('_')[1]) if '_' in key and key.split('_')[1].isdigit() else 'N/A'
+
+            # Display target_line with special handling for bottom sections
+            target_display = "END" if line_num == -1 else str(line_num)
+
+            # Determine section group
+            if hierarchy.startswith('bottom-modified-'):
+                group = "BotMod"
+            elif hierarchy.startswith('bottom-added-'):
+                group = "BotAdd"
+            else:
+                group = "Regular"
+
+            if operation == 'deleted':
+                action = "delete"
+            elif insertion_type == "before_reference":
+                action = "insert"
+            elif line_num == -1:
+                action = "append"
+            else:
+                action = "replace"
+
+            thread_safe_print(f"   {i:2}. [{group:7}] Target:{target_display:>3} Src:{source_line_num:3} | {key:15} ({operation:8}) | {action:7} | {hierarchy}")
     
     # Determine target file name
     if target_file_name is None:
@@ -2396,7 +2408,7 @@ def update_target_document_sections(all_sections, target_file_path):
             
         else:
             # Handle content format
-            thread_safe_print(f"   📄 Content preview: {repr(target_new_content[:80])}...")
+            verbose_thread_safe_print(f"   📄 Content preview: {repr(target_new_content[:80])}...")
             
             if target_hierarchy.startswith('bottom-'):
                 # Bottom section special handling

@@ -63,7 +63,12 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
         self.assertIn("tidb-cloud", exclude_folders)
 
     def test_commit_ignore_folders_do_not_inherit_pr_mode_defaults(self):
-        self.assertEqual(workflow.get_commit_ignore_folders(), [])
+        with mock.patch.object(
+            workflow,
+            "COMMIT_BASED_MODE_IGNORE_FOLDERS",
+            ("custom-folder",),
+        ):
+            self.assertEqual(workflow.get_commit_ignore_folders(), ["custom-folder"])
 
     def test_commit_repo_config_includes_target_ref_and_local_read_preference(self):
         with mock.patch.object(workflow, "SOURCE_REPO", "pingcap/docs"), mock.patch.object(
@@ -80,14 +85,14 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
         self.assertEqual(repo_config["target_local_path"], "/tmp/docs")
 
     def test_commit_ignore_files_do_not_inherit_pr_mode_defaults(self):
-        with mock.patch.object(workflow, "SOURCE_FOLDER", ""), mock.patch.object(
+        with mock.patch.object(
             workflow,
-            "SOURCE_FILES",
-            "",
+            "COMMIT_BASED_MODE_IGNORE_FILES",
+            ("custom.md",),
         ):
             ignore_files = workflow.get_commit_ignore_files()
 
-        self.assertEqual(ignore_files, [])
+        self.assertEqual(ignore_files, ["custom.md"])
 
     def test_commit_mode_treats_pr_ignored_toc_files_as_special_toc_files(self):
         ignore_files = workflow.get_commit_ignore_files()

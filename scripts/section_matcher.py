@@ -18,6 +18,13 @@ def thread_safe_print(*args, **kwargs):
     with print_lock:
         print(*args, **kwargs)
 
+def verbose_logging_enabled():
+    return os.getenv("VERBOSE_WORKFLOW_LOGS", "false").lower() in ("1", "true", "yes", "on")
+
+def verbose_thread_safe_print(*args, **kwargs):
+    if verbose_logging_enabled():
+        thread_safe_print(*args, **kwargs)
+
 def is_markdown_heading(line):
     """True only for real markdown headings at column 0."""
     if not line or not isinstance(line, str):
@@ -376,10 +383,14 @@ Please select the corresponding {number_of_sections} section(s) in {target_langu
 
 {target_text}"""
 
-    thread_safe_print(f"\n   📤 AI Mapping Prompt ({source_language} → {target_language}):")
-    thread_safe_print(f"   " + "="*80)
-    thread_safe_print(f"   {prompt}")
-    thread_safe_print(f"   " + "="*80)
+    thread_safe_print(
+        f"\n   📤 AI mapping request ({source_language} → {target_language}): "
+        f"{number_of_sections} section(s), {len(target_sections)} target candidate(s), "
+        f"{len(prompt):,} prompt chars"
+    )
+    verbose_thread_safe_print(f"   " + "="*80)
+    verbose_thread_safe_print(f"   {prompt}")
+    verbose_thread_safe_print(f"   " + "="*80)
 
     # Import token estimation function from main
     try:
@@ -413,10 +424,10 @@ Please select the corresponding {number_of_sections} section(s) in {target_langu
             max_tokens=max_tokens
         )
         
-        thread_safe_print(f"\n   📥 AI Mapping Response:")
-        thread_safe_print(f"   " + "-"*80)
-        thread_safe_print(f"   {ai_response}")
-        thread_safe_print(f"   " + "-"*80)
+        thread_safe_print(f"\n   📥 AI mapping response received: {len(ai_response or ''):,} chars")
+        verbose_thread_safe_print(f"   " + "-"*80)
+        verbose_thread_safe_print(f"   {ai_response}")
+        verbose_thread_safe_print(f"   " + "-"*80)
         
         return ai_response
     except Exception as e:
@@ -840,9 +851,9 @@ def extract_hierarchies_from_diff_dict(source_diff_dict):
             # Use the key as the identifier for the hierarchy
             extracted_hierarchies[key] = original_hierarchy
     
-    thread_safe_print(f"📄 Extracted {len(extracted_hierarchies)} hierarchies from source diff dict:")
+    thread_safe_print(f"📄 Extracted {len(extracted_hierarchies)} hierarchies from source diff dict")
     for key, hierarchy in extracted_hierarchies.items():
-        thread_safe_print(f"   {key}: {hierarchy}")
+        verbose_thread_safe_print(f"   {key}: {hierarchy}")
     
     return extracted_hierarchies
 
@@ -955,16 +966,16 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
             batched_ai_failures.update(batched_ai_sections.keys())
     
     # Process each section in original order
-    thread_safe_print(f"\n🔄 Processing sections in original order...")
+    verbose_thread_safe_print(f"\n🔄 Processing sections in original order...")
     
     for key, hierarchy in source_hierarchies.items():
-        thread_safe_print(f"   🔍 Processing {key}: {hierarchy}")
+        verbose_thread_safe_print(f"   🔍 Processing {key}: {hierarchy}")
         matching_hierarchy = matching_hierarchies.get(key, hierarchy)
         
         # Determine processing strategy based on section type and content
         if hierarchy == "intro_section" or key == "intro_section":
             # Intro section - match to target's content from first # heading to first ## heading
-            thread_safe_print(f"      📄 Intro section - matching to target (# to ##)")
+            verbose_thread_safe_print(f"      📄 Intro section - matching to target (# to ##)")
             # Find the first top-level heading in target
             first_heading_line = 0
             for i, line in enumerate(target_lines, 1):
@@ -987,16 +998,16 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
             }
         elif hierarchy.startswith('bottom-added-'):
             # Bottom-added section - no matching needed, append to end
-            thread_safe_print(f"      🔚 Bottom-added section - append to end of document")
+            verbose_thread_safe_print(f"      🔚 Bottom-added section - append to end of document")
             result = {
                 "target_line": "-1",  # Special marker for bottom-added sections
                 "target_hierarchy": hierarchy
             }
         elif key in batched_ai_results:
-            thread_safe_print(f"      🤖 Using batched AI match result")
+            verbose_thread_safe_print(f"      🤖 Using batched AI match result")
             result = batched_ai_results[key]
         elif key in batched_ai_sections:
-            thread_safe_print(f"      ↪ Falling back to individual matching")
+            verbose_thread_safe_print(f"      ↪ Falling back to individual matching")
             if key.startswith('added_'):
                 result = process_added_section(
                     key,
@@ -1010,7 +1021,7 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
                 )
             else:
                 operation = source_entries.get(key, {}).get('operation', 'unknown')
-                thread_safe_print(f"      {operation.capitalize()} section - finding target match")
+                verbose_thread_safe_print(f"      {operation.capitalize()} section - finding target match")
                 result = process_modified_or_deleted_section(
                     key,
                     matching_hierarchy,
@@ -1025,7 +1036,7 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
             # Direct-match path.
             operation = source_entries.get(key, {}).get('operation', 'unknown')
             if key.startswith('added_'):
-                thread_safe_print(f"      ➕ Added section - finding insertion point")
+                verbose_thread_safe_print(f"      ➕ Added section - finding insertion point")
                 result = process_added_section(
                     key,
                     matching_hierarchy,
@@ -1037,7 +1048,7 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
                     max_tokens,
                 )
             else:
-                thread_safe_print(f"      {operation.capitalize()} section - finding target match")
+                verbose_thread_safe_print(f"      {operation.capitalize()} section - finding target match")
                 result = process_modified_or_deleted_section(
                     key,
                     matching_hierarchy,
@@ -1090,7 +1101,7 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
                 'target_end_marker': target_end_marker
             }
             all_matched_sections[key] = enhanced_result
-            thread_safe_print(f"      ✅ {key}: -> line {target_line}")
+            verbose_thread_safe_print(f"      ✅ {key}: -> line {target_line}")
         else:
             thread_safe_print(f"      ❌ {key}: matching failed")
     

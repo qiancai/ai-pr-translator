@@ -303,6 +303,10 @@ Customize handling for specific files and folders in `scripts/workflow_ignore_co
 }
 ```
 
+Set `VERBOSE_WORKFLOW_LOGS=true` to print full AI prompts, AI responses, and
+per-section update details when you need deep debugging. It is disabled by
+default to keep GitHub Actions logs compact.
+
 ### Section matching strategies
 
 1. **Direct Matching**: Exact hierarchy and title matching
