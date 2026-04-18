@@ -71,6 +71,22 @@ TIDB_CLOUD_ABSOLUTE_LINK_PREFIX = os.getenv(
     "TIDB_CLOUD_ABSOLUTE_LINK_PREFIX",
     "https://docs.pingcap.com/tidbcloud/",
 )
+TRANSLATION_CHUNK_SECTION_THRESHOLD = int(os.getenv("TRANSLATION_CHUNK_SECTION_THRESHOLD", "10"))
+TRANSLATION_CHUNK_TOKEN_THRESHOLD = int(os.getenv("TRANSLATION_CHUNK_TOKEN_THRESHOLD", "12000"))
+SYSTEM_TRANSLATION_CHUNK_SIZE = int(os.getenv("SYSTEM_TRANSLATION_CHUNK_SIZE", "20"))
+REGULAR_TRANSLATION_CHUNK_SIZE = int(os.getenv("REGULAR_TRANSLATION_CHUNK_SIZE", "8"))
+TRANSLATION_CHUNK_MAX_SECTIONS = int(
+    os.getenv("TRANSLATION_CHUNK_MAX_SECTIONS", str(SYSTEM_TRANSLATION_CHUNK_SIZE))
+)
+TRANSLATION_CHUNK_CHAR_LIMIT = int(os.getenv("TRANSLATION_CHUNK_CHAR_LIMIT", "40000"))
+
+
+class TranslationResult(dict):
+    """Dictionary of translated sections with non-fatal chunk failures attached."""
+
+    def __init__(self, initial=None, failures=None):
+        super().__init__(initial or {})
+        self.failures = list(failures or [])
 
 
 def has_explicit_heading_anchor(heading_line):
@@ -445,48 +461,254 @@ def enforce_minimal_target_updates(target_sections, updated_sections, pr_diff):
     return guarded
 
 
-def get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_dict, ai_client, source_language, target_language, target_file_name=None, glossary_matcher=None, dry_run=False, source_mode=""):
-    """Use AI to update target sections based on source old content, PR diff, and target sections"""
-    if not source_old_content_dict or not target_sections:
-        return {}
-    
-    # Filter out deleted sections and prepare source sections from old content
-    source_sections = {}
-    for key, old_content in source_old_content_dict.items():
-        # Skip deleted sections
-        if 'deleted' in key:
-            continue
-        
-        # Handle null values by using empty string
-        content = old_content if old_content is not None else ""
-        source_sections[key] = content
+_tiktoken_encoding = None
+_tiktoken_unavailable = False
 
-    # Keep the original order from match_source_diff_to_target.json (no sorting needed)
+
+def estimate_translation_tokens(text):
+    """Estimate token count for chunk-mode routing."""
+    global _tiktoken_encoding, _tiktoken_unavailable
+    if not text:
+        return 0
+    if _tiktoken_unavailable:
+        return max(1, len(str(text)) // 4)
+    if _tiktoken_encoding is None:
+        try:
+            import tiktoken
+            _tiktoken_encoding = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            _tiktoken_unavailable = True
+            return max(1, len(str(text)) // 4)
+    return len(_tiktoken_encoding.encode(str(text)))
+
+
+def get_target_file_prefix_for_debug(target_file_name, target_sections):
+    """Build the temp_output file prefix used by prompt/result debug files."""
+    if target_file_name:
+        return target_file_name.replace('/', '_').replace('.md', '')
+
+    if target_sections:
+        first_key = next(iter(target_sections.keys()), "")
+        if "_" in first_key:
+            parts = first_key.split("_")
+            if len(parts) > 1:
+                return parts[0]
+
+    return "unknown"
+
+
+def get_temp_output_dir():
+    """Return the scripts/temp_output directory and create it if needed."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    temp_dir = os.path.join(script_dir, "temp_output")
+    os.makedirs(temp_dir, exist_ok=True)
+    return temp_dir
+
+
+def extract_first_heading_title(content):
+    """Return the first markdown heading title from a section."""
+    for line in str(content or "").splitlines():
+        if is_markdown_heading(line):
+            return re.sub(r'^#{1,10}\s+', '', line.strip()).strip()
+    return ""
+
+
+def estimate_chunk_section_chars(key, source_sections, target_sections=None):
+    """Estimate how much prompt text a section contributes before diff/glossary."""
+    target_sections = target_sections or {}
+    return len(str(source_sections.get(key, ""))) + len(str(target_sections.get(key, "")))
+
+
+def build_translation_chunks(source_sections, target_sections=None):
+    """Split ordered section keys by section count and approximate character budget."""
+    chunks = []
+    current_keys = []
+    current_chars = 0
+
+    for key in source_sections:
+        section_chars = estimate_chunk_section_chars(key, source_sections, target_sections)
+
+        if current_keys and (
+            len(current_keys) >= TRANSLATION_CHUNK_MAX_SECTIONS
+            or current_chars + section_chars > TRANSLATION_CHUNK_CHAR_LIMIT
+        ):
+            chunks.append(
+                {
+                    "type": "balanced",
+                    "keys": current_keys,
+                    "limit": TRANSLATION_CHUNK_MAX_SECTIONS,
+                    "chars": current_chars,
+                }
+            )
+            current_keys = []
+            current_chars = 0
+
+        current_keys.append(key)
+        current_chars += section_chars
+
+    if current_keys:
+        chunks.append(
+            {
+                "type": "balanced",
+                "keys": current_keys,
+                "limit": TRANSLATION_CHUNK_MAX_SECTIONS,
+                "chars": current_chars,
+            }
+        )
+
+    return chunks
+
+
+def summarize_chunk_sections(chunk_keys, source_sections, max_items=6):
+    """Build a compact section list for failure reports."""
+    names = []
+    for key in chunk_keys:
+        title = extract_first_heading_title(source_sections.get(key, ""))
+        cleaned = title.replace("`", "").strip() if title else key
+        names.append(cleaned or key)
+
+    if len(names) <= max_items:
+        return ", ".join(names)
+
+    shown = ", ".join(names[:max_items])
+    return f"{shown}, ... (+{len(names) - max_items} more)"
+
+
+def should_use_translation_chunk_mode(source_sections):
+    """Decide whether a section update should be translated in smaller chunks."""
+    total_tokens = sum(
+        estimate_translation_tokens(content)
+        for content in source_sections.values()
+        if content
+    )
+    section_count = len(source_sections)
+    use_chunk_mode = (
+        section_count > TRANSLATION_CHUNK_SECTION_THRESHOLD
+        or total_tokens > TRANSLATION_CHUNK_TOKEN_THRESHOLD
+    )
+
+    return use_chunk_mode, total_tokens
+
+
+def _extract_line_number_from_key(key):
+    """Extract the source line number from a section key like 'modified_390'."""
+    parts = key.rsplit("_", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        return int(parts[1])
+    return None
+
+
+def _parse_diff_hunks(pr_diff):
+    """Split a unified diff into its header and individual hunks."""
+    if not pr_diff:
+        return "", []
+    lines = pr_diff.splitlines(True)
+    header_lines = []
+    hunks = []
+    current_hunk = []
+    for line in lines:
+        if line.startswith("@@"):
+            if current_hunk:
+                hunks.append(current_hunk)
+            current_hunk = [line]
+        elif current_hunk:
+            current_hunk.append(line)
+        else:
+            header_lines.append(line)
+    if current_hunk:
+        hunks.append(current_hunk)
+    return "".join(header_lines), hunks
+
+
+_HUNK_HEADER_RE = re.compile(r'@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@')
+
+
+def _hunk_new_line_range(hunk_header):
+    """Return (start, end) line range for the new-file side of a hunk."""
+    m = _HUNK_HEADER_RE.match(hunk_header)
+    if not m:
+        return None, None
+    start = int(m.group(3))
+    count = int(m.group(4)) if m.group(4) is not None else 1
+    return start, start + count - 1
+
+
+def filter_diff_for_chunk_sections(pr_diff, chunk_keys, all_section_keys):
+    """Return only the diff hunks that overlap with the given chunk's sections."""
+    if not pr_diff or not chunk_keys:
+        return pr_diff or ""
+
+    chunk_line_numbers = sorted(
+        n for n in (_extract_line_number_from_key(k) for k in chunk_keys) if n is not None
+    )
+    if not chunk_line_numbers:
+        return pr_diff
+
+    all_line_numbers = sorted(
+        n for n in (_extract_line_number_from_key(k) for k in all_section_keys) if n is not None
+    )
+
+    chunk_ranges = []
+    for ln in chunk_line_numbers:
+        idx = all_line_numbers.index(ln)
+        end = all_line_numbers[idx + 1] - 1 if idx + 1 < len(all_line_numbers) else 999999
+        chunk_ranges.append((ln, end))
+
+    header, hunks = _parse_diff_hunks(pr_diff)
+    relevant = []
+    for hunk in hunks:
+        h_start, h_end = _hunk_new_line_range(hunk[0])
+        if h_start is None:
+            relevant.append(hunk)
+            continue
+        for r_start, r_end in chunk_ranges:
+            if h_start <= r_end and h_end >= r_start:
+                relevant.append(hunk)
+                break
+
+    if not relevant:
+        return header.rstrip("\n")
+    return header + "".join("".join(h) for h in relevant)
+
+
+def _prepare_translation_prompt(
+    pr_diff, source_sections, target_sections,
+    source_language, target_language, source_mode,
+    glossary_matcher=None, chunk_label=None,
+):
+    """Build the AI translation prompt string.
+
+    Returns (prompt, prompt_pr_diff) so callers can reuse the preprocessed diff
+    for enforce_minimal_target_updates.
+    """
     formatted_source_sections = json.dumps(source_sections, ensure_ascii=False, indent=2)
     formatted_target_sections = json.dumps(target_sections, ensure_ascii=False, indent=2)
-    
+
     thread_safe_print(f"   📊 Source sections: {len(source_sections)} sections")
     thread_safe_print(f"   📊 Target sections: {len(target_sections)} sections")
-    
-    # Calculate total content size
-    total_source_chars = sum(len(str(content)) for content in source_sections.values())
-    total_target_chars = sum(len(str(content)) for content in target_sections.values())
+
+    total_source_chars = sum(len(str(c)) for c in source_sections.values())
+    total_target_chars = sum(len(str(c)) for c in target_sections.values())
     thread_safe_print(f"   📏 Content size: Source={total_source_chars:,} chars, Target={total_target_chars:,} chars")
-    
+
     thread_safe_print(f"   🤖 Getting AI translation for {len(source_sections)} sections...")
 
     prompt_pr_diff = preprocess_diff_for_heading_anchor_stability(
         pr_diff, source_language, target_language, source_mode=source_mode
     )
 
-    # Build glossary section for prompt if matcher is provided
     glossary_prompt_section = ""
     glossary_instruction = ""
     if glossary_matcher:
         from glossary import filter_terms_for_content, format_terms_for_prompt
         source_text = '\n'.join(str(v) for v in source_sections.values() if v)
         target_text = '\n'.join(str(v) for v in target_sections.values() if v)
-        matched_terms = filter_terms_for_content(glossary_matcher, source_text, target_text, prompt_pr_diff or '', source_language=source_language)
+        glossary_match_parts = [source_text, target_text, prompt_pr_diff or '']
+        matched_terms = filter_terms_for_content(
+            glossary_matcher,
+            *glossary_match_parts,
+            source_language=source_language,
+        )
         if matched_terms:
             glossary_text = format_terms_for_prompt(matched_terms)
             glossary_prompt_section = f"\n4. {glossary_text}\n"
@@ -521,26 +743,277 @@ Instructions:
 
 Please return the complete updated JSON in the same format as target sections, without any additional explanatory text."""
 
-    # Save prompt to file for reference with target file prefix
-    target_file_prefix = "unknown"
-    if target_file_name:
-        # Use provided target file name
-        target_file_prefix = target_file_name.replace('/', '_').replace('.md', '')
-    elif target_sections:
-        # Try to extract filename from the first section key or content
-        first_key = next(iter(target_sections.keys()), "")
-        if "_" in first_key:
-            # If key contains underscore, it might have target file info
-            parts = first_key.split("_")
-            if len(parts) > 1:
-                target_file_prefix = parts[0]
+    return prompt, prompt_pr_diff
+
+
+def _execute_ai_translation(
+    prompt, ai_client, target_sections, pr_diff,
+    target_file_prefix, prompt_suffix,
+    source_language, target_language,
+):
+    """Send prompt to AI, parse, enforce minimal updates, save, and return result dict."""
+    formatted_source_preview = ""
+    formatted_target_preview = ""
+    try:
+        src_json = json.loads(prompt.split("1. Source sections in")[1].split("\n2. GitHub PR changes")[0].strip().rsplit("\n", 1)[0])
+        formatted_source_preview = json.dumps(src_json, ensure_ascii=False, indent=2)[:500]
+    except Exception:
+        formatted_source_preview = "(preview unavailable)"
+    try:
+        tgt_json = json.loads(prompt.split(f"3. Current target sections in")[1].split("\n4. Glossary")[0].strip().rsplit("\n", 1)[0])
+        formatted_target_preview = json.dumps(tgt_json, ensure_ascii=False, indent=2)[:500]
+    except Exception:
+        formatted_target_preview = "(preview unavailable)"
+
+    thread_safe_print(f"\n   📤 AI Update Prompt ({source_language} → {target_language}):")
+    thread_safe_print(f"   " + "="*80)
+    thread_safe_print(f"   Source Sections: {formatted_source_preview}...")
+    thread_safe_print(f"   PR Diff (first 500 chars): {pr_diff[:500] if pr_diff else '(none)'}...")
+    thread_safe_print(f"   Target Sections: {formatted_target_preview}...")
+    thread_safe_print(f"   " + "="*80)
+
+    try:
+        from main import print_token_estimation
+        print_token_estimation(prompt, f"Document translation ({source_language} → {target_language})")
+    except ImportError:
+        try:
+            import tiktoken
+            enc = tiktoken.get_encoding("cl100k_base")
+            actual_tokens = len(enc.encode(prompt))
+            char_count = len(prompt)
+            thread_safe_print(f"   💰 Document translation ({source_language} → {target_language})")
+            thread_safe_print(f"      📝 Input: {char_count:,} characters")
+            thread_safe_print(f"      🔢 Actual tokens: {actual_tokens:,} (using tiktoken cl100k_base)")
+        except Exception:
+            estimated_tokens = len(prompt) // 4
+            char_count = len(prompt)
+            thread_safe_print(f"   💰 Document translation ({source_language} → {target_language})")
+            thread_safe_print(f"      📝 Input: {char_count:,} characters")
+            thread_safe_print(f"      🔢 Estimated tokens: ~{estimated_tokens:,} (fallback: 4 chars/token approximation)")
+
+    temp_dir = get_temp_output_dir()
+    try:
+        ai_response = ai_client.chat_completion(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+        )
+        thread_safe_print(f"   📝 AI translation response received")
+        thread_safe_print(f"   📋 AI response (first 500 chars): {ai_response[:500]}...")
+
+        result = parse_updated_sections(ai_response)
+        result = enforce_minimal_target_updates(target_sections, result, pr_diff)
+        thread_safe_print(f"   📊 Parsed {len(result)} sections from AI response")
+
+        ai_results_file = os.path.join(
+            temp_dir,
+            f"{target_file_prefix}_updated_sections_from_ai{prompt_suffix}.json",
+        )
+        with open(ai_results_file, 'w', encoding='utf-8') as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+        thread_safe_print(f"   💾 AI results saved to {ai_results_file}")
+        return result
+
+    except Exception as e:
+        thread_safe_print(f"   ❌ AI translation failed: {sanitize_exception_message(e)}")
+        return {}
+
+
+def get_updated_sections_from_ai_chunked(
+    pr_diff,
+    target_sections,
+    source_sections,
+    ai_client,
+    source_language,
+    target_language,
+    target_file_name=None,
+    glossary_matcher=None,
+    dry_run=False,
+    source_mode="",
+    chunk_routing_sections=None,
+):
+    """Translate large section sets chunk by chunk and merge successful chunks.
+
+    Phase 1 builds and saves all prompts (with per-chunk filtered diffs).
+    Phase 2 sends each prompt to AI and collects results.
+    """
+    target_file_prefix = get_target_file_prefix_for_debug(target_file_name, target_sections)
+    routing_sections = chunk_routing_sections or source_sections
+    chunks = build_translation_chunks(routing_sections, target_sections)
+    total_chunks = len(chunks)
+    all_section_keys = list(source_sections.keys())
+
+    thread_safe_print(
+        f"   🧩 Chunk mode enabled: {len(source_sections)} sections split into {total_chunks} chunks"
+    )
+
+    # ------------------------------------------------------------------
+    # Phase 1: Build and save all prompts
+    # ------------------------------------------------------------------
+    prepared = []
+    temp_dir = get_temp_output_dir()
+    for chunk_index, chunk in enumerate(chunks, 1):
+        chunk_keys = chunk["keys"]
+        chunk_source = {key: source_sections[key] for key in chunk_keys}
+        chunk_target = {
+            key: target_sections[key]
+            for key in chunk_keys
+            if key in target_sections
+        }
+        chunk_diff = filter_diff_for_chunk_sections(pr_diff, chunk_keys, all_section_keys)
+        section_summary = summarize_chunk_sections(chunk_keys, routing_sections)
+        chunk_label = f"part-{chunk_index:03d}"
+
+        thread_safe_print(
+            f"   🧩 Building prompt for chunk {chunk_index}/{total_chunks}: "
+            f"{len(chunk_keys)} {chunk['type']} section(s) ({section_summary})"
+        )
+
+        prompt, prompt_pr_diff = _prepare_translation_prompt(
+            chunk_diff, chunk_source, chunk_target,
+            source_language, target_language, source_mode,
+            glossary_matcher=glossary_matcher,
+            chunk_label=chunk_label,
+        )
+
+        prompt_file = os.path.join(
+            temp_dir,
+            f"{target_file_prefix}_prompt-for-ai-translation.{chunk_label}.txt",
+        )
+        with open(prompt_file, 'w', encoding='utf-8') as f:
+            f.write(prompt)
+        thread_safe_print(f"   💾 Prompt saved to {prompt_file} ({len(prompt):,} chars)")
+
+        prepared.append({
+            "index": chunk_index,
+            "keys": chunk_keys,
+            "type": chunk["type"],
+            "prompt": prompt,
+            "chunk_diff": chunk_diff,
+            "chunk_target": chunk_target,
+            "section_summary": section_summary,
+            "chunk_label": chunk_label,
+        })
+
+    thread_safe_print(
+        f"\n   📝 All {total_chunks} chunk prompts generated. "
+        + ("Dry-run: skipping AI calls." if dry_run else "Starting AI translation...")
+    )
+
+    if dry_run:
+        return TranslationResult()
+
+    # ------------------------------------------------------------------
+    # Phase 2: Send each prompt to AI and collect results
+    # ------------------------------------------------------------------
+    merged_result = TranslationResult()
+    failures = []
+
+    for cp in prepared:
+        chunk_index = cp["index"]
+        thread_safe_print(
+            f"\n   🤖 Sending chunk {chunk_index}/{total_chunks} to AI "
+            f"({cp['section_summary']})"
+        )
+
+        chunk_result = _execute_ai_translation(
+            cp["prompt"],
+            ai_client,
+            cp["chunk_target"],
+            cp["chunk_diff"],
+            target_file_prefix,
+            f".{cp['chunk_label']}",
+            source_language,
+            target_language,
+        )
+
+        if not chunk_result:
+            failures.append(
+                f"failed to translate chunk {chunk_index}/{total_chunks} "
+                f"(sections: {cp['section_summary']})"
+            )
+            continue
+
+        merged_result.update(chunk_result)
+        missing_keys = [key for key in cp["keys"] if key not in chunk_result]
+        if missing_keys:
+            missing_summary = summarize_chunk_sections(missing_keys, routing_sections)
+            failures.append(
+                f"failed to translate chunk {chunk_index}/{total_chunks} "
+                f"(missing sections: {missing_summary})"
+            )
+
+    merged_result.failures = failures
+
+    ai_results_file = os.path.join(temp_dir, f"{target_file_prefix}_updated_sections_from_ai.json")
+    with open(ai_results_file, 'w', encoding='utf-8') as f:
+        json.dump(merged_result, f, ensure_ascii=False, indent=2)
+    thread_safe_print(f"   💾 Merged AI chunk results saved to {ai_results_file}")
+
+    if failures:
+        thread_safe_print(f"   ⚠️  Chunk translation completed with {len(failures)} failure(s)")
+        for failure in failures:
+            thread_safe_print(f"      ❌ {failure}")
+
+    return merged_result
+
+
+def get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_dict, ai_client, source_language, target_language, target_file_name=None, glossary_matcher=None, dry_run=False, source_mode="", _disable_chunking=False, _chunk_label=None, _chunk_routing_content_dict=None):
+    """Use AI to update target sections based on source old content, PR diff, and target sections"""
+    if not source_old_content_dict or not target_sections:
+        return {}
     
-    # Ensure temp_output directory exists
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    temp_dir = os.path.join(script_dir, "temp_output")
-    os.makedirs(temp_dir, exist_ok=True)
+    # Filter out deleted sections and prepare source sections from old content
+    source_sections = {}
+    for key, old_content in source_old_content_dict.items():
+        # Skip deleted sections
+        if 'deleted' in key:
+            continue
+        
+        # Handle null values by using empty string
+        content = old_content if old_content is not None else ""
+        source_sections[key] = content
+
+    if _chunk_routing_content_dict:
+        routing_sections = {
+            key: _chunk_routing_content_dict.get(key, source_sections[key])
+            for key in source_sections
+        }
+    else:
+        routing_sections = source_sections
+
+    if not _disable_chunking:
+        use_chunk_mode, total_source_tokens = should_use_translation_chunk_mode(routing_sections)
+        thread_safe_print(
+            f"   🔢 Source new_content tokens for translation routing: ~{total_source_tokens:,}"
+        )
+        if use_chunk_mode:
+            return get_updated_sections_from_ai_chunked(
+                pr_diff,
+                target_sections,
+                source_sections,
+                ai_client,
+                source_language,
+                target_language,
+                target_file_name,
+                glossary_matcher=glossary_matcher,
+                dry_run=dry_run,
+                source_mode=source_mode,
+                chunk_routing_sections=routing_sections,
+            )
+
+    prompt, prompt_pr_diff = _prepare_translation_prompt(
+        pr_diff, source_sections, target_sections,
+        source_language, target_language, source_mode,
+        glossary_matcher=glossary_matcher,
+        chunk_label=_chunk_label,
+    )
+
+    # Save prompt to file for reference
+    target_file_prefix = get_target_file_prefix_for_debug(target_file_name, target_sections)
+    temp_dir = get_temp_output_dir()
     
-    prompt_file = os.path.join(temp_dir, f"{target_file_prefix}_prompt-for-ai-translation.txt")
+    prompt_suffix = f".{_chunk_label}" if _chunk_label else ""
+    prompt_file = os.path.join(temp_dir, f"{target_file_prefix}_prompt-for-ai-translation{prompt_suffix}.txt")
     with open(prompt_file, 'w', encoding='utf-8') as f:
         f.write(prompt)
     
@@ -555,58 +1028,11 @@ Please return the complete updated JSON in the same format as target sections, w
 
     thread_safe_print(f"🤖 Sending prompt to AI...")
 
-    thread_safe_print(f"\n   📤 AI Update Prompt ({source_language} → {target_language}):")
-    thread_safe_print(f"   " + "="*80)
-    thread_safe_print(f"   Source Sections: {formatted_source_sections[:500]}...")
-    thread_safe_print(f"   PR Diff (first 500 chars): {prompt_pr_diff[:500]}...")
-    thread_safe_print(f"   Target Sections: {formatted_target_sections[:500]}...")
-    thread_safe_print(f"   " + "="*80)
-
-    try:
-        from main import print_token_estimation
-        print_token_estimation(prompt, f"Document translation ({source_language} → {target_language})")
-    except ImportError:
-        # Fallback if import fails - use tiktoken
-        try:
-            import tiktoken
-            enc = tiktoken.get_encoding("cl100k_base")
-            tokens = enc.encode(prompt)
-            actual_tokens = len(tokens)
-            char_count = len(prompt)
-            thread_safe_print(f"   💰 Document translation ({source_language} → {target_language})")
-            thread_safe_print(f"      📝 Input: {char_count:,} characters")
-            thread_safe_print(f"      🔢 Actual tokens: {actual_tokens:,} (using tiktoken cl100k_base)")
-        except Exception:
-            # Final fallback to character approximation
-            estimated_tokens = len(prompt) // 4
-            char_count = len(prompt)
-            thread_safe_print(f"   💰 Document translation ({source_language} → {target_language})")
-            thread_safe_print(f"      📝 Input: {char_count:,} characters")
-            thread_safe_print(f"      🔢 Estimated tokens: ~{estimated_tokens:,} (fallback: 4 chars/token approximation)")
-    
-    try:
-        ai_response = ai_client.chat_completion(
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1
-        )
-        thread_safe_print(f"   📝 AI translation response received")
-        thread_safe_print(f"   📋 AI response (first 500 chars): {ai_response[:500]}...")
-        
-        result = parse_updated_sections(ai_response)
-        result = enforce_minimal_target_updates(target_sections, result, pr_diff)
-        thread_safe_print(f"   📊 Parsed {len(result)} sections from AI response")
-        
-        # Save AI results to file with target file prefix
-        ai_results_file = os.path.join(temp_dir, f"{target_file_prefix}_updated_sections_from_ai.json")
-        with open(ai_results_file, 'w', encoding='utf-8') as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
-        
-        thread_safe_print(f"   💾 AI results saved to {ai_results_file}")
-        return result
-        
-    except Exception as e:
-        thread_safe_print(f"   ❌ AI translation failed: {sanitize_exception_message(e)}")
-        return {}
+    return _execute_ai_translation(
+        prompt, ai_client, target_sections, pr_diff,
+        target_file_prefix, prompt_suffix,
+        source_language, target_language,
+    )
 
 def parse_updated_sections(ai_response):
     """Parse AI response and extract JSON (from get-updated-target-sections.py)"""
@@ -1316,6 +1742,7 @@ def process_single_file(file_path, source_sections, pr_diff, source_context_or_p
                 from collections import OrderedDict
                 target_sections = OrderedDict()
                 source_old_content_dict = OrderedDict()
+                source_routing_content_dict = OrderedDict()
                 
                 # Process in the exact order they appear in enhanced_sections (which comes from match_source_diff_to_target.json)
                 for key, section_info in enhanced_sections.items():
@@ -1331,6 +1758,7 @@ def process_single_file(file_path, source_sections, pr_diff, source_context_or_p
                             source_content = section_info.get('source_new_content', '')
                         else:  # modified
                             source_content = section_info.get('source_old_content', '')
+                        routing_content = section_info.get('source_new_content', source_content)
                         
                         # For target sections: use target_content for modified, empty string for added
                         if operation == 'added':
@@ -1341,19 +1769,40 @@ def process_single_file(file_path, source_sections, pr_diff, source_context_or_p
                         # Add to both dictionaries using the same key from match_source_diff_to_target.json
                         if source_content is not None:
                             source_old_content_dict[key] = source_content
+                        source_routing_content_dict[key] = routing_content if routing_content is not None else source_content
                         target_sections[key] = target_content
                 
                 thread_safe_print(f"   [{thread_id}] 📊 Extracted: {len(target_sections)} target sections, {len(source_old_content_dict)} source old content entries")
                 
                 # Update sections with AI (get-updated-target-sections.py logic)
                 thread_safe_print(f"   [{thread_id}] 🤖 Getting updated sections from AI...")
-                updated_sections = get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_dict, ai_client, repo_config['source_language'], repo_config['target_language'], file_path, glossary_matcher=glossary_matcher, dry_run=dry_run, source_mode=source_mode)
+                updated_sections = get_updated_sections_from_ai(
+                    pr_diff,
+                    target_sections,
+                    source_old_content_dict,
+                    ai_client,
+                    repo_config['source_language'],
+                    repo_config['target_language'],
+                    file_path,
+                    glossary_matcher=glossary_matcher,
+                    dry_run=dry_run,
+                    source_mode=source_mode,
+                    _chunk_routing_content_dict=source_routing_content_dict,
+                )
                 if dry_run:
                     thread_safe_print(f"   [{thread_id}] ⏸️  Dry-run: prompt saved for {file_path}")
                     return True, {}
                 if not updated_sections:
                     thread_safe_print(f"   [{thread_id}] ⚠️  Could not get AI update")
+                    chunk_failures = getattr(updated_sections, "failures", [])
+                    if chunk_failures:
+                        return False, "; ".join(chunk_failures)
                     return False, f"Could not get AI update for {file_path}"
+
+                chunk_failures = getattr(updated_sections, "failures", [])
+                if chunk_failures:
+                    thread_safe_print(f"   [{thread_id}] ⚠️  Skipping file update due to chunk translation failures")
+                    return False, "; ".join(chunk_failures)
 
                 # Return the AI results for further processing
                 thread_safe_print(f"   [{thread_id}] ✅ Successfully got AI translation results for {file_path}")
@@ -1507,6 +1956,7 @@ def process_single_file(file_path, source_sections, pr_diff, source_context_or_p
         # Extract source old content from the enhanced data structure
         thread_safe_print(f"   [{thread_id}] 📖 Extracting source old content...")
         source_old_content_dict = {}
+        source_routing_content_dict = {}
         
         # Handle different data structures for source_sections
         if isinstance(source_sections, dict) and 'sections' in source_sections:
@@ -1514,6 +1964,9 @@ def process_single_file(file_path, source_sections, pr_diff, source_context_or_p
             for key, section_info in source_sections.items():
                 if isinstance(section_info, dict) and 'source_old_content' in section_info:
                     source_old_content_dict[key] = section_info['source_old_content']
+                    source_routing_content_dict[key] = section_info.get(
+                        'source_new_content', section_info['source_old_content']
+                    )
         else:
             # Fallback: if we don't have the enhanced structure, we need to get it differently
             thread_safe_print(f"   [{thread_id}] ⚠️  Source sections missing enhanced structure, using fallback")
@@ -1522,13 +1975,26 @@ def process_single_file(file_path, source_sections, pr_diff, source_context_or_p
         
         # Update sections with AI (get-updated-target-sections.py logic)
         thread_safe_print(f"   [{thread_id}] 🤖 Getting updated sections from AI...")
-        updated_sections = get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_dict, ai_client, repo_config['source_language'], repo_config['target_language'], file_path, glossary_matcher=glossary_matcher, dry_run=dry_run, source_mode=source_mode)
+        updated_sections = get_updated_sections_from_ai(
+            pr_diff, target_sections, source_old_content_dict, ai_client,
+            repo_config['source_language'], repo_config['target_language'], file_path,
+            glossary_matcher=glossary_matcher, dry_run=dry_run, source_mode=source_mode,
+            _chunk_routing_content_dict=source_routing_content_dict or None,
+        )
         if dry_run:
             thread_safe_print(f"   [{thread_id}] ⏸️  Dry-run: prompt saved for {file_path}")
             return True, {}
         if not updated_sections:
             thread_safe_print(f"   [{thread_id}] ⚠️  Could not get AI update")
+            chunk_failures = getattr(updated_sections, "failures", [])
+            if chunk_failures:
+                return False, "; ".join(chunk_failures)
             return False, f"Could not get AI update for {file_path}"
+
+        chunk_failures = getattr(updated_sections, "failures", [])
+        if chunk_failures:
+            thread_safe_print(f"   [{thread_id}] ⚠️  Skipping file update due to chunk translation failures")
+            return False, "; ".join(chunk_failures)
         
         # Update local document (update-target-doc-v2.py logic)
         thread_safe_print(f"   [{thread_id}] 💾 Updating local document...")

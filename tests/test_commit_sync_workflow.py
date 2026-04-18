@@ -160,6 +160,48 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
             {"guide.md": "# Guide\n\nNew content\n"},
         )
 
+    def test_process_modified_file_reports_regular_file_failure_reason(self):
+        pr_diff = "\n".join(
+            [
+                "File: guide.md",
+                "@@ -1,1 +1,1 @@",
+                "-Old",
+                "+New",
+                "-" * 80,
+            ]
+        )
+        failure_reason = "Target file guide.md is missing or could not map 1 modified source section(s)"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "guide.md").write_text("# Guide\n", encoding="utf-8")
+
+            with mock.patch.object(
+                workflow,
+                "process_regular_modified_file",
+                return_value=(False, failure_reason),
+            ) as process_regular_modified_file:
+                result = workflow._process_commit_modified_file(
+                    "guide.md",
+                    {},
+                    pr_diff,
+                    {"mode": "commit", "source_repo": "acme/docs", "base_ref": "base", "head_ref": "head", "changed_files": []},
+                    object(),
+                    object(),
+                    {
+                        "target_repo": "acme/docs",
+                        "target_local_path": tmpdir,
+                        "prefer_local_target_for_read": True,
+                        "source_language": "English",
+                        "target_language": "Chinese",
+                        "ignore_files": [],
+                    },
+                    None,
+                )
+
+        self.assertEqual(result["status"], "failure")
+        self.assertEqual(result["reason"], failure_reason)
+        process_regular_modified_file.assert_called_once()
+
     def test_translation_stats_writes_failure_report(self):
         stats = workflow.TranslationStats()
         stats.mark_failure("cloud.md", "Matcher failed")

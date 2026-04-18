@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -11,13 +12,32 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from file_updater import (
+    TranslationResult,
     build_heading_anchor_slug,
+    build_translation_chunks,
+    get_updated_sections_from_ai,
     preprocess_diff_for_heading_anchor_stability,
     update_target_document_from_match_data,
 )
 
 
 class FileUpdaterRegressionTest(unittest.TestCase):
+    def _cleanup_chunk_test_outputs(self, prefix):
+        temp_dir = SCRIPTS_DIR / "temp_output"
+        for path in temp_dir.glob(f"{prefix}_*"):
+            path.unlink()
+
+    def _build_system_sections(self, count, term_prefix=""):
+        source_sections = {}
+        target_sections = {}
+        for index in range(1, count + 1):
+            key = f"modified_{index}"
+            name = f"tidb_chunk_test_{index:03d}"
+            term = f" {term_prefix}{index}" if term_prefix else ""
+            source_sections[key] = f"### `{name}`\n\nOld English content{term}.\n"
+            target_sections[key] = f"### `{name}`\n\n旧中文内容{index}。\n"
+        return source_sections, target_sections
+
     def test_build_heading_anchor_slug_keeps_visible_text_inside_span(self):
         heading = '`txn-entry-size-limit` <span class="version-mark">New in v4.0.10 and v5.0.0</span>'
         slug = build_heading_anchor_slug(heading)
@@ -288,6 +308,169 @@ class FileUpdaterRegressionTest(unittest.TestCase):
             updated_content = target_file.read_text(encoding="utf-8")
             self.assertTrue(updated_content.endswith("New content\n"))
             self.assertFalse(updated_content.endswith("New content\n\n"))
+
+    def test_large_system_sections_are_translated_in_chunks_and_merged(self):
+        class FakeAIClient:
+            def __init__(self):
+                self.prompts = []
+
+            def chat_completion(self, messages, temperature=0.1):
+                prompt = messages[0]["content"]
+                self.prompts.append(prompt)
+                keys = list(dict.fromkeys(re.findall(r'"(modified_\d+)"\s*:', prompt)))
+                return json.dumps({key: f"translated {key}" for key in keys})
+
+        prefix = "chunk-test-unit"
+        self._cleanup_chunk_test_outputs(prefix)
+        try:
+            source_sections, target_sections = self._build_system_sections(25)
+            ai_client = FakeAIClient()
+
+            result = get_updated_sections_from_ai(
+                "File: system-variables.md\n@@ -1,1 +1,1 @@",
+                target_sections,
+                source_sections,
+                ai_client,
+                "English",
+                "Chinese",
+                "chunk-test-unit.md",
+            )
+
+            self.assertIsInstance(result, TranslationResult)
+            self.assertEqual(len(ai_client.prompts), 2)
+            self.assertEqual(set(result.keys()), set(source_sections.keys()))
+            self.assertFalse(result.failures)
+
+            temp_dir = SCRIPTS_DIR / "temp_output"
+            self.assertTrue((temp_dir / f"{prefix}_updated_sections_from_ai.part-001.json").exists())
+            self.assertTrue((temp_dir / f"{prefix}_updated_sections_from_ai.part-002.json").exists())
+            merged_file = temp_dir / f"{prefix}_updated_sections_from_ai.json"
+            self.assertTrue(merged_file.exists())
+            merged = json.loads(merged_file.read_text(encoding="utf-8"))
+            self.assertEqual(set(merged.keys()), set(source_sections.keys()))
+        finally:
+            self._cleanup_chunk_test_outputs(prefix)
+
+    def test_translation_chunks_use_character_budget(self):
+        source_sections = {
+            "modified_1": "x" * 60,
+            "modified_2": "x" * 60,
+            "modified_3": "x" * 20,
+        }
+
+        with mock.patch("file_updater.TRANSLATION_CHUNK_MAX_SECTIONS", 20), mock.patch(
+            "file_updater.TRANSLATION_CHUNK_CHAR_LIMIT",
+            100,
+        ):
+            chunks = build_translation_chunks(source_sections)
+
+        self.assertEqual([chunk["keys"] for chunk in chunks], [["modified_1"], ["modified_2", "modified_3"]])
+
+    def test_translation_chunks_include_target_content_in_character_budget(self):
+        source_sections = {
+            "modified_1": "x" * 40,
+            "modified_2": "x" * 40,
+            "modified_3": "x" * 20,
+        }
+        target_sections = {
+            "modified_1": "y" * 20,
+            "modified_2": "y" * 20,
+            "modified_3": "y" * 10,
+        }
+
+        with mock.patch("file_updater.TRANSLATION_CHUNK_MAX_SECTIONS", 20), mock.patch(
+            "file_updater.TRANSLATION_CHUNK_CHAR_LIMIT",
+            100,
+        ):
+            chunks = build_translation_chunks(source_sections, target_sections)
+
+        self.assertEqual([chunk["keys"] for chunk in chunks], [["modified_1"], ["modified_2", "modified_3"]])
+
+    def test_chunk_glossary_matching_uses_chunk_filtered_diff(self):
+        class FakeAIClient:
+            def __init__(self):
+                self.prompts = []
+
+            def chat_completion(self, messages, temperature=0.1):
+                prompt = messages[0]["content"]
+                self.prompts.append(prompt)
+                keys = list(dict.fromkeys(re.findall(r'"(modified_\d+)"\s*:', prompt)))
+                return json.dumps({key: f"translated {key}" for key in keys})
+
+        prefix = "chunk-glossary-unit"
+        self._cleanup_chunk_test_outputs(prefix)
+        try:
+            source_sections, target_sections = self._build_system_sections(25)
+            seen_glossary_inputs = []
+
+            def glossary_matcher(text, source_language=None):
+                seen_glossary_inputs.append(text)
+                return []
+
+            get_updated_sections_from_ai(
+                "\n".join([
+                    "File: system-variables.md",
+                    "@@ -1,3 +1,3 @@",
+                    "-old content 1",
+                    "+ChunkDiffOnlyTerm1",
+                    " context",
+                    "@@ -25,3 +25,3 @@",
+                    "-old content 25",
+                    "+ChunkDiffOnlyTerm25",
+                    " context",
+                ]),
+                target_sections,
+                source_sections,
+                FakeAIClient(),
+                "English",
+                "Chinese",
+                "chunk-glossary-unit.md",
+                glossary_matcher=glossary_matcher,
+            )
+
+            self.assertEqual(len(seen_glossary_inputs), 2)
+            self.assertIn("ChunkDiffOnlyTerm1", seen_glossary_inputs[0])
+            self.assertNotIn("ChunkDiffOnlyTerm25", seen_glossary_inputs[0])
+            self.assertIn("ChunkDiffOnlyTerm25", seen_glossary_inputs[1])
+            self.assertNotIn("ChunkDiffOnlyTerm1", seen_glossary_inputs[1])
+        finally:
+            self._cleanup_chunk_test_outputs(prefix)
+
+    def test_chunk_failure_is_attached_to_translation_result(self):
+        class FakeAIClient:
+            def __init__(self):
+                self.prompts = []
+
+            def chat_completion(self, messages, temperature=0.1):
+                prompt = messages[0]["content"]
+                self.prompts.append(prompt)
+                if len(self.prompts) == 2:
+                    return "not json"
+                keys = list(dict.fromkeys(re.findall(r'"(modified_\d+)"\s*:', prompt)))
+                return json.dumps({key: f"translated {key}" for key in keys})
+
+        prefix = "chunk-failure-unit"
+        self._cleanup_chunk_test_outputs(prefix)
+        try:
+            source_sections, target_sections = self._build_system_sections(25)
+
+            result = get_updated_sections_from_ai(
+                "File: system-variables.md\n@@ -1,1 +1,1 @@",
+                target_sections,
+                source_sections,
+                FakeAIClient(),
+                "English",
+                "Chinese",
+                "chunk-failure-unit.md",
+            )
+
+            self.assertIsInstance(result, TranslationResult)
+            self.assertEqual(len(result), 20)
+            self.assertEqual(len(result.failures), 1)
+            self.assertIn("failed to translate chunk 2/2", result.failures[0])
+            self.assertIn("tidb_chunk_test_021", result.failures[0])
+        finally:
+            self._cleanup_chunk_test_outputs(prefix)
 
 
 if __name__ == "__main__":

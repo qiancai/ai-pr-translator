@@ -6,6 +6,7 @@ Orchestrates the entire auto-sync workflow in GitHub Actions environment
 import sys
 import os
 import json
+import re
 import subprocess
 import tiktoken
 from github import Github, Auth
@@ -226,6 +227,60 @@ def check_source_token_limit(source_diff_dict_file, token_limit=SOURCE_TOKEN_LIM
         )
         return True, 0, 0  # Allow processing on error to avoid blocking
 
+
+def extract_source_diff_section_title(section_data):
+    """Return a compact source section title for failure reports."""
+    for field in ("new_content", "old_content"):
+        content = section_data.get(field) or ""
+        for line in str(content).splitlines():
+            stripped = line.strip()
+            if re.match(r'^#{1,10}\s+\S', stripped):
+                return re.sub(r'^#{1,10}\s+', '', stripped).strip()
+
+    hierarchy = section_data.get("original_hierarchy", "")
+    if hierarchy:
+        leaf = hierarchy.split(" > ")[-1]
+        return re.sub(r'^#{1,10}\s+', '', leaf.strip()).strip()
+
+    return "(unknown section)"
+
+
+def get_unmatched_modified_source_sections(source_diff_dict, matched_sections):
+    """Find modified source sections that could not be mapped to target sections."""
+    matched_keys = set(matched_sections or {})
+    missing = []
+
+    for key, section_data in source_diff_dict.items():
+        if section_data.get("operation") != "modified":
+            continue
+        if key in matched_keys:
+            continue
+
+        missing.append(
+            {
+                "key": key,
+                "line": section_data.get("new_line_number", "?"),
+                "title": extract_source_diff_section_title(section_data),
+            }
+        )
+
+    return missing
+
+
+def format_unmatched_modified_sections_failure(file_path, missing_sections):
+    """Build a one-line reason suitable for translation failure reports."""
+    details = "; ".join(
+        f"{item['key']} (source line {item['line']}): {item['title']}"
+        for item in missing_sections
+    )
+    return (
+        f"Target file {file_path} is missing or could not map "
+        f"{len(missing_sections)} modified source section(s), so translation was skipped. "
+        f"Missing sections: {details}. "
+        "Please add or sync these sections in the target branch first, then rerun translation for this file."
+    )
+
+
 def get_pr_diff(pr_url, github_client):
     """Get the diff content from a GitHub PR (from auto-sync-pr-changes.py)"""
     try:
@@ -363,8 +418,13 @@ def determine_file_processing_type(source_file_path, file_sections, special_file
     # For all other modified files, use regular processing
     return "regular_modified"
 
-def process_regular_modified_file(source_file_path, file_sections, file_diff, source_context_or_pr_url, github_client, ai_client, repo_config, max_sections, glossary_matcher=None):
+def process_regular_modified_file(source_file_path, file_sections, file_diff, source_context_or_pr_url, github_client, ai_client, repo_config, max_sections, glossary_matcher=None, return_details=False):
     """Process a regular markdown file that has been modified"""
+    def finish(success, reason=""):
+        if return_details:
+            return success, reason
+        return success
+
     try:
         thread_safe_print(f"   📝 Processing as regular modified file: {source_file_path}")
         
@@ -400,11 +460,14 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, so
                 thread_safe_print(f"   🚫 Skipping file processing: source content exceeds token limit")
                 thread_safe_print(f"      📊 Total tokens: {total_tokens:,} > Limit: {token_limit:,}")
                 thread_safe_print(f"      ⏭️  File {source_file_path} will not be processed")
-                return False
+                return finish(
+                    False,
+                    f"Source content exceeds token limit ({total_tokens:,} > {token_limit:,})",
+                )
                 
         else:
             thread_safe_print(f"   ❌ {source_diff_dict_file} not found")
-            return False
+            return finish(False, f"{source_diff_dict_file} not found")
         
         # Get target file hierarchy and content
         target_repo = repo_config['target_repo']
@@ -419,7 +482,7 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, so
         
         if not target_hierarchy or not target_lines:
             thread_safe_print(f"   ❌ Could not get target file content for {source_file_path}")
-            return False
+            return finish(False, f"Could not get target file content for {source_file_path}")
         
         thread_safe_print(f"   📖 Target file: {len(target_hierarchy)} sections, {len(target_lines)} lines")
         
@@ -437,7 +500,7 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, so
         
         if not enhanced_sections:
             thread_safe_print(f"   ❌ No sections matched")
-            return False
+            return finish(False, "No sections matched")
         
         thread_safe_print(f"   ✅ Matched {len(enhanced_sections)} sections")
         
@@ -446,6 +509,25 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, so
         with open(match_file, 'w', encoding='utf-8') as f:
             json.dump(enhanced_sections, f, ensure_ascii=False, indent=2)
         thread_safe_print(f"   💾 Saved match result to: {match_file}")
+
+        missing_modified_sections = get_unmatched_modified_source_sections(
+            source_diff_dict,
+            enhanced_sections,
+        )
+        if missing_modified_sections:
+            failure_reason = format_unmatched_modified_sections_failure(
+                source_file_path,
+                missing_modified_sections,
+            )
+            thread_safe_print(
+                f"   ❌ Skipping {source_file_path}: "
+                f"{len(missing_modified_sections)} modified source section(s) were not found in target"
+            )
+            for item in missing_modified_sections:
+                thread_safe_print(
+                    f"      - {item['key']} (source line {item['line']}): {item['title']}"
+                )
+            return finish(False, failure_reason)
         
         # Step 2: Get AI translation for the matched sections
         thread_safe_print(f"   🤖 Getting AI translation for matched sections...")
@@ -494,6 +576,12 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, so
                 
                 thread_safe_print(f"   ✅ Updated {updated_count} sections with AI translations in {match_file}")
                 
+                # Abort before writing if any chunk translations failed
+                chunk_failures = getattr(ai_updated_sections, "failures", [])
+                if chunk_failures:
+                    thread_safe_print(f"   ⚠️  Skipping file update due to chunk translation failures")
+                    return finish(False, "; ".join(chunk_failures))
+
                 # Step 4: Apply updates to target document using update_target_document_from_match_data
                 thread_safe_print(f"   📝 Step 4: Applying updates to target document...")
                 from file_updater import update_target_document_from_match_data
@@ -501,23 +589,26 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, so
                 success = update_target_document_from_match_data(match_file, repo_config['target_local_path'], source_file_path)
                 if success:
                     thread_safe_print(f"   🎉 Target document successfully updated!")
-                    return True
+                    return finish(True)
                 else:
                     thread_safe_print(f"   ❌ Failed to update target document")
-                    return False
+                    return finish(False, f"Failed to update target document for {source_file_path}")
                     
             else:
                 thread_safe_print(f"   ⚠️  AI translation failed or returned invalid results")
-                return False
+                failure_reason = "AI translation failed or returned invalid results"
+                if hasattr(ai_updated_sections, "failures") and ai_updated_sections.failures:
+                    failure_reason = "; ".join(ai_updated_sections.failures)
+                return finish(False, failure_reason)
         else:
             thread_safe_print(f"   ⚠️  No results from process_modified_sections")
-            return False
+            return finish(False, "No results from process_modified_sections")
         
     except Exception as e:
         thread_safe_print(
             f"   ❌ Error processing regular modified file {source_file_path}: {sanitize_exception_message(e)}"
         )
-        return False
+        return finish(False, f"Error processing regular modified file {source_file_path}: {sanitize_exception_message(e)}")
 
 
 def _process_single_modified_file_for_pr(
@@ -552,7 +643,7 @@ def _process_single_modified_file_for_pr(
     if file_type != "regular_modified":
         return make_task_result("failure", f"Unknown file processing type: {file_type}")
 
-    success = process_regular_modified_file(
+    success, failure_reason = process_regular_modified_file(
         source_file_path,
         file_sections,
         file_specific_diff,
@@ -562,10 +653,14 @@ def _process_single_modified_file_for_pr(
         repo_config,
         MAX_NON_SYSTEM_SECTIONS_FOR_AI,
         glossary_matcher=glossary_matcher,
+        return_details=True,
     )
     if success:
         return make_task_result("success")
-    return make_task_result("failure", "Regular modified file processor returned failure")
+    return make_task_result(
+        "failure",
+        failure_reason or "Regular modified file processor returned failure",
+    )
 
 
 def is_under_exclude_folder(file_path, folder_name):

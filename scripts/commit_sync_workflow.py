@@ -233,7 +233,7 @@ def _process_commit_modified_file(
     if file_type != "regular_modified":
         return make_task_result("failure", f"Unknown file processing type: {file_type}")
 
-    success = process_regular_modified_file(
+    success, failure_reason = process_regular_modified_file(
         source_file_path,
         file_sections,
         file_specific_diff,
@@ -243,10 +243,14 @@ def _process_commit_modified_file(
         repo_config,
         MAX_NON_SYSTEM_SECTIONS_FOR_AI,
         glossary_matcher=glossary_matcher,
+        return_details=True,
     )
     if success:
         return make_task_result("success")
-    return make_task_result("failure", "Regular modified file processor returned failure")
+    return make_task_result(
+        "failure",
+        failure_reason or "Regular modified file processor returned failure",
+    )
 
 
 def get_commit_repo_config():

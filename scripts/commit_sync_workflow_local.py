@@ -47,11 +47,11 @@ TEST_CONFIGS = {
         "SOURCE_REPO": "pingcap/docs",
         "TARGET_REPO": "pingcap/docs",
         # Set SOURCE_BASE_REF from latest_translation_commit.json and SOURCE_HEAD_REF from release-8.5 HEAD.
-        "SOURCE_BASE_REF": "014b06961a702d1be56f5aeaaed77b4dfc28e025",
-        "SOURCE_HEAD_REF": "ecd31cc2c25ad6715af68d05794da89265cfe4d8",
+        "SOURCE_BASE_REF": "0205ededf901476ea31dcd603f21ab9c9bed3f0d",
+        "SOURCE_HEAD_REF": "68fed3b6508cb56dc77800008c1d13ef40b1a8a6", # #ecd31cc2c25ad6715af68d05794da89265cfe4d8
         # Keep SOURCE_FOLDER empty. Put resolved Cloud TOC-scoped files here.
         "SOURCE_FOLDER": "", ## Leave this field empty when translating cloud docs.
-        "SOURCE_FILES": "TOC-tidb-cloud.md",
+        "SOURCE_FILES": "system-variables.md",
         "AUTO_RESOLVE_CLOUD_SOURCE_FILES": True,
         "CLOUD_TOC_FILES": (
             "TOC-tidb-cloud.md,"

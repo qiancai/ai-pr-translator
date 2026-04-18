@@ -1,4 +1,6 @@
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -84,6 +86,102 @@ class MainWorkflowImageOnlyPrTest(unittest.TestCase):
             fake_github_client,
             repo_config,
         )
+
+
+class MainWorkflowRegressionTest(unittest.TestCase):
+    def test_unmatched_modified_sections_are_formatted_for_failure_report(self):
+        source_diff_dict = {
+            "modified_1102": {
+                "operation": "modified",
+                "new_line_number": 1102,
+                "new_content": "### tidb_analyze_column_options\n\nNew content\n",
+            },
+            "added_1200": {
+                "operation": "added",
+                "new_line_number": 1200,
+                "new_content": "### new_section\n",
+            },
+        }
+
+        missing = main_workflow.get_unmatched_modified_source_sections(
+            source_diff_dict,
+            {"added_1200": {}},
+        )
+        reason = main_workflow.format_unmatched_modified_sections_failure(
+            "system-variables.md",
+            missing,
+        )
+
+        self.assertEqual(len(missing), 1)
+        self.assertEqual(missing[0]["key"], "modified_1102")
+        self.assertEqual(missing[0]["title"], "tidb_analyze_column_options")
+        self.assertIn("system-variables.md", reason)
+        self.assertIn("modified_1102 (source line 1102): tidb_analyze_column_options", reason)
+        self.assertIn("translation was skipped", reason)
+
+    def test_regular_modified_file_skips_translation_when_modified_section_unmatched(self):
+        source_diff_dict = {
+            "modified_10": {
+                "operation": "modified",
+                "new_line_number": 10,
+                "new_content": "### missing_source_section\n\nNew content\n",
+                "old_content": "### missing_source_section\n\nOld content\n",
+                "original_hierarchy": "## Variable reference > ### missing_source_section",
+            },
+            "modified_20": {
+                "operation": "modified",
+                "new_line_number": 20,
+                "new_content": "### matched_source_section\n\nNew content\n",
+                "old_content": "### matched_source_section\n\nOld content\n",
+                "original_hierarchy": "## Variable reference > ### matched_source_section",
+            },
+        }
+        matched_sections = {
+            "modified_20": {
+                "target_line": "20",
+                "target_hierarchy": "## matched_source_section",
+                "target_content": "### matched_source_section\n\n旧内容\n",
+                "source_operation": "modified",
+                "source_old_content": "### matched_source_section\n\nOld content\n",
+                "source_new_content": "### matched_source_section\n\nNew content\n",
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_dir = Path(tmpdir)
+            source_diff_file = temp_dir / "system-variables-source-diff-dict.json"
+            source_diff_file.write_text(
+                json.dumps(source_diff_dict),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(main_workflow, "ensure_temp_output_dir", return_value=tmpdir), \
+                mock.patch.object(main_workflow, "check_source_token_limit", return_value=(True, 10, 50000)), \
+                mock.patch("diff_analyzer.get_target_hierarchy_and_content", return_value=({"20": "## matched_source_section"}, ["### matched_source_section"])), \
+                mock.patch("section_matcher.match_source_diff_to_target", return_value=matched_sections), \
+                mock.patch.object(main_workflow, "process_modified_sections") as process_modified_sections:
+                success, reason = main_workflow.process_regular_modified_file(
+                    "system-variables.md",
+                    {"sections": {"10": "## missing_source_section", "20": "## matched_source_section"}},
+                    "File: system-variables.md\n@@ -10,1 +10,1 @@\n-old\n+new",
+                    {"mode": "commit"},
+                    object(),
+                    object(),
+                    {
+                        "target_repo": "pingcap/docs",
+                        "target_local_path": tmpdir,
+                        "prefer_local_target_for_read": True,
+                        "source_language": "English",
+                        "target_language": "Chinese",
+                    },
+                    120,
+                    return_details=True,
+                )
+
+        self.assertFalse(success)
+        self.assertIn("modified_10", reason)
+        self.assertIn("missing_source_section", reason)
+        process_modified_sections.assert_not_called()
 
 
 if __name__ == "__main__":
