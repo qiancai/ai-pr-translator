@@ -517,6 +517,80 @@ class DiffAnalyzerContextTest(unittest.TestCase):
         self.assertIn("keywords.md", keyword_files)
         self.assertIn("- 苹果", keyword_files["keywords.md"]["tabs_changes"]["A"]["target_old_block"])
 
+    def test_toc_snapshot_sync_is_commit_only(self):
+        patch = "\n".join(
+            [
+                "@@ -1,1 +1,2 @@",
+                " - [Old](/old.md)",
+                "+- [New](/new.md)",
+            ]
+        )
+        changed_file = SimpleNamespace(
+            filename="TOC-test.md",
+            status="modified",
+            patch=patch,
+            previous_filename=None,
+        )
+        repo_configs = {
+            "acme/docs": {
+                "target_repo": "acme/docs-cn",
+                "target_local_path": "/tmp/target",
+                "prefer_local_target_for_read": False,
+                "source_language": "English",
+                "target_language": "Chinese",
+            }
+        }
+        source_repo = FakeRepository(
+            {
+                ("TOC-test.md", "base123"): "- [Old](/old.md)\n",
+                ("TOC-test.md", "head123"): "- [Old](/old.md)\n- [New](/new.md)\n",
+            },
+            FakePR([changed_file], "Update toc", "base123", "head123"),
+            {("base123", "head123"): [changed_file]},
+        )
+        target_repo = FakeRepository(
+            {
+                ("TOC-test.md", "master"): "- [旧](/old.md)\n- [仅目标端](/target-only.md)\n",
+            },
+            FakePR([], "Empty", "base123", "head123"),
+            {},
+        )
+        github = FakeGithub({"acme/docs": source_repo, "acme/docs-cn": target_repo})
+
+        pr_context = build_pr_diff_context("https://github.com/acme/docs/pull/123", github, repo_configs)
+        commit_context = build_commit_diff_context(
+            "acme/docs",
+            "acme/docs-cn",
+            "base123",
+            "head123",
+            github,
+            repo_configs,
+        )
+
+        pr_result = analyze_source_changes(
+            pr_context,
+            github,
+            special_files=["TOC.md", "keywords.md"],
+            ignore_files=[],
+            repo_configs=repo_configs,
+        )
+        commit_result = analyze_source_changes(
+            commit_context,
+            github,
+            special_files=["TOC.md", "keywords.md"],
+            ignore_files=[],
+            repo_configs=repo_configs,
+        )
+
+        pr_toc = pr_result[5]["TOC-test.md"]
+        commit_toc = commit_result[5]["TOC-test.md"]
+
+        self.assertTrue(pr_toc["operations"])
+        self.assertNotIn("source_base_content", pr_toc)
+        self.assertEqual([], commit_toc["operations"])
+        self.assertEqual("- [Old](/old.md)\n", commit_toc["source_base_content"])
+        self.assertEqual("- [Old](/old.md)\n- [New](/new.md)\n", commit_toc["source_head_content"])
+
     def test_local_commit_context_reads_all_changed_files_from_git_diff(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)

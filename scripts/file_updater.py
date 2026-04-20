@@ -1815,7 +1815,15 @@ def process_single_file(file_path, source_sections, pr_diff, source_context_or_p
         # Check if this is a TOC file with special operations
         if isinstance(source_sections, dict) and 'type' in source_sections and source_sections['type'] == 'toc':
             from toc_processor import process_toc_file
-            return process_toc_file(file_path, source_sections, source_context_or_pr_url, github_client, ai_client, repo_config)
+            return process_toc_file(
+                file_path,
+                source_sections,
+                source_context_or_pr_url,
+                github_client,
+                ai_client,
+                repo_config,
+                glossary_matcher=glossary_matcher,
+            )
         
         # Check if this is enhanced sections
         if isinstance(source_sections, dict) and 'sections' in source_sections:

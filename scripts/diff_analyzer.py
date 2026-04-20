@@ -2025,7 +2025,13 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
                     operations['deleted_lines']
                 ])
 
-                if has_toc_diff and source_base_content is not None:
+                use_snapshot_sync = (
+                    source_context.get("mode") == "commit"
+                    and has_toc_diff
+                    and source_base_content is not None
+                )
+
+                if use_snapshot_sync:
                     # Use full source snapshots for TOC files. This handles
                     # unlinked TOC group rows and moved nested sections more
                     # reliably than operation-by-operation insertion.
@@ -2042,7 +2048,18 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
                     print(f"   📋 TOC snapshot sync queued for processing")
                 else:
                     # Fallback to legacy operation-level processing.
-                    toc_results = process_toc_operations(file.filename, operations, source_lines, target_lines, "")  # Local path will be determined later
+                    toc_results = process_toc_operations(
+                        file.filename,
+                        operations,
+                        source_lines,
+                        target_lines,
+                        "",
+                        source_base_lines=(
+                            source_base_content.split('\n')
+                            if source_base_content is not None
+                            else None
+                        ),
+                    )  # Local path will be determined later
 
                     # Store TOC operations for later processing
                     if any([toc_results['added'], toc_results['modified'], toc_results['deleted']]):

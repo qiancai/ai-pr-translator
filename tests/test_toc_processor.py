@@ -8,7 +8,13 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from toc_processor import parse_toc_line, plan_synced_toc_lines, process_toc_file
+from toc_processor import (
+    is_toc_translation_needed,
+    parse_toc_line,
+    plan_synced_toc_lines,
+    process_toc_file,
+    process_toc_operations,
+)
 
 
 class FakeAIClient:
@@ -32,6 +38,21 @@ class FakeAIClient:
         if "Connect AWS DMS to TiDB Cloud]" in prompt:
             translations["line_7"] = "    - [连接 AWS DMS 到 TiDB Cloud](/tidb-cloud/tidb-cloud-connect-aws-dms.md)"
         return json.dumps(translations, ensure_ascii=False)
+
+
+class EmptyAIClient:
+    def chat_completion(self, messages, temperature=0.1):
+        return "{}"
+
+
+class RecordingAIClient:
+    def __init__(self, response):
+        self.response = response
+        self.prompts = []
+
+    def chat_completion(self, messages, temperature=0.1):
+        self.prompts.append(messages[0]["content"])
+        return json.dumps(self.response, ensure_ascii=False)
 
 
 class TocProcessorSnapshotSyncTest(unittest.TestCase):
@@ -65,6 +86,11 @@ class TocProcessorSnapshotSyncTest(unittest.TestCase):
             " ![BETA](/media/tidb-cloud/blank_transparent_placeholder.png)",
         )
 
+    def test_single_word_english_toc_link_still_requires_translation(self):
+        self.assertTrue(is_toc_translation_needed("- [Events](/events.md)"))
+        self.assertTrue(is_toc_translation_needed("- [Overview](/overview.md)"))
+        self.assertFalse(is_toc_translation_needed("- [2024-09-15](/release.md)"))
+
     def test_added_plain_toc_line_is_retranslated_even_when_text_exists_in_base(self):
         planned_lines, lines_to_translate = plan_synced_toc_lines(
             "\n".join(
@@ -93,10 +119,6 @@ class TocProcessorSnapshotSyncTest(unittest.TestCase):
         self.assertEqual(planned_lines[1], "- 甲")
 
     def test_missing_toc_translation_fails_without_writing_source_text(self):
-        class EmptyAIClient:
-            def chat_completion(self, messages, temperature=0.1):
-                return "{}"
-
         with tempfile.TemporaryDirectory() as tmpdir:
             toc_path = Path(tmpdir) / "TOC-tidb-cloud.md"
             toc_path.write_text("- 旧行", encoding="utf-8")
@@ -111,7 +133,7 @@ class TocProcessorSnapshotSyncTest(unittest.TestCase):
                     "source_added_line_numbers": [1],
                 },
                 {},
-                object(),
+                None,
                 EmptyAIClient(),
                 {
                     "target_local_path": tmpdir,
@@ -201,7 +223,7 @@ class TocProcessorSnapshotSyncTest(unittest.TestCase):
                     "source_head_content": source_head,
                 },
                 {},
-                object(),
+                None,
                 FakeAIClient(),
                 {
                     "target_local_path": tmpdir,
@@ -222,6 +244,487 @@ class TocProcessorSnapshotSyncTest(unittest.TestCase):
         self.assertIn("    - [连接 AWS DMS 到 TiDB Cloud](/tidb-cloud/tidb-cloud-connect-aws-dms.md)", result)
         self.assertNotIn("- 管理集群", result)
         self.assertNotIn("使用带有 TiFlash 的 HTAP 集群", result)
+
+    def test_snapshot_glossary_matches_only_changed_toc_lines(self):
+        seen_glossary_inputs = []
+
+        def glossary_matcher(text, source_language=None):
+            seen_glossary_inputs.append((text, source_language))
+            if "Events" in text:
+                return [{"en": "Events", "zh": "事件", "comment": "TOC term"}]
+            return []
+
+        ai_client = RecordingAIClient({"line_0": "- [事件](/events.md)"})
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            toc_path = Path(tmpdir) / "TOC-test.md"
+            toc_path.write_text(
+                "\n".join(
+                    [
+                        "- [旧标题](/events.md)",
+                        "- [稳定项](/stable.md)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            success = process_toc_file(
+                "TOC-test.md",
+                {
+                    "type": "toc",
+                    "operations": [],
+                    "source_base_content": "\n".join(
+                        [
+                            "- [Old Title](/events.md)",
+                            "- [Stable](/stable.md)",
+                        ]
+                    ),
+                    "source_head_content": "\n".join(
+                        [
+                            "- [Events](/events.md)",
+                            "- [Stable](/stable.md)",
+                        ]
+                    ),
+                },
+                {},
+                None,
+                ai_client,
+                {
+                    "target_local_path": tmpdir,
+                    "source_language": "English",
+                    "target_language": "Chinese",
+                },
+                glossary_matcher=glossary_matcher,
+            )
+
+        self.assertTrue(success)
+        self.assertEqual([("- [Events](/events.md)", "English")], seen_glossary_inputs)
+        self.assertEqual(1, len(ai_client.prompts))
+        self.assertIn("| Events | 事件 | TOC term |", ai_client.prompts[0])
+        self.assertNotIn("Stable", ai_client.prompts[0])
+
+
+class TocProcessorOperationLevelTest(unittest.TestCase):
+    def test_added_group_preserves_source_order(self):
+        source_lines = [
+            "- [Old](/old.md)",
+            "- A",
+            "- B",
+        ]
+        target_lines = [
+            "- [旧](/old.md)",
+        ]
+        toc_results = process_toc_operations(
+            "TOC-test.md",
+            {
+                "added_lines": [
+                    {"line_number": 2, "content": "- A", "is_header": False},
+                    {"line_number": 3, "content": "- B", "is_header": False},
+                ],
+                "modified_lines": [],
+                "deleted_lines": [],
+            },
+            source_lines,
+            target_lines,
+            "",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            toc_path = Path(tmpdir) / "TOC-test.md"
+            toc_path.write_text("\n".join(target_lines), encoding="utf-8")
+
+            success = process_toc_file(
+                "TOC-test.md",
+                {
+                    "type": "toc",
+                    "operations": toc_results["added"],
+                },
+                {"mode": "pr"},
+                None,
+                EmptyAIClient(),
+                {
+                    "target_local_path": tmpdir,
+                    "source_language": "English",
+                    "target_language": "Chinese",
+                },
+            )
+
+            result = toc_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertTrue(success)
+        self.assertEqual(["- [旧](/old.md)", "- A", "- B"], result)
+
+    def test_modified_group_updates_each_line_once(self):
+        source_lines = [
+            "- [Anchor](/anchor.md)",
+            "- new1",
+            "- new2",
+        ]
+        target_lines = [
+            "- [锚点](/anchor.md)",
+            "- old1",
+            "- old2",
+        ]
+        toc_results = process_toc_operations(
+            "TOC-test.md",
+            {
+                "added_lines": [],
+                "modified_lines": [
+                    {"line_number": 2, "content": "- new1", "is_header": False},
+                    {"line_number": 3, "content": "- new2", "is_header": False},
+                ],
+                "deleted_lines": [],
+            },
+            source_lines,
+            target_lines,
+            "",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            toc_path = Path(tmpdir) / "TOC-test.md"
+            toc_path.write_text("\n".join(target_lines), encoding="utf-8")
+
+            success = process_toc_file(
+                "TOC-test.md",
+                {
+                    "type": "toc",
+                    "operations": toc_results["modified"],
+                },
+                {"mode": "pr"},
+                None,
+                EmptyAIClient(),
+                {
+                    "target_local_path": tmpdir,
+                    "source_language": "English",
+                    "target_language": "Chinese",
+                },
+            )
+
+            result = toc_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertTrue(success)
+        self.assertEqual(["- [锚点](/anchor.md)", "- new1", "- new2"], result)
+
+    def test_added_group_can_use_next_link_when_immediate_previous_line_has_no_link(self):
+        source_lines = [
+            "## GUIDES",
+            "- Parent Group",
+            "  - [Child](/child.md)",
+            "- [Existing](/existing.md)",
+        ]
+        target_lines = [
+            "## 指南",
+            "- 父分组",
+            "- [已有](/existing.md)",
+        ]
+        toc_results = process_toc_operations(
+            "TOC-test.md",
+            {
+                "added_lines": [
+                    {"line_number": 3, "content": "  - [Child](/child.md)", "is_header": False},
+                ],
+                "modified_lines": [],
+                "deleted_lines": [],
+            },
+            source_lines,
+            target_lines,
+            "",
+        )
+
+        self.assertEqual(1, len(toc_results["added"]))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            toc_path = Path(tmpdir) / "TOC-test.md"
+            toc_path.write_text("\n".join(target_lines), encoding="utf-8")
+
+            success = process_toc_file(
+                "TOC-test.md",
+                {
+                    "type": "toc",
+                    "operations": toc_results["added"],
+                },
+                {"mode": "pr"},
+                None,
+                EmptyAIClient(),
+                {
+                    "target_local_path": tmpdir,
+                    "source_language": "English",
+                    "target_language": "Chinese",
+                },
+            )
+
+            result = toc_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertTrue(success)
+        self.assertEqual(
+            ["## 指南", "- 父分组", "  - [Child](/child.md)", "- [已有](/existing.md)"],
+            result,
+        )
+
+    def test_deleted_plain_group_title_is_removed_using_next_anchor(self):
+        source_base_lines = [
+            "## GUIDES",
+            "- Parent Group",
+            "  - [Child](/child.md)",
+            "- [Existing](/existing.md)",
+        ]
+        source_head_lines = [
+            "## GUIDES",
+            "  - [Child](/child.md)",
+            "- [Existing](/existing.md)",
+        ]
+        target_lines = [
+            "## 指南",
+            "- 父分组",
+            "  - [子项](/child.md)",
+            "- [已有](/existing.md)",
+        ]
+        toc_results = process_toc_operations(
+            "TOC-test.md",
+            {
+                "added_lines": [],
+                "modified_lines": [],
+                "deleted_lines": [
+                    {"line_number": 2, "content": "- Parent Group", "is_header": False},
+                ],
+            },
+            source_head_lines,
+            target_lines,
+            "",
+            source_base_lines=source_base_lines,
+        )
+
+        self.assertEqual([2], [op["target_line"] for op in toc_results["deleted"]])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            toc_path = Path(tmpdir) / "TOC-test.md"
+            toc_path.write_text("\n".join(target_lines), encoding="utf-8")
+
+            success = process_toc_file(
+                "TOC-test.md",
+                {
+                    "type": "toc",
+                    "operations": toc_results["deleted"],
+                },
+                {"mode": "pr"},
+                None,
+                EmptyAIClient(),
+                {
+                    "target_local_path": tmpdir,
+                    "source_language": "English",
+                    "target_language": "Chinese",
+                },
+            )
+
+            result = toc_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertTrue(success)
+        self.assertEqual(["## 指南", "  - [子项](/child.md)", "- [已有](/existing.md)"], result)
+
+    def test_deleted_plain_group_is_skipped_when_target_range_is_ambiguous(self):
+        source_base_lines = [
+            "- [A](/a.md)",
+            "- Parent Group",
+            "- [B](/b.md)",
+        ]
+        source_head_lines = [
+            "- [A](/a.md)",
+            "- [B](/b.md)",
+        ]
+        target_lines = [
+            "- [甲](/a.md)",
+            "- 目标独有章节",
+            "- 父分组",
+            "- [乙](/b.md)",
+        ]
+
+        toc_results = process_toc_operations(
+            "TOC-test.md",
+            {
+                "added_lines": [],
+                "modified_lines": [],
+                "deleted_lines": [
+                    {"line_number": 2, "content": "- Parent Group", "is_header": False},
+                ],
+            },
+            source_head_lines,
+            target_lines,
+            "",
+            source_base_lines=source_base_lines,
+        )
+
+        self.assertEqual([], toc_results["deleted"])
+
+    def test_modified_group_is_skipped_when_target_range_is_ambiguous(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            toc_path = Path(tmpdir) / "TOC-test.md"
+            toc_path.write_text(
+                "\n".join(
+                    [
+                        "- [锚点](/anchor.md)",
+                        "- 目标独有章节",
+                        "- old1",
+                        "- old2",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            success = process_toc_file(
+                "TOC-test.md",
+                {
+                    "type": "toc",
+                    "operations": [
+                        {
+                            "group_id": "modified:2",
+                            "group_offset": 0,
+                            "source_line": 2,
+                            "content": "- new1",
+                            "needs_translation": False,
+                            "anchor_previous_link": "(/anchor.md)",
+                            "anchor_previous_source_line": 1,
+                        },
+                        {
+                            "group_id": "modified:2",
+                            "group_offset": 1,
+                            "source_line": 3,
+                            "content": "- new2",
+                            "needs_translation": False,
+                            "anchor_previous_link": "(/anchor.md)",
+                            "anchor_previous_source_line": 1,
+                        },
+                    ],
+                },
+                {"mode": "pr"},
+                None,
+                EmptyAIClient(),
+                {
+                    "target_local_path": tmpdir,
+                    "source_language": "English",
+                    "target_language": "Chinese",
+                },
+            )
+
+            result = toc_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertTrue(success)
+        self.assertEqual(
+            ["- [锚点](/anchor.md)", "- 目标独有章节", "- old1", "- old2"],
+            result,
+        )
+
+    def test_modified_plain_text_group_with_original_content_updates_when_anchor_window_is_unique(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            toc_path = Path(tmpdir) / "TOC-test.md"
+            toc_path.write_text(
+                "\n".join(
+                    [
+                        "- [锚点](/anchor.md)",
+                        "- 父分组",
+                        "- [后续](/next.md)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            ai_client = RecordingAIClient({"line_0": "- 新父分组"})
+            success = process_toc_file(
+                "TOC-test.md",
+                {
+                    "type": "toc",
+                    "operations": [
+                        {
+                            "group_id": "modified:2",
+                            "group_offset": 0,
+                            "source_line": 2,
+                            "content": "- New Parent Group",
+                            "original_content": "- Parent Group",
+                            "needs_translation": True,
+                            "anchor_previous_link": "(/anchor.md)",
+                            "anchor_previous_source_line": 1,
+                            "anchor_next_link": "(/next.md)",
+                            "anchor_next_source_line": 3,
+                        },
+                    ],
+                },
+                {"mode": "pr"},
+                None,
+                ai_client,
+                {
+                    "target_local_path": tmpdir,
+                    "source_language": "English",
+                    "target_language": "Chinese",
+                },
+            )
+
+            result = toc_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertTrue(success)
+        self.assertEqual(
+            ["- [锚点](/anchor.md)", "- 新父分组", "- [后续](/next.md)"],
+            result,
+        )
+
+    def test_operation_level_glossary_matches_only_changed_toc_lines(self):
+        source_lines = [
+            "- [Anchor](/anchor.md)",
+            "- [Events](/events.md)",
+            "- [KeepMe](/keep.md)",
+        ]
+        target_lines = [
+            "- [锚点](/anchor.md)",
+            "- [保留项](/keep.md)",
+        ]
+        toc_results = process_toc_operations(
+            "TOC-test.md",
+            {
+                "added_lines": [
+                    {"line_number": 2, "content": "- [Events](/events.md)", "is_header": False},
+                ],
+                "modified_lines": [],
+                "deleted_lines": [],
+            },
+            source_lines,
+            target_lines,
+            "",
+        )
+
+        seen_glossary_inputs = []
+
+        def glossary_matcher(text, source_language=None):
+            seen_glossary_inputs.append((text, source_language))
+            if "Events" in text:
+                return [{"en": "Events", "zh": "事件", "comment": "TOC term"}]
+            return []
+
+        ai_client = RecordingAIClient({"line_0": "- [事件](/events.md)"})
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            toc_path = Path(tmpdir) / "TOC-test.md"
+            toc_path.write_text("\n".join(target_lines), encoding="utf-8")
+
+            success = process_toc_file(
+                "TOC-test.md",
+                {
+                    "type": "toc",
+                    "operations": toc_results["added"],
+                },
+                {"mode": "pr"},
+                None,
+                ai_client,
+                {
+                    "target_local_path": tmpdir,
+                    "source_language": "English",
+                    "target_language": "Chinese",
+                },
+                glossary_matcher=glossary_matcher,
+            )
+
+        self.assertTrue(success)
+        self.assertEqual([("- [Events](/events.md)", "English")], seen_glossary_inputs)
+        self.assertEqual(1, len(ai_client.prompts))
+        self.assertIn("| Events | 事件 | TOC term |", ai_client.prompts[0])
+        self.assertNotIn("KeepMe", ai_client.prompts[0])
 
 
 if __name__ == "__main__":

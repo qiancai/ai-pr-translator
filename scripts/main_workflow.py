@@ -17,6 +17,7 @@ TARGET_PR_URL = os.getenv("TARGET_PR_URL")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 AI_PROVIDER = os.getenv("AI_PROVIDER", "deepseek")
 TARGET_REPO_PATH = os.getenv("TARGET_REPO_PATH")
+SOURCE_FILES = os.getenv("SOURCE_FILES", "")
 SKIP_GIT_ADD = os.getenv("SKIP_GIT_ADD", "false").lower() == "true"
 TIDB_CLOUD_ABSOLUTE_LINK_PREFIX = os.getenv(
     "TIDB_CLOUD_ABSOLUTE_LINK_PREFIX",
@@ -729,6 +730,76 @@ def filter_docs_by_folder(folder_name, added_sections, modified_sections, delete
         filter_list(deleted_images),
     )
 
+
+def normalize_source_files(source_files):
+    """Normalize a comma-separated source file filter list."""
+    normalized = []
+    seen = set()
+    for item in source_files.split(","):
+        path = item.strip()
+        if path.startswith("./"):
+            path = path[2:]
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        normalized.append(path)
+    return normalized
+
+
+def filter_docs_by_source_files(source_files, added_sections, modified_sections, deleted_sections,
+                                added_files, deleted_files, toc_files, keyword_files,
+                                added_images, modified_images, deleted_images):
+    """Keep only entries whose repo-relative path is explicitly listed."""
+    normalized_files = set(normalize_source_files(source_files))
+    if not normalized_files:
+        return (
+            added_sections,
+            modified_sections,
+            deleted_sections,
+            added_files,
+            deleted_files,
+            toc_files,
+            keyword_files,
+            added_images,
+            modified_images,
+            deleted_images,
+        )
+
+    def keep(path):
+        return path in normalized_files
+
+    def filter_dict(d):
+        return {k: v for k, v in d.items() if keep(k)}
+
+    def filter_list(lst):
+        return [item for item in lst if keep(item)]
+
+    discovered_paths = set()
+    for d in (added_sections, modified_sections, deleted_sections, added_files, toc_files, keyword_files):
+        discovered_paths.update(d.keys())
+    for lst in (deleted_files, added_images, modified_images, deleted_images):
+        discovered_paths.update(lst)
+
+    missing_paths = sorted(normalized_files - discovered_paths)
+    thread_safe_print(f"\n📄 Applying SOURCE_FILES filter: {', '.join(sorted(normalized_files))}")
+    if missing_paths:
+        thread_safe_print("   ⚠️  Requested source files not found in this PR diff:")
+        for path in missing_paths:
+            thread_safe_print(f"      - {path}")
+
+    return (
+        filter_dict(added_sections),
+        filter_dict(modified_sections),
+        filter_dict(deleted_sections),
+        filter_dict(added_files),
+        filter_list(deleted_files),
+        filter_dict(toc_files),
+        filter_dict(keyword_files),
+        filter_list(added_images),
+        filter_list(modified_images),
+        filter_list(deleted_images),
+    )
+
 def get_workflow_repo_config(pr_url, repo_configs):
     """Get repository configuration for workflow environment"""
     from diff_analyzer import parse_pr_url
@@ -828,6 +899,20 @@ def main():
         pr_diff=pr_diff,
         exclude_folders=exclude_folders,
     )
+    if SOURCE_FILES:
+        added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images = filter_docs_by_source_files(
+            SOURCE_FILES,
+            added_sections,
+            modified_sections,
+            deleted_sections,
+            added_files,
+            deleted_files,
+            toc_files,
+            keyword_files,
+            added_images,
+            modified_images,
+            deleted_images,
+        )
     diff_file_count = count_unique_file_paths(
         added_sections,
         modified_sections,
@@ -896,7 +981,15 @@ def main():
             def run_toc_file(path=file_path, data=toc_data):
                 if data.get("type") != "toc":
                     return make_task_result("failure", f"Unknown TOC data type: {data.get('type')}")
-                success = process_toc_file(path, data, SOURCE_PR_URL, github_client, ai_client, repo_config)
+                success = process_toc_file(
+                    path,
+                    data,
+                    SOURCE_PR_URL,
+                    github_client,
+                    ai_client,
+                    repo_config,
+                    glossary_matcher=glossary_matcher,
+                )
                 if success:
                     return make_task_result("success")
                 return make_task_result("failure", "TOC processor returned failure")

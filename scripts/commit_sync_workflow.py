@@ -584,6 +584,7 @@ def main():
                     github_client,
                     ai_client,
                     repo_config,
+                    glossary_matcher=glossary_matcher,
                 )
                 if success:
                     return make_task_result("success")

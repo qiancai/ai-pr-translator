@@ -112,6 +112,32 @@ class MainWorkflowImageOnlyPrTest(unittest.TestCase):
 
 
 class MainWorkflowRegressionTest(unittest.TestCase):
+    def test_filter_docs_by_source_files_keeps_only_requested_paths(self):
+        filtered = main_workflow.filter_docs_by_source_files(
+            "guide.md, TOC-test.md",
+            {"guide.md": {"sections": {}}},
+            {"ignore.md": {"sections": {}}},
+            {"guide.md": {"sections": {}}},
+            {"add.md": "# Added"},
+            ["ignore-delete.md", "guide.md"],
+            {"TOC-test.md": {"type": "toc"}},
+            {"keywords.md": {"type": "keyword"}},
+            ["guide.png"],
+            ["ignore-image.png"],
+            ["TOC-test.md"],
+        )
+
+        self.assertEqual({"guide.md"}, set(filtered[0].keys()))
+        self.assertEqual({}, filtered[1])
+        self.assertEqual({"guide.md"}, set(filtered[2].keys()))
+        self.assertEqual({}, filtered[3])
+        self.assertEqual(["guide.md"], filtered[4])
+        self.assertEqual({"TOC-test.md"}, set(filtered[5].keys()))
+        self.assertEqual({}, filtered[6])
+        self.assertEqual([], filtered[7])
+        self.assertEqual([], filtered[8])
+        self.assertEqual(["TOC-test.md"], filtered[9])
+
     def test_unmatched_modified_sections_are_formatted_for_failure_report(self):
         source_diff_dict = {
             "modified_1102": {
