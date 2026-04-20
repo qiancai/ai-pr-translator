@@ -54,6 +54,24 @@ def main():
         print(f"❌ {e}")
         return 1
 
+    if AI_PROVIDER == "azure":
+        local_azure_openai_key = os.getenv("AZURE_OPENAI_KEY") or os.getenv("TRANS_KEY", "")
+        local_azure_openai_base_url = (
+            os.getenv("AZURE_OPENAI_BASE_URL") or os.getenv("TRANS_URL", "")
+        )
+
+        if not local_azure_openai_key:
+            print("❌ Neither AZURE_OPENAI_KEY nor TRANS_KEY is set for local Azure runs.")
+            return 1
+        if not local_azure_openai_base_url:
+            print(
+                "❌ Neither AZURE_OPENAI_BASE_URL nor TRANS_URL is set for local Azure runs."
+            )
+            return 1
+        os.environ["AZURE_OPENAI_KEY"] = local_azure_openai_key
+        os.environ["AZURE_OPENAI_BASE_URL"] = local_azure_openai_base_url
+        os.environ["OPENAI_BASE_URL"] = local_azure_openai_base_url
+
     if not os.getenv("GITHUB_TOKEN"):
         print("❌ GITHUB_TOKEN is not set in the environment.")
         return 1

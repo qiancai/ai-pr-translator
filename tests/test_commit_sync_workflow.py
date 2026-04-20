@@ -10,9 +10,42 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import commit_sync_workflow as workflow
+import commit_sync_workflow_local
 
 
 class CommitSyncWorkflowHelpersTest(unittest.TestCase):
+    def test_local_commit_sync_falls_back_to_trans_env_for_azure(self):
+        config = {
+            "AI_PROVIDER": "azure",
+            "SOURCE_BASE_REF": "abc123",
+            "SOURCE_HEAD_REF": "def456",
+        }
+
+        with mock.patch.dict(
+            commit_sync_workflow_local.os.environ,
+            {
+                "GITHUB_TOKEN": "token",
+                "TRANS_KEY": "trans-key",
+                "TRANS_URL": "https://trans.example/v1",
+            },
+            clear=False,
+        ), mock.patch.object(
+            commit_sync_workflow_local, "build_config", return_value=config
+        ), mock.patch.object(
+            commit_sync_workflow_local, "resolve_cloud_source_files_for_local", return_value=(config, True)
+        ), mock.patch.object(
+            workflow, "main", return_value=0
+        ):
+            self.assertEqual(commit_sync_workflow_local.main(), 0)
+            self.assertEqual(
+                commit_sync_workflow_local.os.environ["AZURE_OPENAI_KEY"],
+                "trans-key",
+            )
+            self.assertEqual(
+                commit_sync_workflow_local.os.environ["OPENAI_BASE_URL"],
+                "https://trans.example/v1",
+            )
+
     def test_normalize_source_files_prefixes_folder(self):
         normalized = workflow.normalize_source_files("foo.md, ai/bar.md ,baz/qux.md", "ai")
         self.assertEqual(normalized, {"ai/foo.md", "ai/bar.md", "ai/baz/qux.md"})

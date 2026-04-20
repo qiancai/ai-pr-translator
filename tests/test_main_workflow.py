@@ -28,6 +28,29 @@ class MainWorkflowImageOnlyPrTest(unittest.TestCase):
         self.assertEqual(docs_cn_target["target_pr_url"], "https://github.com/pingcap/docs/pull/0")
         self.assertEqual(docs_cn_target["target_repo_path"], main_workflow_local.DOCS_LOCAL_PATH)
 
+    def test_local_workflow_prefers_explicit_azure_env_over_trans_env(self):
+        with mock.patch.dict(
+            main_workflow_local.os.environ,
+            {
+                "GITHUB_TOKEN": "token",
+                "AZURE_OPENAI_KEY": "azure-key",
+                "AZURE_OPENAI_BASE_URL": "https://azure.example/v1",
+                "TRANS_KEY": "trans-key",
+                "TRANS_URL": "https://trans.example/v1",
+            },
+            clear=False,
+        ), mock.patch.object(main_workflow_local, "AI_PROVIDER", "azure"), mock.patch.object(
+            main_workflow_local,
+            "_target_for_source_pr",
+            return_value={"target_pr_url": "https://github.com/acme/docs/pull/0", "target_repo_path": "/tmp/target"},
+        ), mock.patch.object(main_workflow, "main", return_value=0):
+            self.assertEqual(main_workflow_local.main(), 0)
+            self.assertEqual(main_workflow_local.os.environ["AZURE_OPENAI_KEY"], "azure-key")
+            self.assertEqual(
+                main_workflow_local.os.environ["OPENAI_BASE_URL"],
+                "https://azure.example/v1",
+            )
+
     def test_git_add_changes_can_be_disabled(self):
         with mock.patch.object(main_workflow, "SKIP_GIT_ADD", True), mock.patch.object(
             main_workflow.subprocess, "run"
