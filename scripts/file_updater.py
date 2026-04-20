@@ -14,6 +14,12 @@ from github import Github
 from openai import OpenAI
 from log_sanitizer import sanitize_exception_message
 from special_file_utils import source_scope_includes_folder
+from svg_preprocessor import (
+    strip_svgs,
+    restore_svgs,
+    strip_svgs_from_sections_and_diff,
+    restore_svgs_in_dict,
+)
 
 # Thread-safe printing
 print_lock = threading.Lock()
@@ -23,7 +29,7 @@ def thread_safe_print(*args, **kwargs):
         print(*args, **kwargs)
 
 def verbose_logging_enabled():
-    return os.getenv("VERBOSE_WORKFLOW_LOGS", "false").lower() in ("1", "true", "yes", "on")
+    return os.getenv("VERBOSE_WORKFLOW_LOGS", "true").lower() in ("1", "true", "yes", "on")
 
 def verbose_thread_safe_print(*args, **kwargs):
     if verbose_logging_enabled():
@@ -35,13 +41,25 @@ def read_text_lines_preserve_newlines(file_path):
         return f.readlines()
 
 def write_text_lines_preserve_newlines(file_path, lines):
-    """Write text lines while preserving line endings and trimming EOF blanks."""
-    lines = normalize_trailing_blank_lines(lines)
+    """Write text lines while preserving line endings and the original EOF newline state."""
+    lines = normalize_trailing_blank_lines(
+        lines,
+        preserve_final_newline=file_ends_with_newline(file_path),
+    )
     with open(file_path, 'w', encoding='utf-8', newline='') as f:
         f.writelines(lines)
 
-def normalize_trailing_blank_lines(lines):
-    """Remove blank-only lines at EOF while preserving a single final newline."""
+def file_ends_with_newline(file_path):
+    """Return whether the existing file ends with a newline byte."""
+    if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+        return False
+
+    with open(file_path, 'rb') as f:
+        f.seek(-1, os.SEEK_END)
+        return f.read(1) in (b'\n', b'\r')
+
+def normalize_trailing_blank_lines(lines, preserve_final_newline=True):
+    """Remove blank-only lines at EOF while preserving the original final newline state."""
     normalized = list(lines)
     preferred_newline = "\n"
     for line in reversed(normalized):
@@ -55,8 +73,12 @@ def normalize_trailing_blank_lines(lines):
     while normalized and not normalized[-1].strip():
         normalized.pop()
 
-    if normalized and not normalized[-1].endswith("\n"):
-        normalized[-1] += preferred_newline
+    if normalized:
+        if preserve_final_newline:
+            if not normalized[-1].endswith(("\n", "\r")):
+                normalized[-1] += preferred_newline
+        else:
+            normalized[-1] = normalized[-1].rstrip("\r\n")
 
     return normalized
 
@@ -82,8 +104,9 @@ TRANSLATION_CHUNK_SECTION_THRESHOLD = int(os.getenv("TRANSLATION_CHUNK_SECTION_T
 TRANSLATION_CHUNK_TOKEN_THRESHOLD = int(os.getenv("TRANSLATION_CHUNK_TOKEN_THRESHOLD", "12000"))
 SYSTEM_TRANSLATION_CHUNK_SIZE = int(os.getenv("SYSTEM_TRANSLATION_CHUNK_SIZE", "20"))
 REGULAR_TRANSLATION_CHUNK_SIZE = int(os.getenv("REGULAR_TRANSLATION_CHUNK_SIZE", "8"))
+TRANSLATION_CHUNK_MAX_SECTIONS_ENV = os.getenv("TRANSLATION_CHUNK_MAX_SECTIONS")
 TRANSLATION_CHUNK_MAX_SECTIONS = int(
-    os.getenv("TRANSLATION_CHUNK_MAX_SECTIONS", str(SYSTEM_TRANSLATION_CHUNK_SIZE))
+    TRANSLATION_CHUNK_MAX_SECTIONS_ENV or str(REGULAR_TRANSLATION_CHUNK_SIZE)
 )
 TRANSLATION_CHUNK_CHAR_LIMIT = int(os.getenv("TRANSLATION_CHUNK_CHAR_LIMIT", "40000"))
 
@@ -526,24 +549,44 @@ def estimate_chunk_section_chars(key, source_sections, target_sections=None):
     return len(str(source_sections.get(key, ""))) + len(str(target_sections.get(key, "")))
 
 
-def build_translation_chunks(source_sections, target_sections=None):
+def get_translation_chunk_max_sections(target_file_name=None):
+    """Return per-file chunk size, preserving larger chunks for dense reference docs."""
+    if TRANSLATION_CHUNK_MAX_SECTIONS_ENV:
+        return TRANSLATION_CHUNK_MAX_SECTIONS
+
+    basename = os.path.basename(target_file_name or "")
+    if basename in {
+        "system-variables.md",
+        "configuration-file.md",
+        "tidb-configuration-file.md",
+        "tikv-configuration-file.md",
+        "pd-configuration-file.md",
+        "tiflash-configuration.md",
+    }:
+        return SYSTEM_TRANSLATION_CHUNK_SIZE
+
+    return REGULAR_TRANSLATION_CHUNK_SIZE
+
+
+def build_translation_chunks(source_sections, target_sections=None, max_sections=None):
     """Split ordered section keys by section count and approximate character budget."""
     chunks = []
     current_keys = []
     current_chars = 0
+    max_sections = max_sections or TRANSLATION_CHUNK_MAX_SECTIONS
 
     for key in source_sections:
         section_chars = estimate_chunk_section_chars(key, source_sections, target_sections)
 
         if current_keys and (
-            len(current_keys) >= TRANSLATION_CHUNK_MAX_SECTIONS
+            len(current_keys) >= max_sections
             or current_chars + section_chars > TRANSLATION_CHUNK_CHAR_LIMIT
         ):
             chunks.append(
                 {
                     "type": "balanced",
                     "keys": current_keys,
-                    "limit": TRANSLATION_CHUNK_MAX_SECTIONS,
+                    "limit": max_sections,
                     "chars": current_chars,
                 }
             )
@@ -558,7 +601,7 @@ def build_translation_chunks(source_sections, target_sections=None):
             {
                 "type": "balanced",
                 "keys": current_keys,
-                "limit": TRANSLATION_CHUNK_MAX_SECTIONS,
+                "limit": max_sections,
                 "chars": current_chars,
             }
         )
@@ -681,7 +724,7 @@ def filter_diff_for_chunk_sections(pr_diff, chunk_keys, all_section_keys):
 def _prepare_translation_prompt(
     pr_diff, source_sections, target_sections,
     source_language, target_language, source_mode,
-    glossary_matcher=None, chunk_label=None,
+    glossary_matcher=None, chunk_label=None, post_change_context_keys=None,  # post_change_context_keys kept for backward compat, unused
 ):
     """Build the AI translation prompt string.
 
@@ -690,6 +733,9 @@ def _prepare_translation_prompt(
     """
     formatted_source_sections = json.dumps(source_sections, ensure_ascii=False, indent=2)
     formatted_target_sections = json.dumps(target_sections, ensure_ascii=False, indent=2)
+    source_sections_heading = (
+        f"1. Source sections in {source_language} (post-change, i.e. after applying the diff):"
+    )
 
     thread_safe_print(f"   📊 Source sections: {len(source_sections)} sections")
     thread_safe_print(f"   📊 Target sections: {len(target_sections)} sections")
@@ -721,7 +767,7 @@ def _prepare_translation_prompt(
 
     prompt = f"""You are a professional technical writer in the Database domain. I will provide you with:
 
-1. Source sections in {source_language}:
+1. Latest source sections in {source_language}:
 {formatted_source_sections}
 
 2. GitHub PR changes (Diff):
@@ -736,7 +782,7 @@ def _prepare_translation_prompt(
 Task: Update the target sections in {target_language} according to the diff in {source_language}.
 
 Instructions:
-1. Carefully analyze the PR diff to identify exactly which source lines and words changed in {source_language}.
+1. The source sections above show the final state after the diff was applied. Carefully analyze the PR diff to identify exactly which source lines and words changed in {source_language}. Make sure the returned translation covers ALL content in each source section — do not omit any paragraph or sentence.
 2. According to the diff, identify the lines that should be updated accordingly in {target_language}. For lines that needs to be updated in {target_language}, apply the corresponding minimal edits according to the diff. For lines not changed or not included in the diff, make sure to keep the corresponding target lines byte-for-byte identical (same wording, punctuation, spacing, indentation, list markers, and line breaks), which means Do Not add, remove, or modify lines not included in the diff. Never rewrite style, improve wording, or rephrase unaffected content.
 3. Translation rules:
    - Preserve doc variables/placeholders exactly as they appear, including triple braces, such as {DOC_VARIABLE_EXAMPLE}. This also applies when they appear inside HTML attributes or tab labels.
@@ -838,6 +884,7 @@ def get_updated_sections_from_ai_chunked(
     dry_run=False,
     source_mode="",
     chunk_routing_sections=None,
+    post_change_context_keys=None,
 ):
     """Translate large section sets chunk by chunk and merge successful chunks.
 
@@ -846,9 +893,15 @@ def get_updated_sections_from_ai_chunked(
     """
     target_file_prefix = get_target_file_prefix_for_debug(target_file_name, target_sections)
     routing_sections = chunk_routing_sections or source_sections
-    chunks = build_translation_chunks(routing_sections, target_sections)
+    chunk_max_sections = get_translation_chunk_max_sections(target_file_name)
+    chunks = build_translation_chunks(
+        routing_sections,
+        target_sections,
+        max_sections=chunk_max_sections,
+    )
     total_chunks = len(chunks)
     all_section_keys = list(source_sections.keys())
+    post_change_context_key_set = set(post_change_context_keys or [])
 
     thread_safe_print(
         f"   🧩 Chunk mode enabled: {len(source_sections)} sections split into {total_chunks} chunks"
@@ -881,6 +934,9 @@ def get_updated_sections_from_ai_chunked(
             source_language, target_language, source_mode,
             glossary_matcher=glossary_matcher,
             chunk_label=chunk_label,
+            post_change_context_keys=[
+                key for key in chunk_keys if key in post_change_context_key_set
+            ],
         )
 
         prompt_file = os.path.join(
@@ -965,8 +1021,8 @@ def get_updated_sections_from_ai_chunked(
     return merged_result
 
 
-def get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_dict, ai_client, source_language, target_language, target_file_name=None, glossary_matcher=None, dry_run=False, source_mode="", _disable_chunking=False, _chunk_label=None, _chunk_routing_content_dict=None):
-    """Use AI to update target sections based on source old content, PR diff, and target sections"""
+def get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_dict, ai_client, source_language, target_language, target_file_name=None, glossary_matcher=None, dry_run=False, source_mode="", _disable_chunking=False, _chunk_label=None, _chunk_routing_content_dict=None, _post_change_context_keys=None):
+    """Use AI to update target sections based on source content (post-change), PR diff, and target sections."""
     if not source_old_content_dict or not target_sections:
         return {}
     
@@ -981,6 +1037,14 @@ def get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_di
         content = old_content if old_content is not None else ""
         source_sections[key] = content
 
+    # Strip SVG tags from all content before sending to AI to save tokens
+    # and avoid truncation.  The svg_map is used to restore originals after
+    # the AI responds.
+    source_sections, target_sections, pr_diff, svg_map = \
+        strip_svgs_from_sections_and_diff(source_sections, target_sections, pr_diff)
+    if svg_map:
+        thread_safe_print(f"   🖼️  Replaced {len(svg_map)} SVG(s) with placeholders for AI translation")
+
     if _chunk_routing_content_dict:
         routing_sections = {
             key: _chunk_routing_content_dict.get(key, source_sections[key])
@@ -989,13 +1053,24 @@ def get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_di
     else:
         routing_sections = source_sections
 
+    def _restore_result(result):
+        """Restore SVG placeholders in the AI result dict."""
+        if not svg_map or not result:
+            return result
+        restored = restore_svgs_in_dict(result, svg_map)
+        if hasattr(result, "failures"):
+            restored_obj = TranslationResult(restored)
+            restored_obj.failures = result.failures
+            return restored_obj
+        return restored
+
     if not _disable_chunking:
         use_chunk_mode, total_source_tokens = should_use_translation_chunk_mode(routing_sections)
         thread_safe_print(
             f"   🔢 Source new_content tokens for translation routing: ~{total_source_tokens:,}"
         )
         if use_chunk_mode:
-            return get_updated_sections_from_ai_chunked(
+            result = get_updated_sections_from_ai_chunked(
                 pr_diff,
                 target_sections,
                 source_sections,
@@ -1007,13 +1082,16 @@ def get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_di
                 dry_run=dry_run,
                 source_mode=source_mode,
                 chunk_routing_sections=routing_sections,
+                post_change_context_keys=_post_change_context_keys,
             )
+            return _restore_result(result)
 
     prompt, prompt_pr_diff = _prepare_translation_prompt(
         pr_diff, source_sections, target_sections,
         source_language, target_language, source_mode,
         glossary_matcher=glossary_matcher,
         chunk_label=_chunk_label,
+        post_change_context_keys=_post_change_context_keys,
     )
 
     # Save prompt to file for reference
@@ -1036,11 +1114,12 @@ def get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_di
 
     thread_safe_print(f"🤖 Sending prompt to AI...")
 
-    return _execute_ai_translation(
+    result = _execute_ai_translation(
         prompt, ai_client, target_sections, pr_diff,
         target_file_prefix, prompt_suffix,
         source_language, target_language,
     )
+    return _restore_result(result)
 
 def parse_updated_sections(ai_response):
     """Parse AI response and extract JSON (from get-updated-target-sections.py)"""
@@ -1761,12 +1840,14 @@ def process_single_file(file_path, source_sections, pr_diff, source_context_or_p
                         if operation == 'deleted':
                             continue
                         
-                        # For source sections: use old_content for modified, new_content for added
-                        if operation == 'added':
-                            source_content = section_info.get('source_new_content', '')
-                        else:  # modified
+                        # Always use source_new_content (post-change) so the AI
+                        # sees the final source state alongside the diff and
+                        # current target.  This avoids the AI missing newly added
+                        # paragraphs that only appeared in the diff.
+                        source_content = section_info.get('source_new_content', '')
+                        if not source_content:
                             source_content = section_info.get('source_old_content', '')
-                        routing_content = section_info.get('source_new_content', source_content)
+                        routing_content = source_content
                         
                         # For target sections: use target_content for modified, empty string for added
                         if operation == 'added':
@@ -1969,12 +2050,13 @@ def process_single_file(file_path, source_sections, pr_diff, source_context_or_p
         # Handle different data structures for source_sections
         if isinstance(source_sections, dict) and 'sections' in source_sections:
             # New format: complete data structure with enhanced matching info
+            # Always prefer source_new_content (post-change) so the AI sees
+            # the final source state alongside the diff.
             for key, section_info in source_sections.items():
-                if isinstance(section_info, dict) and 'source_old_content' in section_info:
-                    source_old_content_dict[key] = section_info['source_old_content']
-                    source_routing_content_dict[key] = section_info.get(
-                        'source_new_content', section_info['source_old_content']
-                    )
+                if isinstance(section_info, dict) and ('source_new_content' in section_info or 'source_old_content' in section_info):
+                    source_content = section_info.get('source_new_content') or section_info.get('source_old_content', '')
+                    source_old_content_dict[key] = source_content
+                    source_routing_content_dict[key] = source_content
         else:
             # Fallback: if we don't have the enhanced structure, we need to get it differently
             thread_safe_print(f"   [{thread_id}] ⚠️  Source sections missing enhanced structure, using fallback")
@@ -2175,6 +2257,109 @@ def process_files_in_batches(source_changes, pr_diff, source_context_or_pr_url, 
     
     return results
 
+def _detect_and_fix_cross_parent_moves(sections_with_line):
+    """Detect sections that moved to a different parent and split them into delete + insert.
+
+    When a source file restructure moves a section from one parent heading to
+    another (e.g. ``### Modify project roles`` under ``## Manage project
+    access`` becomes ``### Remove instance access`` under a new ``## Manage
+    instance access``), the matcher maps the change to the *old* target
+    position.  An in-place replace would leave the translated content under the
+    wrong parent.
+
+    This function detects such cases and converts the single "modified/replace"
+    entry into two entries — a *delete* at the old position and an *insert*
+    next to the newly added parent — so the content lands in the right place.
+    """
+    from section_matcher import extract_first_heading_from_content, clean_title_for_matching
+
+    def _source_line(key):
+        parts = key.split('_')
+        if len(parts) >= 2 and parts[-1].isdigit():
+            return int(parts[-1])
+        return 0
+
+    def _heading_level(heading_line):
+        if not heading_line:
+            return 0
+        stripped = heading_line.lstrip()
+        level = 0
+        for ch in stripped:
+            if ch == '#':
+                level += 1
+            else:
+                break
+        return level
+
+    added_parents = []
+    for key, section_data, line_num in sections_with_line:
+        if section_data.get('source_operation') != 'added':
+            continue
+        new_content = section_data.get('source_new_content', '')
+        heading = extract_first_heading_from_content(new_content)
+        if heading and _heading_level(heading) == 2:
+            added_parents.append((_source_line(key), key, section_data, line_num))
+    added_parents.sort(key=lambda x: x[0])
+
+    if not added_parents:
+        return sections_with_line
+
+    result = []
+    for key, section_data, line_num in sections_with_line:
+        if section_data.get('source_operation') != 'modified':
+            result.append((key, section_data, line_num))
+            continue
+
+        old_content = section_data.get('source_old_content', '') or ''
+        new_content = section_data.get('source_new_content', '') or ''
+
+        if old_content.strip():
+            result.append((key, section_data, line_num))
+            continue
+
+        old_hierarchy = section_data.get('source_original_hierarchy', '')
+        old_leaf = old_hierarchy.rsplit(' > ', 1)[-1] if old_hierarchy else ''
+        old_title = clean_title_for_matching(old_leaf)
+
+        new_heading = extract_first_heading_from_content(new_content)
+        new_title = clean_title_for_matching(new_heading) if new_heading else ''
+
+        if not old_title or not new_title or old_title == new_title:
+            result.append((key, section_data, line_num))
+            continue
+
+        src_line = _source_line(key)
+        parent_match = None
+        for p_src_line, p_key, p_data, p_line_num in reversed(added_parents):
+            if p_src_line < src_line:
+                parent_match = (p_key, p_data, p_line_num)
+                break
+
+        if parent_match is None:
+            result.append((key, section_data, line_num))
+            continue
+
+        p_key, p_data, p_target_line = parent_match
+
+        thread_safe_print(
+            f"   🔀 Cross-parent move detected: {key}"
+            f"\n      Old position: {old_leaf} (target line {line_num})"
+            f"\n      New parent: {p_key} (target line {p_target_line})"
+            f"\n      → Splitting into DELETE at line {line_num} + INSERT before line {p_target_line}"
+        )
+
+        delete_data = dict(section_data)
+        delete_data['source_operation'] = 'deleted'
+        delete_data['target_new_content'] = None
+        result.append((key + '_delete', delete_data, line_num))
+
+        insert_data = dict(section_data)
+        insert_data['insertion_type'] = 'before_reference'
+        result.append((key + '_insert', insert_data, p_target_line))
+
+    return result
+
+
 def update_target_document_from_match_data(match_file_path, target_local_path, target_file_name=None):
     """
     Update target document using data from match_source_diff_to_target.json
@@ -2232,6 +2417,14 @@ def update_target_document_from_match_data(match_file_path, target_local_path, t
             except ValueError:
                 thread_safe_print(f"⚠️  Skipping invalid target_line: {target_line} for {key}")
     
+    # ------------------------------------------------------------------
+    # Detect cross-parent section moves: when a "modified" section's
+    # content was completely replaced with content that belongs under a
+    # newly added parent heading, split it into delete + insert so the
+    # new content lands under the correct parent.
+    # ------------------------------------------------------------------
+    sections_with_line = _detect_and_fix_cross_parent_moves(sections_with_line)
+
     # Separate sections into different processing groups
     bottom_modified_sections = []  # Process first: modify existing content at document end
     regular_sections = []          # Process second: normal operations from back to front

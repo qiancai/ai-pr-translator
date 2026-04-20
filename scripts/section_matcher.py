@@ -19,7 +19,7 @@ def thread_safe_print(*args, **kwargs):
         print(*args, **kwargs)
 
 def verbose_logging_enabled():
-    return os.getenv("VERBOSE_WORKFLOW_LOGS", "false").lower() in ("1", "true", "yes", "on")
+    return os.getenv("VERBOSE_WORKFLOW_LOGS", "true").lower() in ("1", "true", "yes", "on")
 
 def verbose_thread_safe_print(*args, **kwargs):
     if verbose_logging_enabled():
@@ -358,15 +358,126 @@ def filter_non_system_sections(target_hierarchy):
     
     return filtered_hierarchy
 
-def get_corresponding_sections(source_sections, target_sections, ai_client, source_language, target_language, max_tokens=20000):
+def format_hierarchy_list_for_prompt(hierarchy):
+    """Render a hierarchy dict/list in stable line order for AI prompts."""
+    if not hierarchy:
+        return ""
+
+    if isinstance(hierarchy, dict):
+        def sort_key(item):
+            line_num, _ = item
+            try:
+                return int(line_num)
+            except (TypeError, ValueError):
+                return 0
+
+        return "\n".join(
+            f"{line_num}: {section}"
+            for line_num, section in sorted(hierarchy.items(), key=sort_key)
+        )
+
+    return "\n".join(str(section) for section in hierarchy)
+
+
+def build_changed_sections_context(source_sections, source_diff_dict=None):
+    """Render changed source sections with operation and old/new hierarchy hints."""
+    if not isinstance(source_sections, dict):
+        return "\n".join(str(section) for section in source_sections)
+
+    rows = []
+    source_diff_dict = source_diff_dict or {}
+
+    for key, hierarchy in source_sections.items():
+        source_info = source_diff_dict.get(key, {}) if isinstance(source_diff_dict, dict) else {}
+        operation = source_info.get("operation", "unknown")
+        old_heading = extract_first_heading_from_content(source_info.get("old_content", ""))
+        new_heading = extract_first_heading_from_content(source_info.get("new_content", ""))
+        original_hierarchy = source_info.get("original_hierarchy", hierarchy)
+
+        details = [
+            f"- key: {key}",
+            f"  operation: {operation}",
+            f"  matching source hierarchy: {hierarchy}",
+            f"  original source hierarchy: {original_hierarchy}",
+        ]
+        if old_heading:
+            details.append(f"  old heading: {old_heading}")
+        if new_heading:
+            details.append(f"  new heading: {new_heading}")
+        rows.append("\n".join(details))
+
+    return "\n".join(rows)
+
+
+def get_corresponding_sections(
+    source_sections,
+    target_sections,
+    ai_client,
+    source_language,
+    target_language,
+    max_tokens=20000,
+    source_base_hierarchy=None,
+    source_head_hierarchy=None,
+    source_diff_dict=None,
+    source_mode="",
+):
     """Use AI to find corresponding sections between different languages"""
     
     # Format source sections
-    source_text = "\n".join(source_sections)
+    if isinstance(source_sections, dict):
+        source_text = "\n".join(source_sections.values())
+        changed_sections_text = build_changed_sections_context(source_sections, source_diff_dict)
+        number_of_sections = len(source_sections)
+    else:
+        source_text = "\n".join(source_sections)
+        changed_sections_text = source_text
+        number_of_sections = len(source_sections)
     target_text = "\n".join(target_sections)
-    number_of_sections = len(source_sections)
-    
-    prompt = f"""I am aligning the {source_language} and {target_language} documentation for TiDB.
+    source_base_text = format_hierarchy_list_for_prompt(source_base_hierarchy)
+    source_head_text = format_hierarchy_list_for_prompt(source_head_hierarchy)
+    normalized_source_mode = (source_mode or "").lower()
+
+    if source_base_text or source_head_text:
+        mode_guidance = (
+            "This is commit-based mode. The target file is expected to correspond to the source BASE file. "
+            "First align the source BASE section structure to the target-language section structure, then map the changed sections. "
+            "For added sections, return the target-language reference section that should be used as the insertion anchor."
+            if normalized_source_mode == "commit"
+            else
+            "This is PR mode. Use the full source structure only as local context to disambiguate parents and siblings. "
+            "Do not assume every source section must have a target-language counterpart."
+        )
+
+        prompt = f"""I am aligning the {source_language} and {target_language} documentation for TiDB.
+
+{mode_guidance}
+
+Full {source_language} BASE section structure:
+
+{source_base_text or "(not available)"}
+
+Full {source_language} HEAD section structure:
+
+{source_head_text or "(not available)"}
+
+Changed {source_language} section(s) to map, in order:
+
+{changed_sections_text}
+
+Here is the section structure of the corresponding {target_language} file.
+Please select the corresponding {number_of_sections} section(s) in {target_language} from the list below.
+
+⚠️ Strict rules:
+1. Return **only** the exact same number ({number_of_sections}) of target-language section titles, in the same order as the changed sections above.
+2. Return only section titles that appear in the target-language list below, preserving the exact text and # prefix.
+3. For modified or deleted sections, prefer the target section with the same heading level and equivalent parent/sibling position.
+4. For added sections, return the existing target-language reference section used as the insertion anchor.
+5. Do **not** output any explanations, comments, summaries, keys, numbering, or extra lines.
+6. Wrap your answer in a Markdown code block enclosed in three backticks.
+
+{target_text}"""
+    else:
+        prompt = f"""I am aligning the {source_language} and {target_language} documentation for TiDB.
 
 I have modified the following {number_of_sections} section(s) in the {source_language} file:
 
@@ -433,6 +544,137 @@ Please select the corresponding {number_of_sections} section(s) in {target_langu
     except Exception as e:
         print(f"   ❌ AI mapping error: {sanitize_exception_message(e)}")
         return None
+
+
+def get_corresponding_sections_json(
+    source_sections,
+    target_hierarchy,
+    ai_client,
+    repo_config,
+    max_tokens=20000,
+    source_base_hierarchy=None,
+    source_head_hierarchy=None,
+    source_diff_dict=None,
+    source_mode="",
+):
+    """Use full-context AI mapping and ask for key-based JSON output."""
+    source_language = repo_config['source_language']
+    target_language = repo_config['target_language']
+    changed_sections_text = build_changed_sections_context(source_sections, source_diff_dict)
+    source_base_text = format_hierarchy_list_for_prompt(source_base_hierarchy)
+    source_head_text = format_hierarchy_list_for_prompt(source_head_hierarchy)
+    target_text = format_hierarchy_list_for_prompt(target_hierarchy)
+    expected_keys = list(source_sections.keys())
+    expected_keys_json = json.dumps(expected_keys, ensure_ascii=False)
+    normalized_source_mode = (source_mode or "").lower()
+    mode_guidance = (
+        "This is commit-based mode. The target file is expected to correspond to the source BASE file. "
+        "First align the source BASE section structure to the target-language section structure, then map each changed section by key. "
+        "For added sections, the matching/original source hierarchy is the insertion reference section, not the new section being inserted; "
+        "return the target-language counterpart of that reference section."
+        if normalized_source_mode == "commit"
+        else
+        "This is PR mode. Use the full source structure only as local context to disambiguate parents and siblings. "
+        "Do not assume every source section must have a target-language counterpart."
+    )
+
+    prompt = f"""I am aligning the {source_language} and {target_language} documentation for TiDB.
+
+{mode_guidance}
+
+Full {source_language} BASE section structure:
+
+{source_base_text or "(not available)"}
+
+Full {source_language} HEAD section structure:
+
+{source_head_text or "(not available)"}
+
+Changed {source_language} section(s) to map:
+
+{changed_sections_text}
+
+Here is the section structure of the corresponding {target_language} file:
+
+{target_text}
+
+Return a JSON object that maps every changed section key to the exact target-language section hierarchy.
+
+⚠️ Strict rules:
+1. Return exactly these keys and no others: {expected_keys_json}
+2. Every JSON value must be one exact hierarchy string from the target-language list above.
+3. For modified or deleted sections, prefer the target section with the same heading level and equivalent parent/sibling position.
+4. For added sections, map the shown matching/original source hierarchy to its existing target-language counterpart and use that as the insertion anchor; do not map to the parent of the new heading.
+5. Do not return null, arrays, comments, Markdown headings, explanations, or extra text.
+6. Wrap your answer in a Markdown code block enclosed in three backticks.
+
+Example shape:
+```json
+{{"modified_12": "## 目标章节", "added_20": "## 插入锚点"}}
+```"""
+
+    thread_safe_print(
+        f"\n   📤 AI JSON mapping request ({source_language} → {target_language}): "
+        f"{len(source_sections)} section(s), {len(target_hierarchy)} target candidate(s), "
+        f"{len(prompt):,} prompt chars"
+    )
+    verbose_thread_safe_print(f"   " + "="*80)
+    verbose_thread_safe_print(f"   {prompt}")
+    verbose_thread_safe_print(f"   " + "="*80)
+
+    try:
+        from main import print_token_estimation
+        print_token_estimation(prompt, f"Section JSON mapping ({source_language} → {target_language})")
+    except ImportError:
+        try:
+            import tiktoken
+            enc = tiktoken.get_encoding("cl100k_base")
+            actual_tokens = len(enc.encode(prompt))
+            thread_safe_print(f"   💰 Section JSON mapping ({source_language} → {target_language})")
+            thread_safe_print(f"      📝 Input: {len(prompt):,} characters")
+            thread_safe_print(f"      🔢 Actual tokens: {actual_tokens:,} (using tiktoken cl100k_base)")
+        except Exception:
+            thread_safe_print(f"   💰 Section JSON mapping ({source_language} → {target_language})")
+            thread_safe_print(f"      📝 Input: {len(prompt):,} characters")
+            thread_safe_print(f"      🔢 Estimated tokens: ~{len(prompt) // 4:,} (fallback: 4 chars/token approximation)")
+
+    try:
+        ai_response = ai_client.chat_completion(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=max_tokens,
+        )
+        thread_safe_print(f"\n   📥 AI JSON mapping response received: {len(ai_response or ''):,} chars")
+        verbose_thread_safe_print(f"   " + "-"*80)
+        verbose_thread_safe_print(f"   {ai_response}")
+        verbose_thread_safe_print(f"   " + "-"*80)
+        return ai_response
+    except Exception as e:
+        thread_safe_print(f"   ❌ AI JSON mapping error: {sanitize_exception_message(e)}")
+        return None
+
+
+def parse_ai_json_mapping_response(ai_response):
+    """Parse a fenced or raw JSON object from AI mapping output."""
+    if not ai_response:
+        return {}
+
+    text = ai_response.strip()
+    fenced_match = re.search(r'```(?:json)?\s*(.*?)```', text, flags=re.DOTALL | re.IGNORECASE)
+    if fenced_match:
+        text = fenced_match.group(1).strip()
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as e:
+        thread_safe_print(f"      ❌ Could not parse AI JSON mapping response: {sanitize_exception_message(e)}")
+        return {}
+
+    if not isinstance(parsed, dict):
+        thread_safe_print("      ❌ AI JSON mapping response is not an object")
+        return {}
+
+    return {str(key): value for key, value in parsed.items() if isinstance(value, str)}
 
 def parse_ai_response(ai_response):
     """Parse AI response to extract section names"""
@@ -558,8 +800,10 @@ def resolve_batched_ai_matches(source_sections, ai_sections, target_hierarchy_di
     failed_keys = []
 
     for (key, source_hierarchy), ai_section in zip(source_sections.items(), ai_sections):
+        source_operation = source_diff_dict.get(key, {}).get("operation", "")
+        allow_reused_line = source_operation == "added"
         candidates = find_candidate_line_numbers_for_ai_section(
-            ai_section, target_hierarchy_dict, used_lines
+            ai_section, target_hierarchy_dict, None if allow_reused_line else used_lines
         )
         if not candidates:
             thread_safe_print(f"      ✗ No target hierarchy match found for batched AI section: {ai_section}")
@@ -567,13 +811,13 @@ def resolve_batched_ai_matches(source_sections, ai_sections, target_hierarchy_di
             continue
 
         target_line, target_hierarchy_str = choose_best_ai_match(candidates, source_hierarchy)
-        if not target_line or target_line in used_lines:
+        if not target_line or (target_line in used_lines and not allow_reused_line):
             thread_safe_print(f"      ✗ Duplicate or invalid batched match for {key}: {ai_section}")
             failed_keys.append(key)
             continue
 
-        used_lines.add(target_line)
-        source_operation = source_diff_dict.get(key, {}).get("operation", "")
+        if not allow_reused_line:
+            used_lines.add(target_line)
         resolved[key] = build_target_match_result(
             key, source_operation, target_line, target_hierarchy_str
         )
@@ -581,18 +825,123 @@ def resolve_batched_ai_matches(source_sections, ai_sections, target_hierarchy_di
     return resolved, failed_keys
 
 
-def batch_match_sections_with_ai(source_sections, target_hierarchy, ai_client, repo_config, max_tokens=20000):
+def resolve_keyed_ai_matches(source_sections, keyed_sections, target_hierarchy_dict, source_diff_dict):
+    """Validate and resolve a key -> target hierarchy AI mapping result."""
+    expected_keys = set(source_sections.keys())
+    actual_keys = set(keyed_sections.keys())
+    missing_keys = [key for key in source_sections if key not in actual_keys]
+    extra_keys = sorted(actual_keys - expected_keys)
+
+    if missing_keys:
+        thread_safe_print(
+            f"      ❌ AI JSON mapping is missing {len(missing_keys)} key(s): {', '.join(missing_keys)}"
+        )
+    if extra_keys:
+        thread_safe_print(
+            f"      ❌ AI JSON mapping returned unexpected key(s): {', '.join(extra_keys)}"
+        )
+
+    used_lines = set()
+    resolved = {}
+    failed_keys = list(missing_keys)
+
+    for key, source_hierarchy in source_sections.items():
+        if key not in keyed_sections:
+            continue
+
+        source_operation = source_diff_dict.get(key, {}).get("operation", "")
+        allow_reused_line = source_operation == "added"
+        ai_section = keyed_sections[key]
+        candidates = find_candidate_line_numbers_for_ai_section(
+            ai_section, target_hierarchy_dict, None if allow_reused_line else used_lines
+        )
+        if not candidates:
+            thread_safe_print(f"      ✗ No target hierarchy match found for {key}: {ai_section}")
+            failed_keys.append(key)
+            continue
+
+        target_line, target_hierarchy_str = choose_best_ai_match(candidates, source_hierarchy)
+        if not target_line or (target_line in used_lines and not allow_reused_line):
+            thread_safe_print(f"      ✗ Duplicate or invalid keyed match for {key}: {ai_section}")
+            failed_keys.append(key)
+            continue
+
+        if not allow_reused_line:
+            used_lines.add(target_line)
+        resolved[key] = build_target_match_result(
+            key, source_operation, target_line, target_hierarchy_str
+        )
+
+    return resolved, failed_keys
+
+
+def batch_match_sections_with_ai_json(
+    source_sections,
+    target_hierarchy,
+    ai_client,
+    repo_config,
+    max_tokens=20000,
+    source_diff_dict=None,
+    source_base_hierarchy=None,
+    source_head_hierarchy=None,
+    source_mode="",
+):
+    """Match multiple sections in one full-context AI call with key-based JSON."""
+    if not source_sections:
+        return {}, []
+
+    ai_response = get_corresponding_sections_json(
+        source_sections,
+        target_hierarchy,
+        ai_client,
+        repo_config,
+        max_tokens=max_tokens,
+        source_base_hierarchy=source_base_hierarchy,
+        source_head_hierarchy=source_head_hierarchy,
+        source_diff_dict=source_diff_dict,
+        source_mode=source_mode,
+    )
+    if not ai_response:
+        return {}, list(source_sections.keys())
+
+    keyed_sections = parse_ai_json_mapping_response(ai_response)
+    if not keyed_sections:
+        return {}, list(source_sections.keys())
+
+    return resolve_keyed_ai_matches(
+        source_sections,
+        keyed_sections,
+        target_hierarchy,
+        source_diff_dict or {},
+    )
+
+
+def batch_match_sections_with_ai(
+    source_sections,
+    target_hierarchy,
+    ai_client,
+    repo_config,
+    max_tokens=20000,
+    source_diff_dict=None,
+    source_base_hierarchy=None,
+    source_head_hierarchy=None,
+    source_mode="",
+):
     """Match multiple non-direct sections in one AI call."""
     if not source_sections:
         return [], []
 
     ai_response = get_corresponding_sections(
-        list(source_sections.values()),
+        source_sections,
         list(target_hierarchy.values()),
         ai_client,
         repo_config['source_language'],
         repo_config['target_language'],
         max_tokens,
+        source_base_hierarchy=source_base_hierarchy,
+        source_head_hierarchy=source_head_hierarchy,
+        source_diff_dict=source_diff_dict,
+        source_mode=source_mode,
     )
 
     if not ai_response:
@@ -714,6 +1063,104 @@ def choose_best_ai_match(ai_matched, source_hierarchy):
     # Fallback to largest line number to avoid accidentally choosing top-level title.
     items.sort(key=lambda x: int(x[0]))
     return items[-1]
+
+
+def validate_mapping_for_retry(matched_sections, source_diff_dict=None):
+    """Return deterministic mapping-risk errors that merit full-context retry."""
+    errors = []
+    claimed_lines = {}
+    source_diff_dict = source_diff_dict or {}
+    matched_keys = set(matched_sections or {})
+
+    for key, section_data in source_diff_dict.items():
+        operation = section_data.get("operation", "")
+        if operation in ("modified", "deleted") and key not in matched_keys:
+            errors.append(f"{key} ({operation}) did not map to any target section")
+
+    for key, section_data in matched_sections.items():
+        operation = section_data.get("source_operation", "")
+        if operation not in ("modified", "deleted"):
+            continue
+
+        target_line = section_data.get("target_line")
+        target_hierarchy = section_data.get("target_hierarchy", "")
+        source_hierarchy = section_data.get("source_matching_hierarchy") or section_data.get("source_original_hierarchy", "")
+
+        if not target_line or target_line in ("unknown", "-1"):
+            continue
+
+        previous_key = claimed_lines.get(target_line)
+        if previous_key:
+            errors.append(
+                f"{key} and {previous_key} both map to target line {target_line} ({target_hierarchy})"
+            )
+        else:
+            claimed_lines[target_line] = key
+
+        source_level = get_heading_level(source_hierarchy)
+        target_level = get_heading_level(target_hierarchy)
+        old_heading_level = get_heading_level(
+            extract_first_heading_from_content(section_data.get("source_old_content", ""))
+        )
+        new_heading_level = get_heading_level(
+            extract_first_heading_from_content(section_data.get("source_new_content", ""))
+        )
+        source_heading_level_changed = (
+            old_heading_level is not None
+            and new_heading_level is not None
+            and old_heading_level != new_heading_level
+        )
+        if (
+            not source_heading_level_changed
+            and source_level is not None
+            and target_level is not None
+            and source_level != target_level
+        ):
+            errors.append(
+                f"{key} maps source level {source_level} ({source_hierarchy}) "
+                f"to target level {target_level} ({target_hierarchy})"
+            )
+
+    return errors
+
+
+def validate_commit_mode_matches(matched_sections, source_diff_dict=None):
+    """Return validation errors that should block commit-mode writes."""
+    return validate_mapping_for_retry(matched_sections, source_diff_dict)
+
+
+def build_enhanced_match_result(key, hierarchy, matching_hierarchy, result, source_info, target_lines):
+    """Attach target/source content metadata to a raw target match result."""
+    target_line = result.get('target_line', 'unknown')
+    target_content = ""
+
+    if hierarchy == "intro_section" or key == "intro_section":
+        target_content, _ = extract_intro_section_content_from_lines(target_lines)
+    elif target_line == '-1':
+        target_content = ""
+    elif target_line != 'unknown' and target_line != '0':
+        try:
+            target_line_num = int(target_line)
+            target_content = extract_section_direct_content(target_line_num, target_lines)
+        except (ValueError, IndexError):
+            target_content = ""
+    elif target_line == '0':
+        target_content = extract_frontmatter_content(target_lines)
+
+    target_end_marker = source_info.get('target_end_marker')
+    if target_end_marker:
+        target_content = trim_content_by_end_marker(target_content, target_end_marker)
+
+    return {
+        **result,
+        'target_content': target_content,
+        'source_original_hierarchy': source_info.get('original_hierarchy', ''),
+        'source_matching_hierarchy': matching_hierarchy,
+        'source_operation': source_info.get('operation', ''),
+        'source_old_content': source_info.get('old_content', ''),
+        'source_new_content': source_info.get('new_content', ''),
+        'target_end_marker': target_end_marker
+    }
 
 def build_hierarchy_path(lines, line_num, all_headers):
     """Build the full hierarchy path for a header at given line (from auto-sync-pr-changes.py)"""
@@ -857,7 +1304,19 @@ def extract_hierarchies_from_diff_dict(source_diff_dict):
     
     return extracted_hierarchies
 
-def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines, ai_client, repo_config, max_non_system_sections=120, max_tokens=20000):
+def match_source_diff_to_target(
+    source_diff_dict,
+    target_hierarchy,
+    target_lines,
+    ai_client,
+    repo_config,
+    max_non_system_sections=120,
+    max_tokens=20000,
+    source_mode=None,
+    source_base_hierarchy=None,
+    source_head_hierarchy=None,
+    source_hierarchy_provider=None,
+):
     """
     Match source_diff_dict original_hierarchy to target file sections
     Uses direct matching for system variables/config and AI matching for others
@@ -873,6 +1332,8 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
             - source_new_content: New content from source diff
     """
     thread_safe_print(f"🔗 Starting source diff to target matching...")
+    normalized_source_mode = (source_mode or repo_config.get("source_mode") or "pr").lower()
+    full_context_max_sections = int(os.getenv("FULL_CONTEXT_MAPPING_MAX_SECTIONS", "100"))
     
     # Extract hierarchies from source diff dict
     source_hierarchies = extract_hierarchies_from_diff_dict(source_diff_dict)
@@ -938,6 +1399,10 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
                 ai_client,
                 repo_config,
                 max_tokens,
+                source_diff_dict=source_entries,
+                source_base_hierarchy=None,
+                source_head_hierarchy=None,
+                source_mode=normalized_source_mode,
             )
             if batch_call_failures:
                 batched_ai_failures.update(batch_call_failures)
@@ -1063,48 +1528,116 @@ def match_source_diff_to_target(source_diff_dict, target_hierarchy, target_lines
         if result:
             # Add source language information from source_diff_dict
             source_info = source_entries.get(key, {})
-            
-            # Extract target content from target_lines
-            target_line = result.get('target_line', 'unknown')
-            target_content = ""
-            
-            # Special handling for intro section
-            if hierarchy == "intro_section" or key == "intro_section":
-                # Extract intro section content from target
-                target_content, _ = extract_intro_section_content_from_lines(target_lines)
-            elif target_line == '-1':
-                # Bottom-added sections do not have existing target content.
-                target_content = ""
-            elif target_line != 'unknown' and target_line != '0':
-                try:
-                    target_line_num = int(target_line)
-                    # For ALL operations, only extract direct content (no sub-sections)
-                    # This avoids duplication when both parent and child sections have operations
-                    target_content = extract_section_direct_content(target_line_num, target_lines)
-                except (ValueError, IndexError):
-                    target_content = ""
-            elif target_line == '0':
-                # For frontmatter, extract content from beginning to first header
-                target_content = extract_frontmatter_content(target_lines)
-
-            target_end_marker = source_info.get('target_end_marker')
-            if target_end_marker:
-                target_content = trim_content_by_end_marker(target_content, target_end_marker)
-            
-            enhanced_result = {
-                **result,  # Include existing target matching info
-                'target_content': target_content,  # Add target section content
-                'source_original_hierarchy': source_info.get('original_hierarchy', ''),
-                'source_operation': source_info.get('operation', ''),
-                'source_old_content': source_info.get('old_content', ''),
-                'source_new_content': source_info.get('new_content', ''),
-                'target_end_marker': target_end_marker
-            }
-            all_matched_sections[key] = enhanced_result
-            verbose_thread_safe_print(f"      ✅ {key}: -> line {target_line}")
+            all_matched_sections[key] = build_enhanced_match_result(
+                key,
+                hierarchy,
+                matching_hierarchy,
+                result,
+                source_info,
+                target_lines,
+            )
+            verbose_thread_safe_print(f"      ✅ {key}: -> line {result.get('target_line', 'unknown')}")
         else:
             thread_safe_print(f"      ❌ {key}: matching failed")
-    
+
+    validation_errors = validate_mapping_for_retry(all_matched_sections, source_entries)
+    if validation_errors:
+        thread_safe_print("\n⚠️  Section mapping risk detected after lightweight mapping:")
+        for error in validation_errors:
+            thread_safe_print(f"   - {error}")
+
+        can_retry_with_full_context = (
+            len(target_hierarchy or {}) <= full_context_max_sections
+            and bool(batched_ai_sections)
+        )
+        if can_retry_with_full_context:
+            if not source_base_hierarchy and not source_head_hierarchy and source_hierarchy_provider:
+                try:
+                    source_base_hierarchy, source_head_hierarchy = source_hierarchy_provider()
+                except Exception as e:
+                    thread_safe_print(
+                        f"   ⚠️  Could not load source hierarchy context for retry: "
+                        f"{sanitize_exception_message(e)}"
+                    )
+
+            if source_base_hierarchy or source_head_hierarchy:
+                thread_safe_print(
+                    f"   🧭 Retrying section mapping with full context "
+                    f"({normalized_source_mode} mode, {len(target_hierarchy or {})} target sections)"
+                )
+                retry_batched_results, retry_validation_failures = batch_match_sections_with_ai_json(
+                    batched_ai_sections,
+                    filtered_target_hierarchy or filter_non_system_sections(target_hierarchy),
+                    ai_client,
+                    repo_config,
+                    max_tokens,
+                    source_diff_dict=source_entries,
+                    source_base_hierarchy=source_base_hierarchy,
+                    source_head_hierarchy=source_head_hierarchy,
+                    source_mode=normalized_source_mode,
+                )
+
+                if retry_validation_failures:
+                    thread_safe_print(
+                        f"   ⚠️  Full-context JSON mapping left "
+                        f"{len(retry_validation_failures)} unresolved section(s)"
+                    )
+
+                if retry_batched_results:
+                    retried_sections = all_matched_sections.copy()
+                    for key, result in retry_batched_results.items():
+                        hierarchy = source_hierarchies.get(key, "")
+                        matching_hierarchy = matching_hierarchies.get(key, hierarchy)
+                        retried_sections[key] = build_enhanced_match_result(
+                            key,
+                            hierarchy,
+                            matching_hierarchy,
+                            result,
+                            source_entries.get(key, {}),
+                            target_lines,
+                        )
+
+                    retry_validation_errors = validate_mapping_for_retry(
+                        retried_sections,
+                        source_entries,
+                    )
+                    if normalized_source_mode == "pr":
+                        if len(retry_validation_errors) <= len(validation_errors):
+                            thread_safe_print(
+                                f"   ✅ Using full-context retry result for PR-mode mapping "
+                                f"({len(retry_validation_errors)} remaining risk item(s))"
+                            )
+                            all_matched_sections = retried_sections
+                            validation_errors = retry_validation_errors
+                        else:
+                            thread_safe_print(
+                                f"   ↪ Keeping lightweight PR-mode mapping because retry increased risk "
+                                f"({len(validation_errors)} -> {len(retry_validation_errors)})"
+                            )
+                    else:
+                        all_matched_sections = retried_sections
+                        validation_errors = retry_validation_errors
+                        if validation_errors:
+                            thread_safe_print("\n❌ Commit-mode full-context mapping validation failed:")
+                            for error in validation_errors:
+                                thread_safe_print(f"   - {error}")
+                            return {}
+                elif normalized_source_mode == "commit":
+                    thread_safe_print("   ❌ Commit-mode full-context mapping produced no usable repair result")
+                    return {}
+            else:
+                thread_safe_print("   ⚠️  No source hierarchy context available for full-context retry")
+        else:
+            thread_safe_print("   ⚠️  Full-context retry is not available for this file")
+
+    if normalized_source_mode == "commit":
+        validation_errors = validate_commit_mode_matches(all_matched_sections, source_entries)
+        if validation_errors:
+            thread_safe_print("\n❌ Commit-mode section mapping validation failed:")
+            for error in validation_errors:
+                thread_safe_print(f"   - {error}")
+            return {}
+
     thread_safe_print(f"\n📊 Final matching results: {len(all_matched_sections)} total matches")
     return all_matched_sections
 

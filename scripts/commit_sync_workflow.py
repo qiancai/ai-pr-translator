@@ -262,6 +262,7 @@ def get_commit_repo_config():
         "target_local_path": TARGET_REPO_PATH,
         "target_ref": TARGET_REF,
         "prefer_local_target_for_read": PREFER_LOCAL_TARGET_FOR_READ,
+        "source_mode": "commit",
         "source_language": source_language,
         "target_language": target_language,
     }

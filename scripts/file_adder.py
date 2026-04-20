@@ -10,6 +10,7 @@ import threading
 from github import Github
 from openai import OpenAI
 from log_sanitizer import sanitize_exception_message
+from svg_preprocessor import strip_svgs, restore_svgs
 
 # Thread-safe printing
 print_lock = threading.Lock()
@@ -122,6 +123,10 @@ def translate_file_batch(batch_content, ai_client, source_language="English", ta
         source_mode=source_mode,
     )
 
+    prompt_batch_content, svg_map = strip_svgs(prompt_batch_content)
+    if svg_map:
+        thread_safe_print(f"   🖼️  Replaced {len(svg_map)} SVG(s) with placeholders for AI translation")
+
     # Build glossary section for prompt if matcher is provided
     glossary_prompt_section = ""
     glossary_instruction = ""
@@ -186,6 +191,7 @@ Please provide the translated content maintaining all formatting and structure."
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1
         )
+        translated_content = restore_svgs(translated_content, svg_map)
         thread_safe_print(f"   ✅ Batch translation completed")
         return translated_content
         

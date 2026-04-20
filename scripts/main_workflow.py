@@ -29,7 +29,7 @@ os.environ.setdefault(
 
 # Import all modules
 from ai_client import UnifiedAIClient, thread_safe_print, print_lock, PROVIDER_MAX_TOKENS
-from diff_analyzer import analyze_source_changes, get_repo_config, get_target_hierarchy_and_content, parse_pr_url
+from diff_analyzer import analyze_source_changes, get_repo_config, get_target_hierarchy_and_content, get_source_file_hierarchy, parse_pr_url
 from image_processor import process_all_images
 from file_adder import process_added_files
 from file_deleter import process_deleted_files
@@ -98,6 +98,7 @@ def get_workflow_repo_configs():
             "target_repo": target_repo_key,
             "target_local_path": TARGET_REPO_PATH,
             "prefer_local_target_for_read": False,
+            "source_mode": "pr",
             "source_language": source_language,
             "target_language": target_language
         }
@@ -481,6 +482,27 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, so
         
         thread_safe_print(f"   📖 Target file: {len(target_hierarchy)} sections, {len(target_lines)} lines")
         
+        source_mode = source_context_or_pr_url.get("mode", "pr") if isinstance(source_context_or_pr_url, dict) else "pr"
+
+        def load_source_hierarchy_context():
+            source_base_hierarchy = get_source_file_hierarchy(
+                source_file_path,
+                source_context_or_pr_url,
+                github_client,
+                get_base_version=True,
+            )
+            source_head_hierarchy = get_source_file_hierarchy(
+                source_file_path,
+                source_context_or_pr_url,
+                github_client,
+                get_base_version=False,
+            )
+            thread_safe_print(
+                f"   🧭 Source hierarchy context for retry: "
+                f"{len(source_base_hierarchy)} base sections, {len(source_head_hierarchy)} head sections"
+            )
+            return source_base_hierarchy, source_head_hierarchy
+
         # Perform source diff to target matching
         thread_safe_print(f"   🔗 Matching source diff to target...")
         enhanced_sections = match_source_diff_to_target(
@@ -490,7 +512,9 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, so
             ai_client, 
             repo_config, 
             max_sections,
-            AI_MAX_TOKENS
+            AI_MAX_TOKENS,
+            source_mode=source_mode,
+            source_hierarchy_provider=load_source_hierarchy_context,
         )
         
         if not enhanced_sections:

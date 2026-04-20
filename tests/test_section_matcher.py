@@ -182,6 +182,56 @@ class SectionMatcherRegressionTest(unittest.TestCase):
         self.assertEqual(result["added_178"]["insertion_type"], "before_reference")
         self.assertEqual(result["deleted_178"]["target_line"], "22")
 
+    def test_added_section_can_reuse_modified_target_anchor(self):
+        repo_config = {
+            "source_language": "English",
+            "target_language": "Chinese",
+        }
+        target_lines = ["# 标题", "", "## 管理组织访问", ""]
+        target_hierarchy = {
+            "1": "# 标题",
+            "3": "## 管理组织访问",
+        }
+        source_diff_dict = {
+            "added_146": {
+                "operation": "added",
+                "original_hierarchy": "## Manage organization access",
+                "old_content": "",
+                "new_content": "### Instance roles\n\nnew",
+            },
+            "modified_172": {
+                "operation": "modified",
+                "original_hierarchy": "## Manage organization access",
+                "old_content": "## Manage organization access\n\nold",
+                "new_content": "## Manage organization access\n\nnew",
+            },
+        }
+        ai_client = FakeAIClient(
+            [
+                "\n".join(
+                    [
+                        "```",
+                        "## 管理组织访问",
+                        "## 管理组织访问",
+                        "```",
+                    ]
+                )
+            ]
+        )
+
+        result = match_source_diff_to_target(
+            source_diff_dict,
+            target_hierarchy,
+            target_lines,
+            ai_client,
+            repo_config,
+        )
+
+        self.assertEqual(len(ai_client.prompts), 1)
+        self.assertEqual(result["added_146"]["target_line"], "3")
+        self.assertEqual(result["added_146"]["insertion_type"], "before_reference")
+        self.assertEqual(result["modified_172"]["target_line"], "3")
+
     def test_match_source_diff_to_target_falls_back_when_batch_result_is_incomplete(self):
         repo_config = {
             "source_language": "English",
@@ -412,6 +462,235 @@ class SectionMatcherRegressionTest(unittest.TestCase):
 
         self.assertEqual(ai_sections, [])
         self.assertEqual(failed_keys, ["modified_16"])
+
+    def test_pr_mode_retries_with_full_context_without_hard_rejecting(self):
+        repo_config = {
+            "source_language": "English",
+            "target_language": "Chinese",
+            "source_mode": "pr",
+        }
+        target_lines = [
+            "# 监控 TiDB",
+            "",
+            "## 监控指标",
+            "",
+            "### 指标页面",
+            "",
+        ]
+        target_hierarchy = {
+            "1": "# 监控 TiDB",
+            "3": "## 监控指标",
+            "5": "## 监控指标 > ### 指标页面",
+        }
+        source_diff_dict = {
+            "modified_79": {
+                "operation": "modified",
+                "original_hierarchy": "## Monitoring metrics",
+                "old_content": "## Monitoring metrics\n\nold",
+                "new_content": "## Monitoring metrics\n\nnew",
+            },
+        }
+        ai_client = FakeAIClient(
+            [
+                "```\n## 监控指标 > ### 指标页面\n```",
+                '```json\n{"modified_79": "## 监控指标"}\n```',
+            ]
+        )
+
+        result = match_source_diff_to_target(
+            source_diff_dict,
+            target_hierarchy,
+            target_lines,
+            ai_client,
+            repo_config,
+            source_base_hierarchy={6: "# Monitor TiDB", 79: "## Monitoring metrics"},
+            source_head_hierarchy={6: "# Monitor TiDB", 79: "## Monitoring metrics"},
+        )
+
+        self.assertEqual(result["modified_79"]["target_line"], "3")
+        self.assertEqual(len(ai_client.prompts), 2)
+        self.assertNotIn("Full English BASE section structure", ai_client.prompts[0])
+        self.assertIn("This is PR mode", ai_client.prompts[1])
+        self.assertIn("Full English BASE section structure", ai_client.prompts[1])
+        self.assertIn("Return a JSON object", ai_client.prompts[1])
+
+    def test_full_context_provider_is_not_called_without_mapping_risk(self):
+        repo_config = {
+            "source_language": "English",
+            "target_language": "Chinese",
+            "source_mode": "commit",
+        }
+        target_lines = ["# 监控 TiDB", "", "## 监控指标", ""]
+        target_hierarchy = {
+            "1": "# 监控 TiDB",
+            "3": "## 监控指标",
+        }
+        source_diff_dict = {
+            "modified_79": {
+                "operation": "modified",
+                "original_hierarchy": "## Monitoring metrics",
+                "old_content": "## Monitoring metrics\n\nold",
+                "new_content": "## Monitoring metrics\n\nnew",
+            },
+        }
+        ai_client = FakeAIClient(["```\n## 监控指标\n```"])
+
+        def fail_if_called():
+            raise AssertionError("source hierarchy provider should be lazy")
+
+        result = match_source_diff_to_target(
+            source_diff_dict,
+            target_hierarchy,
+            target_lines,
+            ai_client,
+            repo_config,
+            source_hierarchy_provider=fail_if_called,
+        )
+
+        self.assertEqual(result["modified_79"]["target_line"], "3")
+        self.assertEqual(len(ai_client.prompts), 1)
+        self.assertNotIn("Full English BASE section structure", ai_client.prompts[0])
+
+    def test_commit_mode_retries_full_context_then_rejects_level_mismatch(self):
+        repo_config = {
+            "source_language": "English",
+            "target_language": "Chinese",
+            "source_mode": "commit",
+        }
+        target_lines = [
+            "# 监控 TiDB",
+            "",
+            "## 监控指标",
+            "",
+            "### 指标页面",
+            "",
+        ]
+        target_hierarchy = {
+            "1": "# 监控 TiDB",
+            "3": "## 监控指标",
+            "5": "## 监控指标 > ### 指标页面",
+        }
+        source_diff_dict = {
+            "modified_79": {
+                "operation": "modified",
+                "original_hierarchy": "## Monitoring metrics",
+                "old_content": "## Monitoring metrics\n\nold",
+                "new_content": "## Monitoring metrics\n\nnew",
+            },
+        }
+        ai_client = FakeAIClient(
+            [
+                "```\n## 监控指标 > ### 指标页面\n```",
+                '```json\n{"modified_79": "## 监控指标 > ### 指标页面"}\n```',
+            ]
+        )
+
+        result = match_source_diff_to_target(
+            source_diff_dict,
+            target_hierarchy,
+            target_lines,
+            ai_client,
+            repo_config,
+            source_base_hierarchy={6: "# Monitor TiDB", 79: "## Monitoring metrics"},
+            source_head_hierarchy={6: "# Monitor TiDB", 79: "## Monitoring metrics"},
+        )
+
+        self.assertEqual(result, {})
+        self.assertEqual(len(ai_client.prompts), 2)
+        self.assertNotIn("Full English BASE section structure", ai_client.prompts[0])
+        self.assertIn("This is commit-based mode", ai_client.prompts[1])
+        self.assertIn("Return a JSON object", ai_client.prompts[1])
+
+    def test_commit_mode_allows_level_mismatch_when_source_heading_level_changed(self):
+        repo_config = {
+            "source_language": "English",
+            "target_language": "Chinese",
+            "source_mode": "commit",
+        }
+        target_lines = [
+            "# SQL",
+            "",
+            "## Statements",
+            "",
+            "### SQL statement",
+            "",
+        ]
+        target_hierarchy = {
+            "1": "# SQL",
+            "3": "## Statements",
+            "5": "## Statements > ### SQL statement",
+        }
+        source_diff_dict = {
+            "modified_20": {
+                "operation": "modified",
+                "original_hierarchy": "## SQL statement",
+                "old_content": "## SQL statement\n\nold",
+                "new_content": "### SQL statement\n\nnew",
+            },
+        }
+        ai_client = FakeAIClient(["```\n## Statements > ### SQL statement\n```"])
+
+        result = match_source_diff_to_target(
+            source_diff_dict,
+            target_hierarchy,
+            target_lines,
+            ai_client,
+            repo_config,
+            source_base_hierarchy={20: "## SQL statement"},
+            source_head_hierarchy={20: "### SQL statement"},
+        )
+
+        self.assertEqual(result["modified_20"]["target_line"], "5")
+        self.assertEqual(len(ai_client.prompts), 1)
+        self.assertNotIn("Full English BASE section structure", ai_client.prompts[0])
+
+    def test_commit_mode_rejects_duplicate_modified_target_lines(self):
+        repo_config = {
+            "source_language": "English",
+            "target_language": "Chinese",
+            "source_mode": "commit",
+        }
+        target_lines = ["# 标题", "", "## 同一节", ""]
+        target_hierarchy = {
+            "1": "# 标题",
+            "3": "## 同一节",
+        }
+        source_diff_dict = {
+            "modified_10": {
+                "operation": "modified",
+                "original_hierarchy": "## First section",
+                "old_content": "## First section\n\nold",
+                "new_content": "## First section\n\nnew",
+            },
+            "modified_20": {
+                "operation": "modified",
+                "original_hierarchy": "## Second section",
+                "old_content": "## Second section\n\nold",
+                "new_content": "## Second section\n\nnew",
+            },
+        }
+        ai_client = FakeAIClient(
+            [
+                "```\n## 同一节\n## 同一节\n```",
+                "```\n## 同一节\n```",
+                '```json\n{"modified_10": "## 同一节", "modified_20": "## 同一节"}\n```',
+            ]
+        )
+
+        result = match_source_diff_to_target(
+            source_diff_dict,
+            target_hierarchy,
+            target_lines,
+            ai_client,
+            repo_config,
+            source_base_hierarchy={10: "## First section", 20: "## Second section"},
+            source_head_hierarchy={10: "## First section", 20: "## Second section"},
+        )
+
+        self.assertEqual(result, {})
+        self.assertEqual(len(ai_client.prompts), 3)
+        self.assertIn("Full English BASE section structure", ai_client.prompts[2])
+        self.assertIn("Return a JSON object", ai_client.prompts[2])
 
 
 if __name__ == "__main__":

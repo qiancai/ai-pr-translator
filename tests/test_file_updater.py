@@ -12,11 +12,15 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from file_updater import (
+    REGULAR_TRANSLATION_CHUNK_SIZE,
+    TRANSLATION_CHUNK_MAX_SECTIONS,
     TranslationResult,
     build_heading_anchor_slug,
     build_translation_chunks,
+    get_translation_chunk_max_sections,
     get_updated_sections_from_ai,
     preprocess_diff_for_heading_anchor_stability,
+    process_single_file,
     update_target_document_from_match_data,
 )
 
@@ -309,6 +313,64 @@ class FileUpdaterRegressionTest(unittest.TestCase):
             self.assertTrue(updated_content.endswith("New content\n"))
             self.assertFalse(updated_content.endswith("New content\n\n"))
 
+    def test_update_preserves_missing_final_newline(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            target_file = tmp_path / "example.md"
+            match_file = tmp_path / "example-match_source_diff_to_target.json"
+
+            target_file.write_text("# Example\n\n## Last section\n\nOld content", encoding="utf-8")
+            match_file.write_text(
+                json.dumps(
+                    {
+                        "modified_3": {
+                            "source_operation": "modified",
+                            "target_line": "3",
+                            "target_hierarchy": "## Last section",
+                            "target_new_content": "## Last section\n\nNew content\n\n",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            success = update_target_document_from_match_data(
+                str(match_file), str(tmp_path), "example.md"
+            )
+
+            self.assertTrue(success)
+            updated_content = target_file.read_text(encoding="utf-8")
+            self.assertEqual(updated_content, "# Example\n\n## Last section\n\nNew content")
+
+    def test_update_preserves_existing_final_newline(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            target_file = tmp_path / "example.md"
+            match_file = tmp_path / "example-match_source_diff_to_target.json"
+
+            target_file.write_text("# Example\n\n## Last section\n\nOld content\n", encoding="utf-8")
+            match_file.write_text(
+                json.dumps(
+                    {
+                        "modified_3": {
+                            "source_operation": "modified",
+                            "target_line": "3",
+                            "target_hierarchy": "## Last section",
+                            "target_new_content": "## Last section\n\nNew content",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            success = update_target_document_from_match_data(
+                str(match_file), str(tmp_path), "example.md"
+            )
+
+            self.assertTrue(success)
+            updated_content = target_file.read_text(encoding="utf-8")
+            self.assertEqual(updated_content, "# Example\n\n## Last section\n\nNew content\n")
+
     def test_large_system_sections_are_translated_in_chunks_and_merged(self):
         class FakeAIClient:
             def __init__(self):
@@ -385,6 +447,24 @@ class FileUpdaterRegressionTest(unittest.TestCase):
             chunks = build_translation_chunks(source_sections, target_sections)
 
         self.assertEqual([chunk["keys"] for chunk in chunks], [["modified_1"], ["modified_2", "modified_3"]])
+
+    def test_default_translation_chunk_size_uses_regular_doc_limit(self):
+        self.assertEqual(TRANSLATION_CHUNK_MAX_SECTIONS, REGULAR_TRANSLATION_CHUNK_SIZE)
+        self.assertEqual(get_translation_chunk_max_sections("guide.md"), REGULAR_TRANSLATION_CHUNK_SIZE)
+        self.assertEqual(get_translation_chunk_max_sections("system-variables.md"), 20)
+
+        source_sections = {
+            f"modified_{index}": f"section {index}"
+            for index in range(REGULAR_TRANSLATION_CHUNK_SIZE + 1)
+        }
+
+        with mock.patch("file_updater.TRANSLATION_CHUNK_CHAR_LIMIT", 100000):
+            chunks = build_translation_chunks(source_sections)
+
+        self.assertEqual(
+            [len(chunk["keys"]) for chunk in chunks],
+            [REGULAR_TRANSLATION_CHUNK_SIZE, 1],
+        )
 
     def test_chunk_glossary_matching_uses_chunk_filtered_diff(self):
         class FakeAIClient:
@@ -567,6 +647,172 @@ class FileUpdaterRegressionTest(unittest.TestCase):
             self.assertIn("tidb_chunk_test_021", result.failures[0])
         finally:
             self._cleanup_chunk_test_outputs(prefix)
+
+    def test_enhanced_modified_section_prompt_falls_back_to_new_content_when_old_missing(self):
+        class FakeAIClient:
+            def __init__(self):
+                self.prompts = []
+
+            def chat_completion(self, messages, temperature=0.1):
+                self.prompts.append(messages[0]["content"])
+                return json.dumps({"modified_10": "### 新标题\n\n新内容"})
+
+        ai_client = FakeAIClient()
+        success, updated_sections = process_single_file(
+            "example.md",
+            {
+                "type": "enhanced_sections",
+                "sections": {
+                    "modified_10": {
+                        "source_operation": "modified",
+                        "source_old_content": "",
+                        "source_new_content": "### New heading\n\nNew content",
+                        "target_content": "### 旧标题\n\n旧内容",
+                    }
+                },
+            },
+            "File: example.md\n@@ -10,1 +10,1 @@\n-### Old heading\n+### New heading",
+            {"mode": "commit"},
+            github_client=None,
+            ai_client=ai_client,
+            repo_config={
+                "source_language": "English",
+                "target_language": "Chinese",
+            },
+        )
+
+        self.assertTrue(success)
+        self.assertEqual(updated_sections["modified_10"], "### 新标题\n\n新内容")
+        self.assertIn("### New heading", ai_client.prompts[0])
+        self.assertIn("New content", ai_client.prompts[0])
+        self.assertIn("after applying the diff", ai_client.prompts[0])
+        self.assertIn("modified_10", ai_client.prompts[0])
+        self.assertNotIn('"modified_10": ""', ai_client.prompts[0])
+
+    def test_enhanced_modified_section_prompt_uses_new_content(self):
+        """Prompt should contain post-change (new) source content so the AI
+        sees the full final state and does not miss added paragraphs."""
+        class FakeAIClient:
+            def __init__(self):
+                self.prompts = []
+
+            def chat_completion(self, messages, temperature=0.1):
+                self.prompts.append(messages[0]["content"])
+                return json.dumps({"modified_10": "### 新标题\n\n新内容"})
+
+        ai_client = FakeAIClient()
+        success, updated_sections = process_single_file(
+            "example.md",
+            {
+                "type": "enhanced_sections",
+                "sections": {
+                    "modified_10": {
+                        "source_operation": "modified",
+                        "source_old_content": "### Old heading\n\nOld content",
+                        "source_new_content": "### New heading\n\nNew content",
+                        "target_content": "### 旧标题\n\n旧内容",
+                    }
+                },
+            },
+            "File: example.md\n@@ -10,1 +10,1 @@\n-### Old heading\n+### New heading",
+            {"mode": "commit"},
+            github_client=None,
+            ai_client=ai_client,
+            repo_config={
+                "source_language": "English",
+                "target_language": "Chinese",
+            },
+        )
+
+        self.assertTrue(success)
+        self.assertEqual(updated_sections["modified_10"], "### 新标题\n\n新内容")
+        self.assertIn("New heading", ai_client.prompts[0])
+        self.assertIn("New content", ai_client.prompts[0])
+        self.assertIn("post-change", ai_client.prompts[0])
+
+    # ------------------------------------------------------------------
+    # Cross-parent move detection tests
+    # ------------------------------------------------------------------
+    def test_cross_parent_move_splits_into_delete_and_insert(self):
+        """When a modified section has empty old_content, a completely
+        different heading, and an added parent section exists, the entry
+        should be split into a delete + insert."""
+        from file_updater import _detect_and_fix_cross_parent_moves
+
+        sections = [
+            ("added_328", {
+                "source_operation": "added",
+                "source_new_content": "## Manage instance access\n",
+                "target_new_content": "## 管理实例访问\n",
+                "target_hierarchy": "## 管理用户资料",
+                "insertion_type": "before_reference",
+            }, 327),
+            ("modified_354", {
+                "source_operation": "modified",
+                "source_old_content": "",
+                "source_new_content": "### Remove instance access\n\nSome content.\n",
+                "source_original_hierarchy": "### Modify project roles",
+                "target_hierarchy": "## 管理项目访问 > ### 修改项目角色",
+                "target_new_content": "### 移除实例访问权限\n\n一些内容。\n",
+            }, 299),
+        ]
+
+        result = _detect_and_fix_cross_parent_moves(sections)
+
+        keys = [k for k, _, _ in result]
+        self.assertIn("added_328", keys)
+        self.assertIn("modified_354_delete", keys)
+        self.assertIn("modified_354_insert", keys)
+        self.assertNotIn("modified_354", keys)
+
+        for key, data, line in result:
+            if key == "modified_354_delete":
+                self.assertEqual(data["source_operation"], "deleted")
+                self.assertEqual(line, 299)
+            elif key == "modified_354_insert":
+                self.assertEqual(data["insertion_type"], "before_reference")
+                self.assertEqual(line, 327)
+                self.assertIn("移除实例访问权限", data["target_new_content"])
+
+    def test_cross_parent_move_no_false_positive_for_heading_rename(self):
+        """A heading rename (old content present, same parent) must NOT
+        be treated as a cross-parent move."""
+        from file_updater import _detect_and_fix_cross_parent_moves
+
+        sections = [
+            ("modified_100", {
+                "source_operation": "modified",
+                "source_old_content": "### Old heading\n\nContent.",
+                "source_new_content": "### New heading\n\nContent.",
+                "source_original_hierarchy": "## Parent > ### Old heading",
+                "target_hierarchy": "## 父级 > ### 旧标题",
+                "target_new_content": "### 新标题\n\n内容。",
+            }, 50),
+        ]
+
+        result = _detect_and_fix_cross_parent_moves(sections)
+        keys = [k for k, _, _ in result]
+        self.assertEqual(keys, ["modified_100"])
+
+    def test_cross_parent_move_no_split_without_added_parent(self):
+        """If there is no added parent H2, the section should not be split
+        even if the heading changed completely."""
+        from file_updater import _detect_and_fix_cross_parent_moves
+
+        sections = [
+            ("modified_354", {
+                "source_operation": "modified",
+                "source_old_content": "",
+                "source_new_content": "### Totally new heading\n\nNew stuff.\n",
+                "source_original_hierarchy": "### Old heading",
+                "target_hierarchy": "## 父级 > ### 旧标题",
+                "target_new_content": "### 全新标题\n\n新内容。\n",
+            }, 299),
+        ]
+
+        result = _detect_and_fix_cross_parent_moves(sections)
+        keys = [k for k, _, _ in result]
+        self.assertEqual(keys, ["modified_354"])
 
 
 if __name__ == "__main__":
