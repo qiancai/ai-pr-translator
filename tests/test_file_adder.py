@@ -1,5 +1,6 @@
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -8,7 +9,7 @@ from unittest import mock
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from file_adder import preprocess_added_file_batch_for_heading_anchor_stability
+from file_adder import preprocess_added_file_batch_for_heading_anchor_stability, process_added_files
 
 
 class FileAdderRegressionTest(unittest.TestCase):
@@ -113,6 +114,58 @@ class FileAdderRegressionTest(unittest.TestCase):
             processed,
             "See [Private Endpoints](https://docs.pingcap.com/tidbcloud/set-up-private-endpoint-connections-serverless2).",
         )
+
+    def test_process_added_files_can_overwrite_existing_target_file(self):
+        repo_config = {
+            "target_local_path": "",
+            "source_language": "English",
+            "target_language": "Chinese",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_config["target_local_path"] = tmpdir
+            target_file = Path(tmpdir, "guide.md")
+            target_file.write_text("old target", encoding="utf-8")
+
+            with mock.patch("file_adder.translate_file_batch", return_value="translated target"):
+                success, failures = process_added_files(
+                    {"guide.md": "# Guide\n\nSource content"},
+                    {"mode": "commit"},
+                    object(),
+                    object(),
+                    repo_config,
+                    return_details=True,
+                    overwrite_existing=True,
+                )
+
+            self.assertTrue(success)
+            self.assertEqual(failures, {})
+            self.assertEqual(target_file.read_text(encoding="utf-8"), "translated target")
+
+    def test_process_added_files_still_rejects_existing_target_file_by_default(self):
+        repo_config = {
+            "target_local_path": "",
+            "source_language": "English",
+            "target_language": "Chinese",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_config["target_local_path"] = tmpdir
+            target_file = Path(tmpdir, "guide.md")
+            target_file.write_text("old target", encoding="utf-8")
+
+            success, failures = process_added_files(
+                {"guide.md": "# Guide\n\nSource content"},
+                {"mode": "commit"},
+                object(),
+                object(),
+                repo_config,
+                return_details=True,
+            )
+
+            self.assertFalse(success)
+            self.assertIn("guide.md", failures)
+            self.assertEqual(target_file.read_text(encoding="utf-8"), "old target")
 
 
 if __name__ == "__main__":

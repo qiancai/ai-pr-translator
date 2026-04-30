@@ -73,7 +73,7 @@ def extract_markdown_doc_links(markdown):
     return links
 
 
-def build_allowed_files(docs_source_path, toc_files):
+def build_allowed_files(docs_source_path, toc_files, extra_files=None):
     allowed = set(toc_files)
     source_root = Path(docs_source_path)
 
@@ -82,6 +82,11 @@ def build_allowed_files(docs_source_path, toc_files):
         if not toc_path.exists():
             raise FileNotFoundError(f"Cloud TOC file not found: {toc_path}")
         allowed.update(extract_markdown_doc_links(toc_path.read_text(encoding="utf-8")))
+
+    for extra_file in extra_files or []:
+        rel = normalize_doc_path(extra_file)
+        if rel:
+            allowed.add(rel)
 
     return allowed
 
@@ -132,12 +137,51 @@ def list_changed_files(docs_source_path, base_ref, head_ref):
     return parse_git_name_status(output)
 
 
+def read_git_file(docs_source_path, ref, file_path):
+    try:
+        return subprocess.check_output(
+            ["git", "-C", docs_source_path, "show", f"{ref}:{file_path}"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except subprocess.CalledProcessError:
+        return None
+
+
+def collect_toc_scope_added_files(docs_source_path, toc_files, base_ref, head_ref):
+    """Return Markdown files newly linked to the aggregate Cloud TOC scope."""
+    base_links = set()
+    head_links = set()
+
+    for toc_file in toc_files:
+        head_content = read_git_file(docs_source_path, head_ref, toc_file)
+        if head_content is None:
+            continue
+
+        base_content = read_git_file(docs_source_path, base_ref, toc_file)
+        base_links.update(extract_markdown_doc_links(base_content or ""))
+        head_links.update(extract_markdown_doc_links(head_content))
+
+    return head_links - base_links
+
+
 def add_unique(items, item):
     if item and item not in items:
         items.append(item)
 
 
-def resolve_source_files(allowed, input_file_names="", changed_rows=None):
+def resolve_source_files(
+    allowed,
+    input_file_names="",
+    changed_rows=None,
+    toc_scope_added_files=None,
+):
+    normalized_scope_added_files = set()
+    for item in toc_scope_added_files or []:
+        rel = normalize_doc_path(item)
+        if rel:
+            normalized_scope_added_files.add(rel)
+    toc_scope_added_files = normalized_scope_added_files
     requested = [
         resolve_requested_file(item, allowed)
         for item in parse_list(input_file_names)
@@ -146,7 +190,10 @@ def resolve_source_files(allowed, input_file_names="", changed_rows=None):
 
     resolved = []
     if requested:
-        invalid = [item for item in requested if item not in allowed]
+        invalid = [
+            item for item in requested
+            if item not in allowed and item not in toc_scope_added_files
+        ]
         if invalid:
             raise ValueError(
                 "The following files are not in the configured Cloud TOC scope: "
@@ -159,10 +206,14 @@ def resolve_source_files(allowed, input_file_names="", changed_rows=None):
     for row in changed_rows or []:
         filename = row.get("filename", "")
         previous_filename = row.get("previous_filename", "")
-        if filename in allowed:
+        if filename in allowed or filename in toc_scope_added_files:
             add_unique(resolved, filename)
-        if previous_filename in allowed:
+        if previous_filename in allowed or previous_filename in toc_scope_added_files:
             add_unique(resolved, previous_filename)
+
+    for rel in sorted(toc_scope_added_files):
+        add_unique(resolved, rel)
+
     return resolved
 
 
@@ -177,13 +228,29 @@ def append_github_output(output_path, values):
 def main():
     docs_source_path = os.environ["DOCS_SOURCE_PATH"]
     toc_files = parse_list(os.environ["CLOUD_TOC_FILES"])
+    cloud_index_files = parse_list(os.getenv("CLOUD_INDEX_FILES", ""))
     input_file_names = os.getenv("INPUT_FILE_NAMES", "")
     base_ref = os.environ["BASE_REF"]
     head_ref = os.environ["HEAD_REF"]
 
-    allowed = build_allowed_files(docs_source_path, toc_files)
-    changed_rows = [] if input_file_names.strip() else list_changed_files(docs_source_path, base_ref, head_ref)
-    resolved = resolve_source_files(allowed, input_file_names=input_file_names, changed_rows=changed_rows)
+    allowed = build_allowed_files(docs_source_path, toc_files, extra_files=cloud_index_files)
+    if input_file_names.strip():
+        changed_rows = []
+        toc_scope_added_files = set()
+    else:
+        changed_rows = list_changed_files(docs_source_path, base_ref, head_ref)
+        toc_scope_added_files = collect_toc_scope_added_files(
+            docs_source_path,
+            toc_files,
+            base_ref,
+            head_ref,
+        )
+    resolved = resolve_source_files(
+        allowed,
+        input_file_names=input_file_names,
+        changed_rows=changed_rows,
+        toc_scope_added_files=toc_scope_added_files,
+    )
 
     append_github_output(
         os.getenv("GITHUB_OUTPUT", ""),

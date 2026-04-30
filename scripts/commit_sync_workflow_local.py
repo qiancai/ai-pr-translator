@@ -12,10 +12,15 @@ import sys
 
 TEST_OPTION = "cloud"  # Options: "ai", "cloud"
 
+# Options: "incremental" for commit diff translation, or "full" for complete
+# SOURCE_FILES translation from SOURCE_HEAD_REF using the file-added flow.
+SOURCE_FILES_TRANSLATION_MODE = "full"
+
 
 COMMON_CONFIG = {
     "SOURCE_BRANCH": "release-8.5",
-    "AI_PROVIDER": "deepseek",  # Options: "deepseek", "gemini", "openai", "azure"
+    "AI_PROVIDER": "azure",  # Options: "deepseek", "gemini", "openai", "azure"
+    "SOURCE_FILES_TRANSLATION_MODE": SOURCE_FILES_TRANSLATION_MODE,
     "TIDB_CLOUD_ABSOLUTE_LINK_PREFIX": "https://docs.pingcap.com/tidbcloud/",
     # Keep local verification going after per-file failures so successful outputs can be reviewed.
     "FAIL_ON_TRANSLATION_ERROR": False,
@@ -49,13 +54,21 @@ TEST_CONFIGS = {
         "SOURCE_HEAD_REF": "ecd31cc2c25ad6715af68d05794da89265cfe4d8",#ecd31cc2c25ad6715af68d05794da89265cfe4d8
         # Keep SOURCE_FOLDER empty. Put resolved Cloud TOC-scoped files here.
         "SOURCE_FOLDER": "", ## Leave this field empty when translating cloud docs.
-        "SOURCE_FILES": "tidb-cloud/manage-user-access.md",
+        "SOURCE_FILES": "tidb-cloud/tidb-cloud-billing.md",
         "AUTO_RESOLVE_CLOUD_SOURCE_FILES": True,
         "CLOUD_TOC_FILES": (
             "TOC-tidb-cloud.md,"
             "TOC-tidb-cloud-starter.md,"
             "TOC-tidb-cloud-essential.md,"
-            "TOC-tidb-cloud-releases.md"
+            "TOC-tidb-cloud-releases.md,"
+            "TOC-tidb-cloud-premium.md"
+        ),
+        "CLOUD_INDEX_FILES": (
+            "tidb-cloud/dedicated/_index.md,"
+            "tidb-cloud/essential/_index.md,"
+            "tidb-cloud/premium/_index.md,"
+            "tidb-cloud/releases/_index.md,"
+            "tidb-cloud/starter/_index.md"
         ),
         # SOURCE_REPO_PATH should be a local checkout/worktree of pingcap/docs release-8.5.
         "SOURCE_REPO_PATH": "/Users/grcai/Documents/GitHub/docs",
@@ -70,7 +83,7 @@ TEST_CONFIGS = {
 
 LOCAL_ONLY_CONFIG_KEYS = {
     "AUTO_RESOLVE_CLOUD_SOURCE_FILES",
-    "CLOUD_TOC_FILES",
+    "CLOUD_INDEX_FILES",
 }
 
 
@@ -88,6 +101,7 @@ def resolve_cloud_source_files_for_local(config):
 
     from resolve_cloud_source_files import (
         build_allowed_files,
+        collect_toc_scope_added_files,
         list_changed_files,
         parse_list,
         resolve_source_files,
@@ -99,17 +113,29 @@ def resolve_cloud_source_files_for_local(config):
         return config, None
 
     input_file_names = config.get("SOURCE_FILES", "")
+    cloud_index_files = parse_list(config.get("CLOUD_INDEX_FILES", ""))
     source_repo_path = config.get("SOURCE_REPO_PATH", "")
     base_ref = config.get("SOURCE_BASE_REF", "")
     head_ref = config.get("SOURCE_HEAD_REF", "")
 
     try:
-        allowed = build_allowed_files(source_repo_path, toc_files)
-        changed_rows = [] if input_file_names.strip() else list_changed_files(source_repo_path, base_ref, head_ref)
+        allowed = build_allowed_files(source_repo_path, toc_files, extra_files=cloud_index_files)
+        if input_file_names.strip():
+            changed_rows = []
+            toc_scope_added_files = set()
+        else:
+            changed_rows = list_changed_files(source_repo_path, base_ref, head_ref)
+            toc_scope_added_files = collect_toc_scope_added_files(
+                source_repo_path,
+                toc_files,
+                base_ref,
+                head_ref,
+            )
         resolved = resolve_source_files(
             allowed,
             input_file_names=input_file_names,
             changed_rows=changed_rows,
+            toc_scope_added_files=toc_scope_added_files,
         )
     except Exception as e:
         print(f"❌ Failed to resolve Cloud source files: {e}")

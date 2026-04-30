@@ -125,6 +125,11 @@ export SOURCE_BRANCH="main"
 export SOURCE_FOLDER="ai"
 export SOURCE_FILES="ai/foo.md,ai/bar.md"
 
+# Optional: only applies when SOURCE_FILES is set.
+# Use "incremental" for commit-diff translation, or "full" to translate each
+# selected file as a complete file using the source content at SOURCE_HEAD_REF.
+export SOURCE_FILES_TRANSLATION_MODE="incremental"
+
 # AI Provider and glossary
 export AI_PROVIDER="deepseek"  # or "gemini"
 export TERMS_PATH="/path/to/terms.md"

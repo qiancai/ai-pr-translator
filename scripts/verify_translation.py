@@ -36,11 +36,10 @@ except ImportError:
 MODE = "commit-based"
 
 SOURCE_COMMIT_COMPARE = (
-    "https://github.com/pingcap/docs/compare/"
-    "d830c33dc1aace9b021477fa794dfce0e5518afb...ecd31cc2c25ad6715af68d05794da89265cfe4d8"
+    "https://github.com/pingcap/docs/compare/f013e32b3fa831a3d64aa064632240a8c11c01bf...c51660507b71937437ce283a6c837934c0e0750c"
 )
 SOURCE_PR = ""
-TARGET_PR = "https://github.com/pingcap/docs/pull/22781"
+TARGET_PR = "https://github.com/pingcap/docs/pull/22833"
 
 # Optional: local clone of the source repo.  When set, `git diff --numstat`
 # is used instead of the GitHub compare API, which avoids the 300-file cap.

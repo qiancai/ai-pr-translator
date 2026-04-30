@@ -207,6 +207,7 @@ def process_added_files(
     repo_config,
     glossary_matcher=None,
     return_details=False,
+    overwrite_existing=False,
 ):
     """Process newly added files by translating and creating them in target repository.
 
@@ -240,12 +241,16 @@ def process_added_files(
             thread_safe_print(f"   📁 Created directory: {target_dir}")
         
         # Check if file already exists
-        if os.path.exists(target_file_path):
-            reason = f"Target file already exists: {target_file_path}"
-            thread_safe_print(f"   ⚠️  {reason}")
-            failure_reasons[file_path] = reason
-            all_success = False
-            continue
+        target_file_exists = os.path.exists(target_file_path)
+        if target_file_exists:
+            if overwrite_existing:
+                thread_safe_print(f"   ♻️  Target file exists; overwriting: {target_file_path}")
+            else:
+                reason = f"Target file already exists: {target_file_path}"
+                thread_safe_print(f"   ⚠️  {reason}")
+                failure_reasons[file_path] = reason
+                all_success = False
+                continue
         
         # Create section batches for translation
         batches = create_section_batches(file_content, max_lines_per_batch=200)
@@ -273,7 +278,8 @@ def process_added_files(
             with open(target_file_path, 'w', encoding='utf-8') as f:
                 f.write(translated_content)
             
-            thread_safe_print(f"   ✅ Created translated file: {target_file_path}")
+            action = "Updated" if overwrite_existing and target_file_exists else "Created"
+            thread_safe_print(f"   ✅ {action} translated file: {target_file_path}")
             
         except Exception as e:
             reason = f"Error creating file {target_file_path}: {sanitize_exception_message(e)}"
