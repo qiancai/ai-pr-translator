@@ -19,8 +19,10 @@ from diff_analyzer import (
     build_pr_diff_context,
     build_hierarchy_dict,
     build_source_diff_dict,
+    collect_added_heading_prefix_lines,
     get_target_file_content,
     get_target_hierarchy_and_content,
+    maybe_use_normalized_snapshot_operations,
 )
 
 
@@ -71,6 +73,7 @@ class FakeGithub:
 
 
 def make_full_rewrite_patch(base_content, head_content):
+    """Build a GitHub API-style patch body without file header lines."""
     base_lines = base_content.replace("\r\n", "\n").splitlines()
     head_lines = head_content.replace("\r\n", "\n").splitlines()
     patch_lines = [f"@@ -1,{len(base_lines)} +1,{len(head_lines)} @@"]
@@ -310,6 +313,108 @@ class DiffAnalyzerContextTest(unittest.TestCase):
         self.assertIn("modified_3", source_diff)
         self.assertIn("added_9", source_diff)
         self.assertIn("New paragraph.", source_diff["modified_3"]["new_content"])
+
+    def test_deleted_line_uses_head_position_for_section_mapping(self):
+        file_path = "guide.md"
+        base_content = "# Guide\n\n## First\n\nkeep\n\n## Second\n\nold line\nmore\n"
+        head_content = "# Guide\n\n## First\n\nkeep\n\n## Inserted\n\ninserted body\n\n## Second\n\nmore\n"
+        patch = "\n".join(
+            [
+                "@@ -3,8 +3,11 @@",
+                " ## First",
+                " ",
+                " keep",
+                " ",
+                "+## Inserted",
+                "+",
+                "+inserted body",
+                "+",
+                " ## Second",
+                " ",
+                "-old line",
+                " more",
+            ]
+        )
+        changed_file = SimpleNamespace(
+            filename=file_path,
+            status="modified",
+            patch=patch,
+            previous_filename=None,
+        )
+        repository = FakeRepository(
+            {
+                (file_path, "base123"): base_content,
+                (file_path, "head123"): head_content,
+            },
+            FakePR([changed_file], "Add section and delete line", "base123", "head123"),
+            {("base123", "head123"): [changed_file]},
+        )
+        github = FakeGithub({"acme/docs": repository})
+        context = build_commit_diff_context(
+            "acme/docs",
+            "acme/docs-cn",
+            "base123",
+            "head123",
+            github,
+            self.repo_configs,
+        )
+
+        analyze_source_changes(
+            context,
+            github,
+            special_files=["TOC.md", "keywords.md"],
+            ignore_files=[],
+            repo_configs=self.repo_configs,
+        )
+
+        source_diff = json.loads(self.generated_file.read_text(encoding="utf-8"))
+        self.assertIn("added_7", source_diff)
+        self.assertIn("modified_11", source_diff)
+        self.assertNotIn("modified_7", source_diff)
+        self.assertIn("old line", source_diff["modified_11"]["old_content"])
+
+    def test_blank_heading_prefix_scan_is_bounded(self):
+        file_lines = ["# Guide", "", "Old", "", "", "", "## New"]
+        operations = {
+            "added_lines": [
+                {"line_number": 4, "is_header": False},
+                {"line_number": 5, "is_header": False},
+                {"line_number": 6, "is_header": False},
+                {"line_number": 7, "is_header": True},
+            ],
+            "modified_lines": [],
+            "deleted_lines": [],
+        }
+
+        prefixes, ignored_lines = collect_added_heading_prefix_lines(file_lines, operations)
+
+        self.assertEqual({}, prefixes)
+        self.assertEqual({6}, ignored_lines)
+
+    def test_bare_cr_headings_use_normalized_line_numbers(self):
+        self.assertEqual(
+            {
+                1: "# Guide",
+                3: "## Section",
+            },
+            build_hierarchy_dict("# Guide\r\r## Section\rBody\r"),
+        )
+
+    def test_snapshot_diff_is_only_used_for_line_ending_style_changes(self):
+        operations = {
+            "added_lines": [{"line_number": 4, "is_header": False, "content": "New"}],
+            "modified_lines": [],
+            "deleted_lines": [],
+        }
+
+        self.assertIs(
+            operations,
+            maybe_use_normalized_snapshot_operations(
+                operations,
+                "# Guide\n\n## Section\nOld\n",
+                "# Guide\n\n## Section\nNew\n",
+            ),
+        )
 
     def test_numbered_heading_rename_is_treated_as_modified(self):
         patch = "\n".join(

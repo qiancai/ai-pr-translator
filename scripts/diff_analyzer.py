@@ -367,16 +367,55 @@ def get_changed_line_numbers_from_operations(operations):
     changed_lines = []
     for key in ("added_lines", "modified_lines", "deleted_lines"):
         for entry in operations.get(key, []):
-            line_number = entry.get("line_number")
+            line_number = (
+                get_head_line_number(entry)
+                if key == "deleted_lines"
+                else entry.get("line_number")
+            )
             if line_number is not None:
                 changed_lines.append(line_number)
     return changed_lines
+
+
+def get_head_line_number(diff_entry):
+    """Return the head-side line number for a parsed diff entry."""
+    return diff_entry.get("head_line_number", diff_entry.get("line_number"))
+
 
 def normalize_line_endings(content):
     """Normalize all line endings to LF for diff analysis."""
     if content is None:
         return ""
     return content.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def split_normalized_lines(content):
+    """Split content into lines after normalizing line endings for analysis."""
+    return normalize_line_endings(content).split('\n')
+
+
+def line_ending_kinds(content):
+    """Return the line-ending styles present in content."""
+    if not content:
+        return set()
+
+    kinds = set()
+    index = 0
+    while index < len(content):
+        char = content[index]
+        if char == "\r":
+            if index + 1 < len(content) and content[index + 1] == "\n":
+                kinds.add("CRLF")
+                index += 2
+            else:
+                kinds.add("CR")
+                index += 1
+        elif char == "\n":
+            kinds.add("LF")
+            index += 1
+        else:
+            index += 1
+    return kinds
 
 
 def operations_change_count(operations):
@@ -417,6 +456,9 @@ def analyze_normalized_snapshot_diff_operations(base_content, head_content):
 
 def maybe_use_normalized_snapshot_operations(operations, base_content, head_content):
     """Use normalized snapshot operations when they remove line-ending noise."""
+    if line_ending_kinds(base_content) == line_ending_kinds(head_content):
+        return operations
+
     snapshot_operations = analyze_normalized_snapshot_diff_operations(base_content, head_content)
     original_count = operations_change_count(operations)
     snapshot_count = operations_change_count(snapshot_operations)
@@ -473,6 +515,7 @@ def analyze_diff_operations(file):
             # This is a deleted line
             deleted_entry = {
                 'line_number': deleted_line,
+                'head_line_number': current_line,
                 'content': line[1:],  # Remove the '-' prefix
                 'is_header': line[1:].strip().startswith('#'),
                 'diff_index': i  # Track position in diff
@@ -699,7 +742,7 @@ def analyze_diff_operations(file):
 
 def build_hierarchy_dict(file_content):
     """Build hierarchy dictionary from file content, excluding content inside code blocks"""
-    lines = file_content.split('\n')
+    lines = split_normalized_lines(file_content)
     level_stack = []
     all_hierarchy_dict = {}
     
@@ -789,7 +832,7 @@ def build_hierarchy_path(lines, line_num, all_headers):
 
 def build_hierarchy_for_modified_section(file_content, target_line_num, original_line, base_hierarchy_dict):
     """Build hierarchy path for a modified section using original content"""
-    lines = file_content.split('\n')
+    lines = split_normalized_lines(file_content)
     
     # Get the level of the original header
     original_match = re.match(r'^(#{1,10})\s+(.+)', original_line)
@@ -1257,7 +1300,7 @@ def get_target_hierarchy_and_content(
             prefer_local_target_for_read=prefer_local_target_for_read,
             target_ref=target_ref,
         )
-        lines = file_content.split('\n')
+        lines = split_normalized_lines(file_content)
 
         # Build hierarchy using same method
         hierarchy = build_hierarchy_dict(file_content)
@@ -1277,7 +1320,7 @@ def get_source_sections_content(source_context_or_pr_url, file_path, source_affe
             github_client,
             ref_name="head_ref",
         )
-        lines = file_content.split('\n')
+        lines = split_normalized_lines(file_content)
         
         # Extract source sections
         source_sections = {}
@@ -1344,7 +1387,7 @@ def trim_content_before_tabs_panel(content):
     if not isinstance(content, str) or not content:
         return content, False
 
-    lines = content.split('\n')
+    lines = split_normalized_lines(content)
     for idx, line in enumerate(lines):
         if "<TabsPanel" in line:
             trimmed = "\n".join(lines[:idx]).rstrip()
@@ -1397,10 +1440,8 @@ def normalize_keywords_regular_source_diff(source_diff_dict):
 
 
 def is_structural_added_heading_prefix_line(line):
-    """Return True for added lines that should belong to the next added heading."""
+    """Return True for added wrapper lines that belong to the next heading."""
     stripped = (line or "").strip()
-    if not stripped:
-        return True
     return re.match(r'^<CustomContent\b[^>]*>\s*$', stripped) is not None
 
 
@@ -1428,10 +1469,21 @@ def collect_added_heading_prefix_lines(file_lines, operations):
     for heading_line in added_heading_lines:
         prefixes = []
         candidate_line = heading_line - 1
+        consecutive_blank_lines = 0
 
         while candidate_line in added_line_numbers and 1 <= candidate_line <= len(file_lines):
             raw_line = file_lines[candidate_line - 1]
-            if not is_structural_added_heading_prefix_line(raw_line):
+            stripped_line = raw_line.strip()
+
+            if not stripped_line:
+                # Allow a single separator blank around a wrapper/heading pair,
+                # but do not sweep unbounded blank-only additions into the prefix.
+                if consecutive_blank_lines >= 1:
+                    break
+                consecutive_blank_lines += 1
+            elif is_structural_added_heading_prefix_line(raw_line):
+                consecutive_blank_lines = 0
+            else:
                 break
 
             prefixes.append(raw_line.rstrip("\r"))
@@ -1502,8 +1554,8 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
     source_diff_dict = {}
     
     # Check if intro section has changes
-    file_lines = file_content.split('\n')
-    base_file_lines = base_file_content.split('\n')
+    file_lines = split_normalized_lines(file_content)
+    base_file_lines = split_normalized_lines(base_file_content)
     added_heading_prefix_lines, _ = collect_added_heading_prefix_lines(file_lines, operations)
     has_intro_changes, first_level2_line = detect_intro_section_changes(operations, file_lines)
     
@@ -1577,32 +1629,32 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
     def extract_section_content_for_diff(line_num, hierarchy_dict):
         if str(line_num) == "0":
             # Handle frontmatter
-            return extract_frontmatter_content(file_content.split('\n'))
+            return extract_frontmatter_content(file_lines)
         else:
-            return extract_section_direct_content(file_content.split('\n'), line_num)
+            return extract_section_direct_content(file_lines, line_num)
     
     # Helper function to extract old content from base file (only direct content, no sub-sections)
     def extract_old_content_for_diff(line_num, base_hierarchy_dict, base_file_content):
         if str(line_num) == "0":
             # Handle frontmatter from base file
-            return extract_frontmatter_content(base_file_content.split('\n'))
+            return extract_frontmatter_content(base_file_lines)
         else:
-            return extract_section_direct_content(base_file_content.split('\n'), line_num)
+            return extract_section_direct_content(base_file_lines, line_num)
     
     # Helper function to extract old content by hierarchy (for modified sections that may have moved)
     def extract_old_content_by_hierarchy(original_hierarchy, base_hierarchy_dict, base_file_content):
         """Extract old content by finding the section with matching hierarchy in base file (only direct content)"""
         if original_hierarchy == "frontmatter":
-            return extract_frontmatter_content(base_file_content.split('\n'))
+            return extract_frontmatter_content(base_file_lines)
         
         # Find the line number in base file that matches the original hierarchy
         for base_line_num_str, base_hierarchy in base_hierarchy_dict.items():
             if base_hierarchy == original_hierarchy:
                 base_line_num = int(base_line_num_str) if base_line_num_str != "0" else 0
                 if base_line_num == 0:
-                    return extract_frontmatter_content(base_file_content.split('\n'))
+                    return extract_frontmatter_content(base_file_lines)
                 else:
-                    return extract_section_direct_content(base_file_content.split('\n'), base_line_num)
+                    return extract_section_direct_content(base_file_lines, base_line_num)
         
         # If exact match not found, return empty string
         print(f"   ⚠️  Could not find matching hierarchy in base file: {original_hierarchy}")
@@ -1612,13 +1664,13 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
     def extract_old_full_content_by_hierarchy(original_hierarchy, base_hierarchy_dict, base_file_content):
         """Extract old content by hierarchy including sub-sections"""
         if original_hierarchy == "frontmatter":
-            return extract_frontmatter_content(base_file_content.split('\n'))
+            return extract_frontmatter_content(base_file_lines)
 
         for base_line_num, base_hierarchy in base_hierarchy_dict.items():
             if base_hierarchy == original_hierarchy:
                 if base_line_num == 0:
-                    return extract_frontmatter_content(base_file_content.split('\n'))
-                return extract_section_content(base_file_content.split('\n'), base_line_num, base_hierarchy_dict)
+                    return extract_frontmatter_content(base_file_lines)
+                return extract_section_content(base_file_lines, base_line_num, base_hierarchy_dict)
 
         return ""
     
@@ -1680,7 +1732,7 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
         # Only include if content actually changed.
         # Fallback to full-section comparison to catch nested-content edits.
         if new_content == old_content:
-            new_full_content = extract_section_content(file_content.split('\n'), line_num, all_hierarchy_dict)
+            new_full_content = extract_section_content(file_lines, line_num, all_hierarchy_dict)
             old_full_content = extract_old_full_content_by_hierarchy(original_hierarchy, base_hierarchy_dict, base_file_content)
             if new_full_content != old_full_content:
                 new_content = new_full_content
@@ -1805,7 +1857,7 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
         new_content = extract_section_content_for_diff(line_num, all_hierarchy_dict)
         prefix_lines = added_heading_prefix_lines.get(line_num, [])
         if prefix_lines:
-            new_content = "\n".join(prefix_lines + ([new_content] if new_content else []))
+            new_content = "\n".join(prefix_lines + ([new_content] if new_content is not None else []))
 
         source_diff_dict[f"added_{line_num_str}"] = {
             "new_line_number": line_num,
@@ -2002,7 +2054,7 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
                 print(f"   📋 Detected keyword file: {file.filename}")
                 operations = analyze_diff_operations(file)
 
-                source_head_lines = file_content.split('\n')
+                source_head_lines = split_normalized_lines(file_content)
                 try:
                     base_file_content_preloaded = repository.get_contents(file.filename, ref=base_ref).decoded_content.decode('utf-8')
                 except Exception as e:
@@ -2011,7 +2063,7 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
                     )
                     base_file_content_preloaded = file_content
 
-                source_base_lines = base_file_content_preloaded.split('\n')
+                source_base_lines = split_normalized_lines(base_file_content_preloaded)
 
                 head_tabs_region = find_tabs_region(source_head_lines)
                 base_tabs_region = find_tabs_region(source_base_lines)
@@ -2036,7 +2088,7 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
                             ),
                             target_ref=repo_config.get('target_ref'),
                         )
-                        target_lines = target_file_content.split('\n')
+                        target_lines = split_normalized_lines(target_file_content)
                         target_tabs_region = find_tabs_region(target_lines)
                         target_blocks = parse_letter_blocks(target_lines, target_tabs_region)
 
@@ -2047,7 +2099,7 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
                                 repo_config['target_repo'],
                                 target_ref=repo_config.get('target_ref'),
                             )
-                            target_lines = target_file_content.split('\n')
+                            target_lines = split_normalized_lines(target_file_content)
                             target_tabs_region = find_tabs_region(target_lines)
                             target_blocks = parse_letter_blocks(target_lines, target_tabs_region)
                     except Exception as e:
@@ -2132,7 +2184,7 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
                         ),
                         target_ref=repo_config.get('target_ref'),
                     )
-                    target_lines = target_file_content.split('\n')
+                    target_lines = split_normalized_lines(target_file_content)
                     print(f"   📌 TOC target baseline source: {target_source}")
                 except Exception as e:
                     print(f"   ⚠️  Could not get target file content: {sanitize_exception_message(e)}")
@@ -2140,7 +2192,7 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
 
                 # Analyze diff operations for TOC.md
                 operations = analyze_diff_operations(file)
-                source_lines = file_content.split('\n')
+                source_lines = split_normalized_lines(file_content)
 
                 try:
                     source_base_content = repository.get_contents(file.filename, ref=base_ref).decoded_content.decode('utf-8')
@@ -2184,7 +2236,7 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
                         target_lines,
                         "",
                         source_base_lines=(
-                            source_base_content.split('\n')
+                            split_normalized_lines(source_base_content)
                             if source_base_content is not None
                             else None
                         ),
@@ -2221,7 +2273,7 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
             operations = analyze_diff_operations(file)
         print(f"   📝 Diff analysis: {len(operations['added_lines'])} added, {len(operations['modified_lines'])} modified, {len(operations['deleted_lines'])} deleted lines")
         
-        lines = file_content.split('\n')
+        lines = split_normalized_lines(file_content)
         all_headers = {}
         
         # Track code block state
@@ -2312,7 +2364,9 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
         # Deleted lines (removed content, excluding headers)
         for deleted_line in operations['deleted_lines']:
             if not deleted_line['is_header']:
-                real_content_changes.add(deleted_line['line_number'])
+                head_line_number = get_head_line_number(deleted_line)
+                if head_line_number is not None:
+                    real_content_changes.add(head_line_number)
         
         # Modified lines (changed content, excluding headers)
         for modified_line in operations['modified_lines']:
@@ -2338,10 +2392,12 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
                 # AND if the changed line is not part of a completely deleted section header
                 is_deleted_header = False
                 for deleted_line in operations['deleted_lines']:
+                    deleted_head_line = get_head_line_number(deleted_line)
                     if (deleted_line['is_header'] and 
-                        abs(changed_line - deleted_line['line_number']) <= 2):
+                        deleted_head_line is not None and
+                        abs(changed_line - deleted_head_line) <= 2):
                         is_deleted_header = True
-                        print(f"   ⚠️  Skipping change at line {changed_line} (deleted header near line {deleted_line['line_number']})")
+                        print(f"   ⚠️  Skipping change at line {changed_line} (deleted header near line {deleted_head_line})")
                         break
                 
                 # More precise filtering: check if this change is actually meaningful
@@ -2350,8 +2406,9 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
                 
                 # Skip exact deleted headers
                 for deleted_line in operations['deleted_lines']:
+                    deleted_head_line = get_head_line_number(deleted_line)
                     if (deleted_line['is_header'] and 
-                        changed_line == deleted_line['line_number']):
+                        changed_line == deleted_head_line):
                         should_include = False
                         print(f"   ⚠️  Skipping change at line {changed_line} (exact deleted header)")
                         break
@@ -2360,10 +2417,13 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
                 # This helps filter out line shift artifacts while keeping real content changes
                 if should_include:
                     for deleted_line in operations['deleted_lines']:
+                        deleted_head_line = get_head_line_number(deleted_line)
+                        if deleted_head_line is None:
+                            continue
                         # Only skip if both conditions are met:
                         # 1. Very close to deleted content (within 5 lines)
                         # 2. The change is far from its containing section (likely a shift artifact)
-                        distance_to_deletion = abs(changed_line - deleted_line['line_number'])
+                        distance_to_deletion = abs(changed_line - deleted_head_line)
                         distance_to_section = changed_line - containing_section
                         
                         if (distance_to_deletion <= 5 and distance_to_section > 100):
@@ -2576,6 +2636,8 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
             synthetic_sections = {}
             for key, diff_info in source_diff_dict.items():
                 operation = diff_info.get("operation")
+                # Deleted sections do not need translation work in the
+                # regular modified-file queue.
                 if operation not in ("added", "modified"):
                     continue
 
