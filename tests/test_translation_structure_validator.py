@@ -1,0 +1,140 @@
+import sys
+import unittest
+from pathlib import Path
+
+
+SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
+sys.path.insert(0, str(SCRIPTS_DIR))
+
+from translation_structure_validator import (
+    compare_heading_structure,
+    compact_heading_levels,
+    extract_heading_levels,
+    validate_markdown_heading_structures,
+)
+
+
+class TranslationStructureValidatorTest(unittest.TestCase):
+    def test_extract_heading_levels_skips_code_blocks_and_indented_lines(self):
+        content = "\n".join(
+            [
+                "# Title",
+                "",
+                "    ## Indented example",
+                "  ## CommonMark heading",
+                "```",
+                "## Code heading",
+                "```",
+                "## Section",
+                "~~~sql",
+                "### Code heading",
+                "~~~",
+                "### Child",
+            ]
+        )
+
+        self.assertEqual([1, 2, 2, 3], extract_heading_levels(content))
+
+    def test_extract_heading_levels_respects_code_fence_length(self):
+        content = "\n".join(
+            [
+                "# Title",
+                "````",
+                "```",
+                "## Not a heading",
+                "```",
+                "````",
+                "## Real heading",
+            ]
+        )
+
+        self.assertEqual([1, 2], extract_heading_levels(content))
+
+    def test_compare_heading_structure_ignores_translated_heading_text(self):
+        issue = compare_heading_structure(
+            "guide.md",
+            "# Guide\n\n## Configure\n\n### Step\n",
+            "# 指南\n\n## 配置\n\n### 步骤\n",
+        )
+
+        self.assertIsNone(issue)
+
+    def test_compare_heading_structure_reports_level_mismatch(self):
+        issue = compare_heading_structure(
+            "guide.md",
+            "# Guide\n\n## Configure\n\n### Step\n",
+            "# 指南\n\n## 配置\n\n## 步骤\n",
+        )
+
+        self.assertIsNotNone(issue)
+        self.assertEqual("guide.md", issue.file_path)
+        self.assertEqual("heading level sequence differs", issue.reason)
+        self.assertEqual("#x1 ##x1 ###x1", issue.source_compact)
+        self.assertEqual("#x1 ##x2", issue.target_compact)
+        self.assertEqual("heading 3: source ###, target ##", issue.first_difference)
+
+    def test_validate_markdown_heading_structures_checks_only_markdown_files(self):
+        calls = []
+
+        def source_loader(file_path):
+            calls.append(("source", file_path))
+            return "# Guide\n\n## Section\n"
+
+        def target_loader(file_path):
+            calls.append(("target", file_path))
+            return "# 指南\n\n### Section\n"
+
+        issues = validate_markdown_heading_structures(
+            ["guide.md", "image.png"],
+            source_loader,
+            target_loader,
+        )
+
+        self.assertEqual(1, len(issues))
+        self.assertEqual("guide.md", issues[0].file_path)
+        self.assertEqual([("source", "guide.md"), ("target", "guide.md")], calls)
+
+    def test_validate_markdown_heading_structures_reports_loader_none_and_exceptions(self):
+        def source_loader(file_path):
+            if file_path == "missing-source.md":
+                return None
+            if file_path == "source-error.md":
+                raise RuntimeError("source unavailable")
+            return "# Guide\n"
+
+        def target_loader(file_path):
+            if file_path == "missing-target.md":
+                return None
+            if file_path == "target-error.md":
+                raise RuntimeError("target unavailable")
+            return "# 指南\n"
+
+        issues = validate_markdown_heading_structures(
+            [
+                "missing-source.md",
+                "missing-target.md",
+                "source-error.md",
+                "target-error.md",
+            ],
+            source_loader,
+            target_loader,
+        )
+
+        reasons = {issue.file_path: issue.reason for issue in issues}
+        self.assertEqual("could not read source HEAD content", reasons["missing-source.md"])
+        self.assertEqual("could not read translated target content", reasons["missing-target.md"])
+        self.assertEqual(
+            "could not read source HEAD content: source unavailable",
+            reasons["source-error.md"],
+        )
+        self.assertEqual(
+            "could not read translated target content: target unavailable",
+            reasons["target-error.md"],
+        )
+
+    def test_compact_heading_levels_handles_empty_documents(self):
+        self.assertEqual("(no headings)", compact_heading_levels([]))
+
+
+if __name__ == "__main__":
+    unittest.main()

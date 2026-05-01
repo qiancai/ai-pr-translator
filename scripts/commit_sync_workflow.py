@@ -71,6 +71,7 @@ from main_workflow import (
     process_regular_modified_file,
 )
 from toc_processor import process_toc_file
+from translation_structure_validator import validate_markdown_heading_structures
 from workflow_ignore_config import load_workflow_ignore_config
 
 WORKFLOW_IGNORE_CONFIG = load_workflow_ignore_config()
@@ -103,6 +104,7 @@ class TranslationStats:
         self.succeeded = []
         self.failed = []
         self.skipped = []
+        self.structure_errors = []
 
     def mark_success(self, file_path):
         self.total += 1
@@ -115,11 +117,15 @@ class TranslationStats:
     def mark_skipped(self, file_path, reason):
         self.skipped.append((file_path, reason))
 
+    def mark_structure_error(self, issue):
+        self.structure_errors.append(issue)
+
     def print_summary(self):
         thread_safe_print("\n📚 Translation attempt summary:")
         thread_safe_print(f"   📄 Files attempted for translation: {self.total}")
         thread_safe_print(f"   ✅ Successfully translated: {len(self.succeeded)}")
         thread_safe_print(f"   ❌ Failed to translate: {len(self.failed)}")
+        thread_safe_print(f"   ⚠️  Section structure mismatches: {len(self.structure_errors)}")
 
         if self.failed:
             thread_safe_print("   ❌ Failed files:")
@@ -136,35 +142,68 @@ class TranslationStats:
         os.makedirs(output_dir, exist_ok=True)
         markdown_path = os.path.join(output_dir, "translation-failures.md")
         json_path = os.path.join(output_dir, "translation-failures.json")
+        structure_json_path = os.path.join(output_dir, "translation-structure-errors.json")
 
-        if not self.failed:
-            for path in (markdown_path, json_path):
+        if not self.failed and not self.structure_errors:
+            for path in (markdown_path, json_path, structure_json_path):
                 if os.path.exists(path):
                     os.remove(path)
             return
 
         with open(markdown_path, "w", encoding="utf-8") as f:
-            f.write("### Translation failures\n\n")
-            f.write(
-                "The following files were not translated automatically and must be handled manually before merging.\n\n"
-            )
-            for file_path, reason in self.failed:
-                f.write(f"- `{file_path}`: {reason}\n")
+            if self.failed:
+                f.write("### Translation failures\n\n")
+                f.write(
+                    "The following files were not translated automatically and must be handled manually before merging.\n\n"
+                )
+                for file_path, reason in self.failed:
+                    f.write(f"- `{file_path}`: {reason}\n")
+                if self.structure_errors:
+                    f.write("\n")
 
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(
-                [
-                    {
-                        "file_path": file_path,
-                        "reason": reason,
-                    }
-                    for file_path, reason in self.failed
-                ],
-                f,
-                ensure_ascii=False,
-                indent=2,
-            )
-            f.write("\n")
+            if self.structure_errors:
+                f.write("### Docs with section structure mismatches after translation\n\n")
+                f.write(
+                    "The following files were translated successfully, but their Markdown heading structure does not match the source HEAD file.\n\n"
+                )
+                for issue in self.structure_errors:
+                    f.write(f"- `{issue.file_path}`: {issue.reason}\n")
+                    if issue.source_compact:
+                        f.write(f"  - Source: `{issue.source_compact}`\n")
+                    if issue.target_compact:
+                        f.write(f"  - Target: `{issue.target_compact}`\n")
+                    if issue.first_difference:
+                        f.write(f"  - First difference: {issue.first_difference}\n")
+
+        if self.failed:
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    [
+                        {
+                            "file_path": file_path,
+                            "reason": reason,
+                        }
+                        for file_path, reason in self.failed
+                    ],
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                f.write("\n")
+        elif os.path.exists(json_path):
+            os.remove(json_path)
+
+        if self.structure_errors:
+            with open(structure_json_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    [issue.to_dict() for issue in self.structure_errors],
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                f.write("\n")
+        elif os.path.exists(structure_json_path):
+            os.remove(structure_json_path)
 
 
 def _record_translation_task_result(task_result, translation_stats):
@@ -362,6 +401,53 @@ def read_target_file_content(target_repo_path, source_file_path):
 
     with open(target_file_path, "r", encoding="utf-8") as f:
         return f.read()
+
+
+def validate_successful_translation_structures(
+    successful_file_paths,
+    diff_context,
+    github_client,
+    translation_stats,
+):
+    """Validate heading-level structure for successfully translated Markdown files."""
+    markdown_file_paths = {
+        file_path
+        for file_path in successful_file_paths
+        if file_path and file_path.lower().endswith(".md")
+    }
+    if not markdown_file_paths:
+        return []
+
+    thread_safe_print(
+        f"\n🔎 Validating heading structure for {len(markdown_file_paths)} translated Markdown file(s)..."
+    )
+
+    issues = validate_markdown_heading_structures(
+        markdown_file_paths,
+        source_content_loader=lambda file_path: get_source_ref_content(
+            file_path,
+            diff_context,
+            github_client,
+            "head_ref",
+        ),
+        target_content_loader=lambda file_path: read_target_file_content(
+            TARGET_REPO_PATH,
+            file_path,
+        ),
+    )
+
+    if not issues:
+        thread_safe_print("   ✅ Heading structures match source HEAD")
+        return []
+
+    thread_safe_print(
+        f"   ⚠️  Found {len(issues)} document(s) with heading structure mismatch"
+    )
+    for issue in issues:
+        thread_safe_print(f"      - {issue.file_path}: {issue.reason}")
+        translation_stats.mark_structure_error(issue)
+
+    return issues
 
 
 def get_corresponding_en_commit(content):
@@ -1293,6 +1379,13 @@ def process_translation_group(
         )
         git_add_changes(TARGET_REPO_PATH)
 
+    validate_successful_translation_structures(
+        successful_file_paths,
+        diff_context,
+        github_client,
+        translation_stats,
+    )
+
     counts = {
         "added_files": len(added_files),
         "deleted_files": len(deleted_files),
@@ -1630,9 +1723,11 @@ def main():
     thread_safe_print("=" * 80)
     if translation_stats.failed:
         thread_safe_print("⚠️  The commit-based sync workflow completed with per-file translation failures.")
-        if FAIL_ON_TRANSLATION_ERROR:
-            return 1
-    else:
+    if translation_stats.structure_errors:
+        thread_safe_print("⚠️  The commit-based sync workflow completed with section structure mismatches.")
+    if translation_stats.failed and FAIL_ON_TRANSLATION_ERROR:
+        return 1
+    if not translation_stats.failed and not translation_stats.structure_errors:
         thread_safe_print("🎉 The commit-based sync workflow completed successfully!")
     return 0
 

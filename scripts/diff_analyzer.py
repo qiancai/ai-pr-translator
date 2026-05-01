@@ -2434,7 +2434,7 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
                 if should_include: # filtering legitimate changes in large sections or at section ends
                     content_affected_sections.add(containing_section)
                     distance_to_section = changed_line - containing_section
-                    print(f"   📝 Content change at line {changed_line} affects section at line {containing_section} (distance: {distance_to_section})")
+                    #print(f"   📝 Content change at line {changed_line} affects section at line {containing_section} (distance: {distance_to_section})")
         
         # Add content-modified sections to the modified set, but exclude sections that are already marked as added or deleted
         for line_num in content_affected_sections:

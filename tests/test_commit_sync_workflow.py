@@ -2,6 +2,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import json
 from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 import commit_sync_workflow as workflow
 import commit_sync_workflow_local
+from translation_structure_validator import StructureValidationIssue
 
 
 class CommitSyncWorkflowHelpersTest(unittest.TestCase):
@@ -1076,15 +1078,102 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
         self.assertIn("### Translation failures", report)
         self.assertIn("- `cloud.md`: Matcher failed", report)
 
+    def test_translation_stats_writes_structure_report_without_translation_failures(self):
+        stats = workflow.TranslationStats()
+        stats.mark_structure_error(
+            StructureValidationIssue(
+                file_path="cloud.md",
+                reason="heading level sequence differs",
+                source_compact="#x1 ##x1",
+                target_compact="#x1 ###x1",
+                first_difference="heading 2: source ##, target ###",
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stats.write_failure_report(tmpdir)
+            report = Path(tmpdir, "translation-failures.md").read_text(encoding="utf-8")
+            structure_json = json.loads(
+                Path(tmpdir, "translation-structure-errors.json").read_text(encoding="utf-8")
+            )
+
+            self.assertFalse(Path(tmpdir, "translation-failures.json").exists())
+
+        self.assertIn("### Docs with section structure mismatches after translation", report)
+        self.assertIn("- `cloud.md`: heading level sequence differs", report)
+        self.assertIn("Source: `#x1 ##x1`", report)
+        self.assertEqual("cloud.md", structure_json[0]["file_path"])
+
+    def test_translation_stats_writes_combined_failure_and_structure_report(self):
+        stats = workflow.TranslationStats()
+        stats.mark_failure("failed.md", "Matcher failed")
+        stats.mark_structure_error(
+            StructureValidationIssue(
+                file_path="mismatch.md",
+                reason="heading level sequence differs",
+                source_compact="#x1 ##x1",
+                target_compact="#x1 ##x2",
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stats.write_failure_report(tmpdir)
+            report = Path(tmpdir, "translation-failures.md").read_text(encoding="utf-8")
+            failure_json = json.loads(
+                Path(tmpdir, "translation-failures.json").read_text(encoding="utf-8")
+            )
+            structure_json = json.loads(
+                Path(tmpdir, "translation-structure-errors.json").read_text(encoding="utf-8")
+            )
+
+        failure_heading = "### Translation failures"
+        structure_heading = "### Docs with section structure mismatches after translation"
+        self.assertIn(failure_heading, report)
+        self.assertIn(structure_heading, report)
+        self.assertLess(report.index(failure_heading), report.index(structure_heading))
+        self.assertIn("- `failed.md`: Matcher failed", report)
+        self.assertIn("- `mismatch.md`: heading level sequence differs", report)
+        self.assertEqual("failed.md", failure_json[0]["file_path"])
+        self.assertEqual("mismatch.md", structure_json[0]["file_path"])
+
     def test_translation_stats_removes_stale_failure_report_when_no_failures(self):
         stats = workflow.TranslationStats()
 
         with tempfile.TemporaryDirectory() as tmpdir:
             report_path = Path(tmpdir, "translation-failures.md")
+            structure_json_path = Path(tmpdir, "translation-structure-errors.json")
             report_path.write_text("stale", encoding="utf-8")
+            structure_json_path.write_text("stale", encoding="utf-8")
             stats.write_failure_report(tmpdir)
 
             self.assertFalse(report_path.exists())
+            self.assertFalse(structure_json_path.exists())
+
+    def test_validate_successful_translation_structures_records_mismatch_but_keeps_success(self):
+        stats = workflow.TranslationStats()
+        stats.mark_success("guide.md")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "guide.md").write_text(
+                "# 指南\n\n### Child\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(workflow, "TARGET_REPO_PATH", tmpdir), mock.patch.object(
+                workflow,
+                "get_source_ref_content",
+                return_value="# Guide\n\n## Child\n",
+            ):
+                issues = workflow.validate_successful_translation_structures(
+                    {"guide.md", "image.png"},
+                    {"head_ref": "head"},
+                    object(),
+                    stats,
+                )
+
+        self.assertEqual(["guide.md"], stats.succeeded)
+        self.assertEqual(1, len(issues))
+        self.assertEqual(1, len(stats.structure_errors))
+        self.assertEqual("guide.md", stats.structure_errors[0].file_path)
 
 
 if __name__ == "__main__":
