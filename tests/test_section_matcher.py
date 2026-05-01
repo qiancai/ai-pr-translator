@@ -354,6 +354,53 @@ class SectionMatcherRegressionTest(unittest.TestCase):
                 self.assertEqual(ai_client.prompts, [])
                 self.assertEqual(result["modified_39"]["target_line"], "1")
 
+    def test_commit_mode_direct_system_variable_match_preserves_target_level(self):
+        repo_config = {
+            "source_language": "English",
+            "target_language": "Chinese",
+            "source_mode": "commit",
+        }
+        target_lines = [
+            "# 系统变量",
+            "",
+            "## 变量参考",
+            "",
+            '### tidb_ddl_disk_quota <span class="version-mark">从 v6.3.0 版本开始引入</span>',
+            "",
+            "> **注意：**",
+            ">",
+            "> 旧链接",
+        ]
+        target_hierarchy = {
+            "1": "# 系统变量",
+            "3": "## 变量参考",
+            "5": '## 变量参考 > ### tidb_ddl_disk_quota <span class="version-mark">从 v6.3.0 版本开始引入</span>',
+        }
+        source_diff_dict = {
+            "modified_1600": {
+                "operation": "modified",
+                "original_hierarchy": '## Variable reference > ### tidb_ddl_disk_quota <span class="version-mark">New in v6.3.0</span>',
+                "old_content": '### tidb_ddl_disk_quota <span class="version-mark">New in v6.3.0</span>\n\nold link',
+                "new_content": '### tidb_ddl_disk_quota <span class="version-mark">New in v6.3.0</span>\n\nnew link',
+            },
+        }
+        ai_client = FakeAIClient([])
+
+        result = match_source_diff_to_target(
+            source_diff_dict,
+            target_hierarchy,
+            target_lines,
+            ai_client,
+            repo_config,
+        )
+
+        self.assertEqual(ai_client.prompts, [])
+        self.assertEqual(result["modified_1600"]["target_line"], "5")
+        self.assertEqual(
+            result["modified_1600"]["target_hierarchy"],
+            '## 变量参考 > ### tidb_ddl_disk_quota <span class="version-mark">从 v6.3.0 版本开始引入</span>',
+        )
+
     def test_bottom_modified_marker_without_source_dict_hierarchy_falls_back_to_content(self):
         repo_config = {
             "source_language": "English",

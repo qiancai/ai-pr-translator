@@ -1677,15 +1677,7 @@ def process_modified_or_deleted_section(key, hierarchy, target_hierarchy, target
             if matched_dict:
                 target_line = list(matched_dict.keys())[0]
                 target_hierarchy_str = list(matched_dict.values())[0]
-                
-                # Extract the leaf title and add # prefix, remove top-level title from hierarchy
-                if ' > ' in target_hierarchy_str:
-                    # Remove top-level title and keep only the leaf with ## prefix
-                    leaf_title = target_hierarchy_str.split(' > ')[-1]
-                    formatted_hierarchy = f"## {leaf_title}"
-                else:
-                    # Single level, add ## prefix
-                    formatted_hierarchy = f"## {target_hierarchy_str}"
+                formatted_hierarchy = format_target_hierarchy(target_hierarchy_str)
                 
                 return {
                     "target_line": target_line,
