@@ -15,6 +15,7 @@ from file_updater import (
     REGULAR_TRANSLATION_CHUNK_SIZE,
     TRANSLATION_CHUNK_MAX_SECTIONS,
     TranslationResult,
+    _prepare_translation_prompt,
     build_heading_anchor_slug,
     build_translation_chunks,
     get_translation_chunk_max_sections,
@@ -67,6 +68,22 @@ class FileUpdaterRegressionTest(unittest.TestCase):
 
         self.assertIn("+## Example test {#example-test}", processed)
         self.assertNotIn("-## Example tests {#example-tests}", processed)
+
+    def test_translation_prompt_preserves_mdx_component_tags(self):
+        prompt, _ = _prepare_translation_prompt(
+            "File: example.md\n@@ -1,1 +1,1 @@",
+            {
+                "added_10": '<CustomContent plan="premium">\n\n## Request units\n\nBody\n\n</CustomContent>',
+            },
+            {"added_10": ""},
+            "English",
+            "Chinese",
+            "commit",
+        )
+
+        self.assertIn("Preserve HTML/MDX component tags exactly", prompt)
+        self.assertIn('<CustomContent plan="premium">', prompt)
+        self.assertIn("</CustomContent>", prompt)
 
     def test_preprocess_diff_keeps_existing_explicit_anchor(self):
         pr_diff = "\n".join(

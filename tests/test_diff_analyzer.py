@@ -2,6 +2,7 @@ import sys
 import subprocess
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -67,6 +68,15 @@ class FakeGithub:
 
     def get_repo(self, repo_name):
         return self._repositories[repo_name]
+
+
+def make_full_rewrite_patch(base_content, head_content):
+    base_lines = base_content.replace("\r\n", "\n").splitlines()
+    head_lines = head_content.replace("\r\n", "\n").splitlines()
+    patch_lines = [f"@@ -1,{len(base_lines)} +1,{len(head_lines)} @@"]
+    patch_lines.extend(f"-{line}" for line in base_lines)
+    patch_lines.extend(f"+{line}" for line in head_lines)
+    return "\n".join(patch_lines)
 
 
 class DiffAnalyzerContextTest(unittest.TestCase):
@@ -176,6 +186,130 @@ class DiffAnalyzerContextTest(unittest.TestCase):
 
         self.assertEqual(source_diff_dict["modified_3"]["original_hierarchy"], "bottom-modified-3")
         self.assertEqual(source_diff_dict["modified_3"]["matching_hierarchy"], "## Section")
+
+    def test_crlf_wrapper_before_added_heading_does_not_modify_previous_section(self):
+        file_path = "tidb-cloud/architecture-concepts.md"
+        output_file = self.temp_output_dir / "tidb-cloud-architecture-concepts-source-diff-dict.json"
+        if output_file.exists():
+            output_file.unlink()
+
+        base_content = "\n".join(
+            [
+                "# Architecture",
+                "",
+                "## Nodes",
+                "",
+                "### TiFlash node",
+                "",
+                "Old tail",
+            ]
+        )
+        head_content_lf = "\n".join(
+            [
+                "# Architecture",
+                "",
+                "## Nodes",
+                "",
+                "### TiFlash node",
+                "",
+                "Old tail",
+                "",
+                '<CustomContent plan="premium">',
+                "",
+                "## Request units and capacity in {{{ .premium }}} {#request-units-and-capacity-in-premium}",
+                "",
+                "New details.",
+                "",
+                "</CustomContent>",
+            ]
+        )
+        head_content = head_content_lf.replace("\n", "\r\n")
+        changed_file = SimpleNamespace(
+            filename=file_path,
+            status="modified",
+            patch=make_full_rewrite_patch(base_content, head_content_lf),
+            previous_filename=None,
+        )
+        repository = FakeRepository(
+            {
+                (file_path, "base123"): base_content,
+                (file_path, "head123"): head_content,
+            },
+            FakePR([changed_file], "Add premium section", "base123", "head123"),
+            {("base123", "head123"): [changed_file]},
+        )
+        github = FakeGithub({"acme/docs": repository})
+        context = build_commit_diff_context(
+            "acme/docs",
+            "acme/docs-cn",
+            "base123",
+            "head123",
+            github,
+            self.repo_configs,
+        )
+
+        result = analyze_source_changes(
+            context,
+            github,
+            special_files=["TOC.md", "keywords.md"],
+            ignore_files=[],
+            repo_configs=self.repo_configs,
+        )
+
+        added_sections, modified_sections = result[0], result[1]
+        self.assertIn(file_path, added_sections)
+        self.assertIn(file_path, modified_sections)
+        self.assertEqual(
+            {"11": "## Request units and capacity in {{{ .premium }}} {#request-units-and-capacity-in-premium}"},
+            modified_sections[file_path]["sections"],
+        )
+
+        source_diff = json.loads(output_file.read_text(encoding="utf-8"))
+        self.assertEqual(["added_11"], list(source_diff.keys()))
+        new_content = source_diff["added_11"]["new_content"]
+        self.assertLess(new_content.index("<CustomContent"), new_content.index("## Request units"))
+        self.assertIn("</CustomContent>", new_content)
+
+    def test_regular_paragraph_before_added_heading_still_modifies_previous_section(self):
+        file_path = "guide.md"
+        base_content = "# Guide\n\n## Existing\n\nOld\n"
+        head_content = "# Guide\n\n## Existing\n\nOld\n\nNew paragraph.\n\n## New Section\n\nBody\n"
+        changed_file = SimpleNamespace(
+            filename=file_path,
+            status="modified",
+            patch=make_full_rewrite_patch(base_content, head_content),
+            previous_filename=None,
+        )
+        repository = FakeRepository(
+            {
+                (file_path, "base123"): base_content,
+                (file_path, "head123"): head_content,
+            },
+            FakePR([changed_file], "Add section with intro paragraph", "base123", "head123"),
+            {("base123", "head123"): [changed_file]},
+        )
+        github = FakeGithub({"acme/docs": repository})
+        context = build_commit_diff_context(
+            "acme/docs",
+            "acme/docs-cn",
+            "base123",
+            "head123",
+            github,
+            self.repo_configs,
+        )
+
+        analyze_source_changes(
+            context,
+            github,
+            special_files=["TOC.md", "keywords.md"],
+            ignore_files=[],
+            repo_configs=self.repo_configs,
+        )
+
+        source_diff = json.loads(self.generated_file.read_text(encoding="utf-8"))
+        self.assertIn("modified_3", source_diff)
+        self.assertIn("added_9", source_diff)
+        self.assertIn("New paragraph.", source_diff["modified_3"]["new_content"])
 
     def test_numbered_heading_rename_is_treated_as_modified(self):
         patch = "\n".join(

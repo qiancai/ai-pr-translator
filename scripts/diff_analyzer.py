@@ -6,6 +6,7 @@ for both PR-based and commit-compare-based workflows.
 """
 
 from dataclasses import dataclass
+import difflib
 import json
 import os
 import re
@@ -359,6 +360,76 @@ def get_changed_line_ranges(file):
             current_line += 1
     
     return changed_ranges
+
+
+def get_changed_line_numbers_from_operations(operations):
+    """Return changed head-side line numbers from effective diff operations."""
+    changed_lines = []
+    for key in ("added_lines", "modified_lines", "deleted_lines"):
+        for entry in operations.get(key, []):
+            line_number = entry.get("line_number")
+            if line_number is not None:
+                changed_lines.append(line_number)
+    return changed_lines
+
+def normalize_line_endings(content):
+    """Normalize all line endings to LF for diff analysis."""
+    if content is None:
+        return ""
+    return content.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def operations_change_count(operations):
+    """Return total changed-line entries in an operations dict."""
+    return sum(len(operations.get(key, [])) for key in ("added_lines", "deleted_lines", "modified_lines"))
+
+
+def analyze_normalized_snapshot_diff_operations(base_content, head_content):
+    """Build diff operations from base/head snapshots after normalizing line endings.
+
+    GitHub patches can show a whole-file rewrite when a commit changes line
+    endings. Using normalized snapshots suppresses that noise while preserving
+    real content changes.
+    """
+    base_lines = normalize_line_endings(base_content).splitlines()
+    head_lines = normalize_line_endings(head_content).splitlines()
+
+    if base_lines == head_lines:
+        return {
+            'added_lines': [],
+            'deleted_lines': [],
+            'modified_lines': []
+        }
+
+    patch_lines = list(
+        difflib.unified_diff(
+            base_lines,
+            head_lines,
+            fromfile="base",
+            tofile="head",
+            n=3,
+            lineterm="",
+        )
+    )
+    patch = "\n".join(patch_lines)
+    return analyze_diff_operations(DiffFile(filename="", status="modified", patch=patch))
+
+
+def maybe_use_normalized_snapshot_operations(operations, base_content, head_content):
+    """Use normalized snapshot operations when they remove line-ending noise."""
+    snapshot_operations = analyze_normalized_snapshot_diff_operations(base_content, head_content)
+    original_count = operations_change_count(operations)
+    snapshot_count = operations_change_count(snapshot_operations)
+
+    if original_count and snapshot_count < original_count:
+        print(
+            f"   🧹 Normalized line-ending diff noise: "
+            f"{original_count} patch changes -> {snapshot_count} snapshot changes"
+        )
+        return snapshot_operations
+
+    return operations
+
 
 def analyze_diff_operations(file):
     """Analyze diff to categorize operations as added, modified, or deleted (improved GitHub-like approach)"""
@@ -1324,6 +1395,58 @@ def normalize_keywords_regular_source_diff(source_diff_dict):
 
     return normalized, dropped
 
+
+def is_structural_added_heading_prefix_line(line):
+    """Return True for added lines that should belong to the next added heading."""
+    stripped = (line or "").strip()
+    if not stripped:
+        return True
+    return re.match(r'^<CustomContent\b[^>]*>\s*$', stripped) is not None
+
+
+def collect_added_heading_prefix_lines(file_lines, operations):
+    """Collect structural added lines immediately before added headings.
+
+    These lines are wrappers for the new section, not content changes in the
+    preceding existing section. Return both a mapping of added heading line to
+    prefix lines and the line numbers to ignore for modified-section detection.
+    """
+    added_line_numbers = {
+        entry.get("line_number")
+        for entry in operations.get("added_lines", [])
+        if entry.get("line_number") is not None
+    }
+    added_heading_lines = sorted(
+        entry.get("line_number")
+        for entry in operations.get("added_lines", [])
+        if entry.get("is_header") and entry.get("line_number") is not None
+    )
+
+    prefix_lines_by_heading = {}
+    ignored_line_numbers = set()
+
+    for heading_line in added_heading_lines:
+        prefixes = []
+        candidate_line = heading_line - 1
+
+        while candidate_line in added_line_numbers and 1 <= candidate_line <= len(file_lines):
+            raw_line = file_lines[candidate_line - 1]
+            if not is_structural_added_heading_prefix_line(raw_line):
+                break
+
+            prefixes.append(raw_line.rstrip("\r"))
+            ignored_line_numbers.add(candidate_line)
+            candidate_line -= 1
+
+        if prefixes:
+            content_prefixes = list(reversed(prefixes))
+            while content_prefixes and not content_prefixes[0].strip():
+                content_prefixes.pop(0)
+            if content_prefixes:
+                prefix_lines_by_heading[heading_line] = content_prefixes
+
+    return prefix_lines_by_heading, ignored_line_numbers
+
 def find_previous_section_for_added(added_sections, hierarchy_dict):
     """Find the previous section hierarchy for each added section group"""
     insertion_points = {}
@@ -1381,6 +1504,7 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
     # Check if intro section has changes
     file_lines = file_content.split('\n')
     base_file_lines = base_file_content.split('\n')
+    added_heading_prefix_lines, _ = collect_added_heading_prefix_lines(file_lines, operations)
     has_intro_changes, first_level2_line = detect_intro_section_changes(operations, file_lines)
     
     if has_intro_changes:
@@ -1678,11 +1802,16 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
             # Use special marker for bottom added sections - no matching needed
             next_section_original_hierarchy = f"bottom-added-{line_num}"
         
+        new_content = extract_section_content_for_diff(line_num, all_hierarchy_dict)
+        prefix_lines = added_heading_prefix_lines.get(line_num, [])
+        if prefix_lines:
+            new_content = "\n".join(prefix_lines + ([new_content] if new_content else []))
+
         source_diff_dict[f"added_{line_num_str}"] = {
             "new_line_number": line_num,
             "original_hierarchy": next_section_original_hierarchy,
             "operation": "added",
-            "new_content": extract_section_content_for_diff(line_num, all_hierarchy_dict),
+            "new_content": new_content,
             "old_content": None  # Added sections have no old content
         }
     
@@ -2147,6 +2276,13 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
             print(f"   ⚠️  Could not get base file content: {sanitize_exception_message(e)}")
             base_hierarchy_dict = all_hierarchy_dict
             base_file_content = file_content  # Fallback to current content
+
+        operations = maybe_use_normalized_snapshot_operations(
+            operations,
+            base_file_content,
+            file_content,
+        )
+        print(f"   📝 Effective diff analysis: {len(operations['added_lines'])} added, {len(operations['modified_lines'])} modified, {len(operations['deleted_lines'])} deleted lines")
         
         # Find sections by operation type with corrected logic
         sections_by_type = find_sections_by_operation_type(lines, operations, all_headers, base_hierarchy_dict)
@@ -2166,10 +2302,11 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
         
         # Get only lines that have actual content changes (exclude headers)
         real_content_changes = set()
+        _, structural_added_prefix_lines = collect_added_heading_prefix_lines(lines, operations)
         
         # Added lines (new content, excluding headers)
         for added_line in operations['added_lines']:
-            if not added_line['is_header']:
+            if not added_line['is_header'] and added_line['line_number'] not in structural_added_prefix_lines:
                 real_content_changes.add(added_line['line_number'])
         
         # Deleted lines (removed content, excluding headers)
@@ -2386,11 +2523,18 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
         # Enhanced logic: also check content-level changes using legacy detection
         # This helps detect changes in section content (not just headers)
         print(f"   🔍 Enhanced detection: checking content-level changes...")
-        changed_lines = get_changed_line_ranges(file)
+        changed_lines = [
+            line_number
+            for line_number in get_changed_line_numbers_from_operations(operations)
+            if line_number not in structural_added_prefix_lines
+        ]
         affected_sections = find_affected_sections(lines, changed_lines, all_headers)
         
         legacy_modified = {}
         for line_num in affected_sections:
+            if line_num in sections_by_type['added'] or line_num in sections_by_type['deleted']:
+                continue
+
             if line_num in all_hierarchy_dict:
                 section_hierarchy = all_hierarchy_dict[line_num]
                 # Only add if not already detected by operation-type analysis
@@ -2423,24 +2567,42 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
                     modified_entry['keyword_regular_only'] = True
                 modified_sections[file.filename] = modified_entry
         
-        # Ensure files with frontmatter/intro_section changes in source_diff_dict
-        # get into modified_sections even when no header-based sections were affected.
+        # Ensure files with source_diff_dict-only work still enter the regular
+        # modified-file processor. Downstream processing loads source_diff_dict
+        # and handles both modified and added sections from there; without this
+        # synthetic queue entry, a file with only newly added sections would be
+        # analyzed but never translated.
         if source_diff_dict and file.filename not in modified_sections:
-            has_frontmatter_or_intro = any(
-                k in ("frontmatter", "intro_section") for k in source_diff_dict
-            )
-            if has_frontmatter_or_intro:
-                synthetic_sections = {}
-                if "frontmatter" in source_diff_dict:
+            synthetic_sections = {}
+            for key, diff_info in source_diff_dict.items():
+                operation = diff_info.get("operation")
+                if operation not in ("added", "modified"):
+                    continue
+
+                if key == "frontmatter":
                     synthetic_sections["0"] = "frontmatter"
-                if "intro_section" in source_diff_dict:
+                    continue
+                if key == "intro_section":
                     synthetic_sections["intro_section"] = "intro_section"
+                    continue
+
+                line_number = diff_info.get("new_line_number")
+                if line_number is None:
+                    continue
+
+                hierarchy = all_hierarchy_dict.get(
+                    int(line_number),
+                    diff_info.get("original_hierarchy", ""),
+                )
+                synthetic_sections[str(line_number)] = hierarchy
+
+            if synthetic_sections:
                 modified_sections[file.filename] = {
                     'sections': synthetic_sections,
                     'original_hierarchy': all_hierarchy_dict,
                     'current_hierarchy': all_hierarchy_dict
                 }
-                print(f"   ✏️  Added file to modified_sections via {list(synthetic_sections.values())} detection")
+                print(f"   ✏️  Added file to modified_sections via source_diff_dict-only work: {list(synthetic_sections.values())}")
     
     # Process image files
     print(f"\n🖼️  Analyzing image files...")

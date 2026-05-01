@@ -786,6 +786,7 @@ Instructions:
 2. According to the diff, identify the lines that should be updated accordingly in {target_language}. For lines that needs to be updated in {target_language}, apply the corresponding minimal edits according to the diff. For lines not changed or not included in the diff, make sure to keep the corresponding target lines byte-for-byte identical (same wording, punctuation, spacing, indentation, list markers, and line breaks), which means Do Not add, remove, or modify lines not included in the diff. Never rewrite style, improve wording, or rephrase unaffected content.
 3. Translation rules:
    - Preserve doc variables/placeholders exactly as they appear, including triple braces, such as {DOC_VARIABLE_EXAMPLE}. This also applies when they appear inside HTML attributes or tab labels.
+   - Preserve HTML/MDX component tags exactly as they appear, including tag names, attributes, and closing tags, such as <CustomContent plan="premium"> and </CustomContent>. Translate only the human-readable Markdown text inside them.
    - Keep UI button/label names wrapped in ** such as **My TiDB** in English.
    - Preserve explicit heading anchors such as {{#example-test}} exactly as they appear.
 4. Keep the JSON structure unchanged, only modify section content where required by the diff.
