@@ -15,12 +15,16 @@ TEST_OPTION = "cloud"  # Options: "ai", "cloud"
 # Options: "incremental" for commit diff translation, or "full" for complete
 # SOURCE_FILES translation from SOURCE_HEAD_REF using the file-added flow.
 SOURCE_FILES_TRANSLATION_MODE = "full"
+# Options: "manual" to add/update per-file Corresponding EN commit markers,
+# or "scheduled" to remove existing markers after successful translation.
+COMMIT_SYNC_RUN_TYPE = "manual"
 
 
 COMMON_CONFIG = {
     "SOURCE_BRANCH": "release-8.5",
     "AI_PROVIDER": "azure",  # Options: "deepseek", "gemini", "openai", "azure"
     "SOURCE_FILES_TRANSLATION_MODE": SOURCE_FILES_TRANSLATION_MODE,
+    "COMMIT_SYNC_RUN_TYPE": COMMIT_SYNC_RUN_TYPE,
     "TIDB_CLOUD_ABSOLUTE_LINK_PREFIX": "https://docs.pingcap.com/tidbcloud/",
     # Keep local verification going after per-file failures so successful outputs can be reviewed.
     "FAIL_ON_TRANSLATION_ERROR": False,

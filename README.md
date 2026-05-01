@@ -121,6 +121,12 @@ export SOURCE_HEAD_REF="def456"
 # Optional: source branch label for logs / workflow context
 export SOURCE_BRANCH="main"
 
+# Optional: set by GitHub Actions as GITHUB_EVENT_NAME. Use "workflow_dispatch"
+# for manual runs or "schedule" for scheduled runs to enable per-file
+# Corresponding EN commit cursor handling. Caller workflows should only advance
+# latest_translation_commit.json for scheduled runs, not workflow_dispatch runs.
+export COMMIT_SYNC_RUN_TYPE="schedule"
+
 # Optional: limit sync scope to a folder or explicit files
 export SOURCE_FOLDER="ai"
 export SOURCE_FILES="ai/foo.md,ai/bar.md"
@@ -135,7 +141,7 @@ export AI_PROVIDER="deepseek"  # or "gemini"
 export TERMS_PATH="/path/to/terms.md"
 ```
 
-`commit_sync_workflow.py` always uses the explicit `SOURCE_BASE_REF -> SOURCE_HEAD_REF` compare range passed in by the caller.
+`commit_sync_workflow.py` uses the explicit `SOURCE_BASE_REF -> SOURCE_HEAD_REF` compare range passed in by the caller. For scheduled commit-based runs, target files that contain `<!--Corresponding EN commit: ...-->` and do not match `SOURCE_BASE_REF` are translated separately from that per-file commit to `SOURCE_HEAD_REF`. Manual runs add or update this marker on successfully translated Markdown files; scheduled runs remove existing markers from successfully translated Markdown files so those files return to the global cursor. The caller workflow should keep `latest_translation_commit.json` as the scheduled global cursor and should not advance it for manual `workflow_dispatch` runs.
 
 ## Usage
 
@@ -256,7 +262,7 @@ graph TD
    - Extracts section content and metadata
    - **Benefit**: Eliminates unnecessary translation of unchanged content
 
-   In commit-based mode, `commit_sync_workflow.py` only consumes the explicit compare range it is given. If you use a cursor file such as `latest_translation_commit.json`, that file should be managed by the caller workflow (for example in the target repository), not by this repo.
+   In commit-based mode, `commit_sync_workflow.py` consumes the explicit compare range it is given. If you use a cursor file such as `latest_translation_commit.json`, that file should be managed by the caller workflow (for example in the target repository). Scheduled runs can temporarily override that global cursor for files that carry a `Corresponding EN commit` marker.
 
 2. **Section Matching** (`section_matcher.py`)
    - Direct matching for identical hierarchies

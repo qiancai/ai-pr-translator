@@ -7,6 +7,7 @@ parallel entrypoint for translation based on an explicit commit compare range.
 
 import json
 import os
+import re
 
 from github import Auth, Github
 
@@ -27,6 +28,7 @@ AI_PROVIDER = os.getenv("AI_PROVIDER", "deepseek")
 TARGET_REPO_PATH = os.getenv("TARGET_REPO_PATH")
 TERMS_PATH = os.getenv("TERMS_PATH", "")
 FAIL_ON_TRANSLATION_ERROR = os.getenv("FAIL_ON_TRANSLATION_ERROR", "false").lower() == "true"
+COMMIT_SYNC_RUN_TYPE = os.getenv("COMMIT_SYNC_RUN_TYPE", os.getenv("GITHUB_EVENT_NAME", ""))
 TIDB_CLOUD_ABSOLUTE_LINK_PREFIX = os.getenv(
     "TIDB_CLOUD_ABSOLUTE_LINK_PREFIX",
     "https://docs.pingcap.com/tidbcloud/",
@@ -84,6 +86,13 @@ SOURCE_FILES_TRANSLATION_MODE_ALIASES = {
     "full-translation": "full",
     "full_translation": "full",
 }
+CORRESPONDING_EN_COMMIT_RE = re.compile(
+    r"<!--\s*Corresponding EN commit:\s*([0-9a-fA-F]{7,64})\s*-->"
+)
+CORRESPONDING_EN_COMMIT_TEMPLATE = "<!--Corresponding EN commit: {sha}-->"
+RUN_TYPE_MANUAL_ALIASES = {"manual", "workflow_dispatch"}
+RUN_TYPE_SCHEDULED_ALIASES = {"schedule", "scheduled"}
+PER_FILE_MARKER_GROUP_WARNING_THRESHOLD = 5
 
 
 class TranslationStats:
@@ -311,6 +320,191 @@ def normalize_source_files(source_files, source_folder):
 
 def parse_comma_separated_list(value):
     return [item.strip() for item in (value or "").split(",") if item.strip()]
+
+
+def normalize_commit_sync_run_type(run_type):
+    normalized = (run_type or "").strip().lower()
+    if normalized in RUN_TYPE_MANUAL_ALIASES:
+        return "manual"
+    if normalized in RUN_TYPE_SCHEDULED_ALIASES:
+        return "scheduled"
+    return ""
+
+
+def commits_match(left, right):
+    """Return True when two commit identifiers refer to the same SHA prefix."""
+    left = (left or "").strip().lower()
+    right = (right or "").strip().lower()
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    shorter, longer = sorted((left, right), key=len)
+    return len(shorter) >= 7 and longer.startswith(shorter)
+
+
+def get_safe_target_file_path(target_repo_path, source_file_path):
+    if not target_repo_path or not source_file_path:
+        return None
+
+    target_root = os.path.realpath(target_repo_path)
+    normalized_source_path = source_file_path.lstrip("/").replace("\\", "/")
+    target_file_path = os.path.realpath(os.path.join(target_root, normalized_source_path))
+    if target_file_path != target_root and not target_file_path.startswith(target_root + os.sep):
+        return None
+    return target_file_path
+
+
+def read_target_file_content(target_repo_path, source_file_path):
+    target_file_path = get_safe_target_file_path(target_repo_path, source_file_path)
+    if not target_file_path or not os.path.exists(target_file_path):
+        return None
+
+    with open(target_file_path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def get_corresponding_en_commit(content):
+    match = CORRESPONDING_EN_COMMIT_RE.search(content or "")
+    return match.group(1) if match else ""
+
+
+def _line_ending(line):
+    if line.endswith("\r\n"):
+        return "\r\n"
+    if line.endswith("\n"):
+        return "\n"
+    return ""
+
+
+def upsert_corresponding_en_commit(content, commit_sha, add_if_missing):
+    """Add or update the per-file source commit marker in translated Markdown."""
+    marker = CORRESPONDING_EN_COMMIT_TEMPLATE.format(sha=commit_sha)
+    if CORRESPONDING_EN_COMMIT_RE.search(content or ""):
+        updated = CORRESPONDING_EN_COMMIT_RE.sub(marker, content, count=1)
+        return updated, updated != content
+
+    if not add_if_missing:
+        return content, False
+
+    lines = (content or "").splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if re.match(r"^#\s+\S", line):
+            ending = _line_ending(line)
+            body = line[: -len(ending)] if ending else line
+            lines[index] = f"{body} {marker}{ending}"
+            return "".join(lines), True
+
+    ending = "\n"
+    return f"{marker}{ending}{content or ''}", True
+
+
+def remove_corresponding_en_commit(content):
+    """Remove an existing per-file source commit marker from Markdown."""
+    if not CORRESPONDING_EN_COMMIT_RE.search(content or ""):
+        return content, False
+
+    updated_lines = []
+    changed = False
+    for line in (content or "").splitlines(keepends=True):
+        if not CORRESPONDING_EN_COMMIT_RE.search(line):
+            updated_lines.append(line)
+            continue
+
+        changed = True
+        updated_line = CORRESPONDING_EN_COMMIT_RE.sub("", line, count=1)
+        if not updated_line.strip():
+            continue
+
+        ending = _line_ending(updated_line)
+        body = updated_line[: -len(ending)] if ending else updated_line
+        updated_lines.append(f"{body.rstrip()}{ending}")
+
+    return "".join(updated_lines), changed
+
+
+def update_corresponding_en_commit_for_files(
+    file_paths,
+    target_repo_path,
+    commit_sha,
+    add_if_missing,
+    remove_if_present=False,
+):
+    """Add/update or remove Corresponding EN commit markers in translated files."""
+    if add_if_missing and remove_if_present:
+        raise ValueError(
+            "add_if_missing and remove_if_present are mutually exclusive."
+        )
+
+    updated_files = []
+    failures = {}
+
+    for file_path in sorted(set(file_paths)):
+        if not file_path.endswith(".md"):
+            continue
+
+        target_file_path = get_safe_target_file_path(target_repo_path, file_path)
+        if not target_file_path:
+            failures[file_path] = "Unsafe target file path"
+            continue
+        if not os.path.exists(target_file_path):
+            continue
+
+        try:
+            with open(target_file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            if remove_if_present:
+                updated_content, changed = remove_corresponding_en_commit(content)
+            else:
+                updated_content, changed = upsert_corresponding_en_commit(
+                    content,
+                    commit_sha,
+                    add_if_missing=add_if_missing,
+                )
+            if not changed:
+                continue
+            with open(target_file_path, "w", encoding="utf-8") as f:
+                f.write(updated_content)
+            updated_files.append(file_path)
+        except Exception as e:
+            failures[file_path] = sanitize_exception_message(e)
+
+    return updated_files, failures
+
+
+def split_changed_files_by_corresponding_en_commit(
+    changed_files,
+    target_repo_path,
+    global_base_ref,
+):
+    """Split scheduled files between the global cursor and per-file cursors."""
+    global_changed_files = []
+    marker_groups = {}
+    marker_file_paths = set()
+
+    for file in changed_files:
+        file_path = getattr(file, "filename", "") or ""
+        marker_commit = ""
+        if file_path and file_path.endswith(".md"):
+            try:
+                target_content = read_target_file_content(target_repo_path, file_path)
+            except Exception as e:
+                thread_safe_print(
+                    f"   ⚠️  Could not read target marker for {file_path}: "
+                    f"{sanitize_exception_message(e)}"
+                )
+                target_content = None
+            marker_commit = get_corresponding_en_commit(target_content or "")
+            if marker_commit:
+                marker_file_paths.add(file_path)
+
+        if marker_commit and not commits_match(marker_commit, global_base_ref):
+            marker_groups.setdefault(marker_commit, set()).add(file_path)
+            continue
+
+        global_changed_files.append(file)
+
+    return global_changed_files, marker_groups, marker_file_paths
 
 
 def filter_changed_files(changed_files, source_folder="", source_files=""):
@@ -778,162 +972,77 @@ def resolve_compare_range():
     return base_ref, head_ref
 
 
-def main():
-    """Run the commit-based translation workflow."""
-    try:
-        source_files_translation_mode = get_effective_source_files_translation_mode(
-            SOURCE_FILES_TRANSLATION_MODE,
-            SOURCE_FILES,
-        )
-        configured_source_files_translation_mode = normalize_source_files_translation_mode(
-            SOURCE_FILES_TRANSLATION_MODE
-        )
-    except Exception as e:
-        thread_safe_print(f"❌ Invalid source files translation mode: {sanitize_exception_message(e)}")
-        return 1
-
-    required_env = {
-        "SOURCE_REPO": SOURCE_REPO,
-        "TARGET_REPO": TARGET_REPO,
-        "GITHUB_TOKEN": GITHUB_TOKEN,
-        "TARGET_REPO_PATH": TARGET_REPO_PATH,
-        "SOURCE_HEAD_REF": SOURCE_HEAD_REF.strip(),
-    }
-    if source_files_translation_mode != "full":
-        required_env["SOURCE_BASE_REF"] = SOURCE_BASE_REF.strip()
-
-    if not all(required_env.values()):
-        thread_safe_print("❌ Missing required environment variables:")
-        thread_safe_print(f"   SOURCE_REPO: {SOURCE_REPO}")
-        thread_safe_print(f"   TARGET_REPO: {TARGET_REPO}")
-        thread_safe_print(f"   GITHUB_TOKEN: {'Set' if GITHUB_TOKEN else 'Not set'}")
-        thread_safe_print(f"   TARGET_REPO_PATH: {TARGET_REPO_PATH}")
-        if source_files_translation_mode != "full":
-            thread_safe_print(f"   SOURCE_BASE_REF: {SOURCE_BASE_REF or '(empty)'}")
-        thread_safe_print(f"   SOURCE_HEAD_REF: {SOURCE_HEAD_REF or '(empty)'}")
-        return 1
-
-    thread_safe_print("🔧 Auto Commit Sync Tool")
-    thread_safe_print(f"📍 Source Repo: {SOURCE_REPO}")
-    thread_safe_print(f"📍 Target Repo: {TARGET_REPO}")
-    thread_safe_print(f"🌿 Source Branch: {SOURCE_BRANCH}")
-    if source_files_translation_mode == "full":
-        thread_safe_print("🧭 Compare Range: (not used in full mode)")
-        thread_safe_print(f"🧭 Source Head Ref: {SOURCE_HEAD_REF}")
-    else:
-        thread_safe_print(f"🧭 Compare Range: {SOURCE_BASE_REF}...{SOURCE_HEAD_REF}")
-    thread_safe_print(f"📁 Source Folder Filter: {SOURCE_FOLDER or '(none)'}")
-    thread_safe_print(f"📄 Source File Filter: {SOURCE_FILES or '(none)'}")
-    if configured_source_files_translation_mode != source_files_translation_mode:
-        thread_safe_print(
-            "📄 Source Files Translation Mode: "
-            f"{source_files_translation_mode} "
-            f"(configured {configured_source_files_translation_mode}, ignored because SOURCE_FILES is empty)"
+def build_incremental_diff_context(
+    base_ref,
+    head_ref,
+    github_client,
+    repo_config,
+    repo_configs,
+):
+    if SOURCE_REPO_PATH:
+        diff_context = build_local_commit_diff_context(
+            SOURCE_REPO,
+            TARGET_REPO,
+            base_ref,
+            head_ref,
+            SOURCE_REPO_PATH,
+            repo_configs,
         )
     else:
-        thread_safe_print(f"📄 Source Files Translation Mode: {source_files_translation_mode}")
-    thread_safe_print(f"📦 Source Repo Path: {SOURCE_REPO_PATH or '(remote compare API)'}")
-    thread_safe_print(f"🎯 Target Ref: {TARGET_REF or '(default branch)'}")
-    thread_safe_print(f"📖 Prefer Local Target Read: {PREFER_LOCAL_TARGET_FOR_READ}")
-    thread_safe_print(f"📁 Target Repo Path: {TARGET_REPO_PATH}")
-    thread_safe_print(f"🤖 AI Provider: {AI_PROVIDER}")
-    thread_safe_print(f"🚦 Fail on Translation Error: {FAIL_ON_TRANSLATION_ERROR}")
+        diff_context = build_commit_diff_context(
+            SOURCE_REPO,
+            TARGET_REPO,
+            base_ref,
+            head_ref,
+            github_client,
+            repo_configs,
+        )
+    diff_context["repo_config"] = repo_config
+    return diff_context
 
-    clean_temp_output_dir()
 
-    auth = Auth.Token(GITHUB_TOKEN)
-    github_client = Github(auth=auth)
-    repo_config = get_commit_repo_config()
-    repo_configs = get_commit_repo_configs()
+def print_group_summary(group_label, counts):
+    thread_safe_print("\n" + "-" * 80)
+    thread_safe_print(f"📊 Group Summary: {group_label}")
+    thread_safe_print("-" * 80)
+    thread_safe_print(f"   📄 Added files: {counts['added_files']} processed")
+    thread_safe_print(f"   🗑️  Deleted files: {counts['deleted_files']} processed")
+    thread_safe_print(f"   📋 TOC files: {counts['toc_files']} processed")
+    thread_safe_print(f"   📋 Keyword files: {counts['keyword_files']} processed")
+    thread_safe_print(f"   📝 Modified files: {counts['modified_sections']} processed")
+    thread_safe_print(f"   🖼️  Added images: {counts['added_images']} processed")
+    thread_safe_print(f"   🖼️  Modified images: {counts['modified_images']} processed")
+    thread_safe_print(f"   🖼️  Deleted images: {counts['deleted_images']} processed")
 
-    try:
-        ai_client = UnifiedAIClient(provider=AI_PROVIDER)
-        thread_safe_print(f"🤖 AI Provider: {AI_PROVIDER.upper()} ({ai_client.model})")
-    except Exception as e:
-        thread_safe_print(f"❌ Failed to initialize AI client: {sanitize_exception_message(e)}")
-        return 1
 
-    commit_ignore_files = get_commit_ignore_files()
-    repo_config["ignore_files"] = commit_ignore_files
-    repo_configs[SOURCE_REPO]["ignore_files"] = commit_ignore_files
+def add_counts(total_counts, counts):
+    for key, value in counts.items():
+        total_counts[key] = total_counts.get(key, 0) + value
 
-    terms_path = TERMS_PATH
-    if not terms_path and TARGET_REPO_PATH:
-        candidate = os.path.join(TARGET_REPO_PATH, "resources", "terms.md")
-        if os.path.exists(candidate):
-            terms_path = candidate
-    thread_safe_print(f"\n📚 Loading glossary from: {terms_path or '(not configured)'}")
-    glossary = load_glossary(terms_path) if terms_path else []
-    glossary_matcher = create_glossary_matcher(glossary)
 
-    if source_files_translation_mode == "full":
-        base_ref = SOURCE_BASE_REF.strip()
-        head_ref = SOURCE_HEAD_REF.strip()
-        thread_safe_print(f"\n🚀 Starting commit-based full sync for SOURCE_FILES at: {head_ref}")
-        diff_context = {
-            "mode": "commit",
-            "source_repo": SOURCE_REPO,
-            "target_repo": TARGET_REPO,
-            # Full mode does not compare refs; base_ref is kept only for shared
-            # source-context helpers that expect the key to exist.
-            "base_ref": base_ref or head_ref,
-            "head_ref": head_ref,
-            "changed_files": [],
-            "repo_config": repo_config,
-            "source_repo_path": SOURCE_REPO_PATH,
-            "source_url": f"https://github.com/{SOURCE_REPO}/tree/{head_ref}",
-            "source_description": f"full SOURCE_FILES at {head_ref}",
-        }
-    else:
-        try:
-            base_ref, head_ref = resolve_compare_range()
-        except Exception as e:
-            thread_safe_print(f"❌ Failed to resolve compare range: {sanitize_exception_message(e)}")
-            return 1
-
-        thread_safe_print(f"\n🚀 Starting commit-based sync for: {base_ref}...{head_ref}")
-
-        try:
-            if SOURCE_REPO_PATH:
-                diff_context = build_local_commit_diff_context(
-                    SOURCE_REPO,
-                    TARGET_REPO,
-                    base_ref,
-                    head_ref,
-                    SOURCE_REPO_PATH,
-                    repo_configs,
-                )
-            else:
-                diff_context = build_commit_diff_context(
-                    SOURCE_REPO,
-                    TARGET_REPO,
-                    base_ref,
-                    head_ref,
-                    github_client,
-                    repo_configs,
-                )
-            diff_context["repo_config"] = repo_config
-        except Exception as e:
-            thread_safe_print(f"❌ Failed to build commit diff context: {sanitize_exception_message(e)}")
-            return 1
+def process_translation_group(
+    group_label,
+    *,
+    source_files_translation_mode,
+    source_files,
+    source_folder,
+    diff_context,
+    filtered_changed_files,
+    pr_diff,
+    github_client,
+    ai_client,
+    repo_config,
+    repo_configs,
+    glossary_matcher,
+    commit_ignore_files,
+    translation_stats,
+):
+    """Process one commit-sync translation group that shares the same base ref."""
+    thread_safe_print(f"\n🔁 Translation group: {group_label}")
+    successful_file_paths = set()
 
     if source_files_translation_mode == "full":
-        filtered_changed_files = []
-        diff_context["changed_files"] = []
         thread_safe_print("📊 Compare diff: skipped for full translation mode")
-        pr_diff = ""
-    else:
-        filtered_changed_files = filter_changed_files(
-            diff_context["changed_files"],
-            source_folder=SOURCE_FOLDER,
-            source_files=SOURCE_FILES,
-        )
-        diff_context["changed_files"] = filtered_changed_files
-
-        thread_safe_print(f"📊 Filtered changed files: {len(filtered_changed_files)}")
-        pr_diff = build_diff_text(filtered_changed_files)
-
-    if source_files_translation_mode == "full":
         thread_safe_print(
             "ℹ️  Full translation uses SOURCE_FILES from SOURCE_HEAD_REF "
             "instead of commit diff analysis."
@@ -950,9 +1059,23 @@ def main():
         deleted_images = []
     else:
         if not filtered_changed_files:
-            thread_safe_print("ℹ️  No matching source changes found after folder/file filtering.")
-            return 0
+            thread_safe_print("ℹ️  No matching source changes found for this translation group.")
+            return {
+                "attempted": False,
+                "successful_file_paths": successful_file_paths,
+                "counts": {
+                    "added_files": 0,
+                    "deleted_files": 0,
+                    "toc_files": 0,
+                    "keyword_files": 0,
+                    "modified_sections": 0,
+                    "added_images": 0,
+                    "modified_images": 0,
+                    "deleted_images": 0,
+                },
+            }
 
+        thread_safe_print(f"📊 Filtered changed files: {len(filtered_changed_files)}")
         if pr_diff:
             thread_safe_print(f"✅ Built diff text: {len(pr_diff)} characters")
         else:
@@ -972,16 +1095,30 @@ def main():
                 exclude_folders=exclude_folders,
             )
         except Exception as e:
-            thread_safe_print(f"❌ Source diff analysis failed: {sanitize_exception_message(e)}")
-            return 1
-
-    translation_stats = TranslationStats()
+            translation_stats.mark_failure(
+                group_label,
+                f"Source diff analysis failed: {sanitize_exception_message(e)}",
+            )
+            return {
+                "attempted": True,
+                "successful_file_paths": successful_file_paths,
+                "counts": {
+                    "added_files": 0,
+                    "deleted_files": 0,
+                    "toc_files": 0,
+                    "keyword_files": 0,
+                    "modified_sections": 0,
+                    "added_images": 0,
+                    "modified_images": 0,
+                    "deleted_images": 0,
+                },
+            }
 
     full_translation_file_paths = set()
     if source_files_translation_mode == "full":
         full_translation_file_paths = apply_source_files_full_translation_mode(
-            SOURCE_FILES,
-            SOURCE_FOLDER,
+            source_files,
+            source_folder,
             filtered_changed_files,
             diff_context,
             github_client,
@@ -1053,7 +1190,8 @@ def main():
 
         added_results = run_file_tasks(added_tasks, "added files", parallel_file_processing)
         for result in added_results:
-            _record_translation_task_result(result, translation_stats)
+            if _record_translation_task_result(result, translation_stats):
+                successful_file_paths.add(result["file_path"])
         git_add_successful_task_changes(added_results, TARGET_REPO_PATH)
 
     if toc_files:
@@ -1081,7 +1219,8 @@ def main():
 
         toc_results = run_file_tasks(toc_tasks, "TOC files", parallel_file_processing)
         for result in toc_results:
-            _record_translation_task_result(result, translation_stats)
+            if _record_translation_task_result(result, translation_stats):
+                successful_file_paths.add(result["file_path"])
         git_add_successful_task_changes(toc_results, TARGET_REPO_PATH)
 
     if keyword_files:
@@ -1108,7 +1247,8 @@ def main():
 
         keyword_results = run_file_tasks(keyword_tasks, "keyword files", parallel_file_processing)
         for result in keyword_results:
-            _record_translation_task_result(result, translation_stats)
+            if _record_translation_task_result(result, translation_stats):
+                successful_file_paths.add(result["file_path"])
         git_add_successful_task_changes(keyword_results, TARGET_REPO_PATH)
 
     if modified_sections:
@@ -1137,7 +1277,8 @@ def main():
 
         modified_results = run_file_tasks(modified_tasks, "modified files", parallel_file_processing)
         for result in modified_results:
-            _record_translation_task_result(result, translation_stats)
+            if _record_translation_task_result(result, translation_stats):
+                successful_file_paths.add(result["file_path"])
         git_add_successful_task_changes(modified_results, TARGET_REPO_PATH)
 
     if added_images or modified_images or deleted_images:
@@ -1152,17 +1293,338 @@ def main():
         )
         git_add_changes(TARGET_REPO_PATH)
 
+    counts = {
+        "added_files": len(added_files),
+        "deleted_files": len(deleted_files),
+        "toc_files": len(toc_files),
+        "keyword_files": len(keyword_files),
+        "modified_sections": len(modified_sections),
+        "added_images": len(added_images),
+        "modified_images": len(modified_images),
+        "deleted_images": len(deleted_images),
+    }
+    print_group_summary(group_label, counts)
+    return {
+        "attempted": True,
+        "successful_file_paths": successful_file_paths,
+        "counts": counts,
+    }
+
+
+def main():
+    """Run the commit-based translation workflow."""
+    try:
+        source_files_translation_mode = get_effective_source_files_translation_mode(
+            SOURCE_FILES_TRANSLATION_MODE,
+            SOURCE_FILES,
+        )
+        configured_source_files_translation_mode = normalize_source_files_translation_mode(
+            SOURCE_FILES_TRANSLATION_MODE
+        )
+    except Exception as e:
+        thread_safe_print(f"❌ Invalid source files translation mode: {sanitize_exception_message(e)}")
+        return 1
+
+    required_env = {
+        "SOURCE_REPO": SOURCE_REPO,
+        "TARGET_REPO": TARGET_REPO,
+        "GITHUB_TOKEN": GITHUB_TOKEN,
+        "TARGET_REPO_PATH": TARGET_REPO_PATH,
+        "SOURCE_HEAD_REF": SOURCE_HEAD_REF.strip(),
+    }
+    if source_files_translation_mode != "full":
+        required_env["SOURCE_BASE_REF"] = SOURCE_BASE_REF.strip()
+
+    if not all(required_env.values()):
+        thread_safe_print("❌ Missing required environment variables:")
+        thread_safe_print(f"   SOURCE_REPO: {SOURCE_REPO}")
+        thread_safe_print(f"   TARGET_REPO: {TARGET_REPO}")
+        thread_safe_print(f"   GITHUB_TOKEN: {'Set' if GITHUB_TOKEN else 'Not set'}")
+        thread_safe_print(f"   TARGET_REPO_PATH: {TARGET_REPO_PATH}")
+        if source_files_translation_mode != "full":
+            thread_safe_print(f"   SOURCE_BASE_REF: {SOURCE_BASE_REF or '(empty)'}")
+        thread_safe_print(f"   SOURCE_HEAD_REF: {SOURCE_HEAD_REF or '(empty)'}")
+        return 1
+
+    thread_safe_print("🔧 Auto Commit Sync Tool")
+    thread_safe_print(f"📍 Source Repo: {SOURCE_REPO}")
+    thread_safe_print(f"📍 Target Repo: {TARGET_REPO}")
+    thread_safe_print(f"🌿 Source Branch: {SOURCE_BRANCH}")
+    if source_files_translation_mode == "full":
+        thread_safe_print("🧭 Compare Range: (not used in full mode)")
+        thread_safe_print(f"🧭 Source Head Ref: {SOURCE_HEAD_REF}")
+    else:
+        thread_safe_print(f"🧭 Compare Range: {SOURCE_BASE_REF}...{SOURCE_HEAD_REF}")
+    thread_safe_print(f"📁 Source Folder Filter: {SOURCE_FOLDER or '(none)'}")
+    thread_safe_print(f"📄 Source File Filter: {SOURCE_FILES or '(none)'}")
+    if configured_source_files_translation_mode != source_files_translation_mode:
+        thread_safe_print(
+            "📄 Source Files Translation Mode: "
+            f"{source_files_translation_mode} "
+            f"(configured {configured_source_files_translation_mode}, ignored because SOURCE_FILES is empty)"
+        )
+    else:
+        thread_safe_print(f"📄 Source Files Translation Mode: {source_files_translation_mode}")
+    thread_safe_print(f"📦 Source Repo Path: {SOURCE_REPO_PATH or '(remote compare API)'}")
+    thread_safe_print(f"🎯 Target Ref: {TARGET_REF or '(default branch)'}")
+    thread_safe_print(f"📖 Prefer Local Target Read: {PREFER_LOCAL_TARGET_FOR_READ}")
+    thread_safe_print(f"📁 Target Repo Path: {TARGET_REPO_PATH}")
+    thread_safe_print(f"🤖 AI Provider: {AI_PROVIDER}")
+    thread_safe_print(f"🚦 Fail on Translation Error: {FAIL_ON_TRANSLATION_ERROR}")
+    run_type = normalize_commit_sync_run_type(COMMIT_SYNC_RUN_TYPE)
+    thread_safe_print(f"🧭 Commit Sync Run Type: {run_type or '(unspecified)'}")
+
+    clean_temp_output_dir()
+
+    auth = Auth.Token(GITHUB_TOKEN)
+    github_client = Github(auth=auth)
+    repo_config = get_commit_repo_config()
+    repo_configs = get_commit_repo_configs()
+
+    try:
+        ai_client = UnifiedAIClient(provider=AI_PROVIDER)
+        thread_safe_print(f"🤖 AI Provider: {AI_PROVIDER.upper()} ({ai_client.model})")
+    except Exception as e:
+        thread_safe_print(f"❌ Failed to initialize AI client: {sanitize_exception_message(e)}")
+        return 1
+
+    commit_ignore_files = get_commit_ignore_files()
+    repo_config["ignore_files"] = commit_ignore_files
+    repo_configs[SOURCE_REPO]["ignore_files"] = commit_ignore_files
+
+    terms_path = TERMS_PATH
+    if not terms_path and TARGET_REPO_PATH:
+        candidate = os.path.join(TARGET_REPO_PATH, "resources", "terms.md")
+        if os.path.exists(candidate):
+            terms_path = candidate
+    thread_safe_print(f"\n📚 Loading glossary from: {terms_path or '(not configured)'}")
+    glossary = load_glossary(terms_path) if terms_path else []
+    glossary_matcher = create_glossary_matcher(glossary)
+    translation_stats = TranslationStats()
+    all_successful_file_paths = set()
+    marker_file_paths = set()
+    total_counts = {
+        "added_files": 0,
+        "deleted_files": 0,
+        "toc_files": 0,
+        "keyword_files": 0,
+        "modified_sections": 0,
+        "added_images": 0,
+        "modified_images": 0,
+        "deleted_images": 0,
+    }
+
+    if source_files_translation_mode == "full":
+        base_ref = SOURCE_BASE_REF.strip()
+        head_ref = SOURCE_HEAD_REF.strip()
+        thread_safe_print(f"\n🚀 Starting commit-based full sync for SOURCE_FILES at: {head_ref}")
+        diff_context = {
+            "mode": "commit",
+            "source_repo": SOURCE_REPO,
+            "target_repo": TARGET_REPO,
+            # Full mode does not compare refs; base_ref is kept only for shared
+            # source-context helpers that expect the key to exist.
+            "base_ref": base_ref or head_ref,
+            "head_ref": head_ref,
+            "changed_files": [],
+            "repo_config": repo_config,
+            "source_repo_path": SOURCE_REPO_PATH,
+            "source_url": f"https://github.com/{SOURCE_REPO}/tree/{head_ref}",
+            "source_description": f"full SOURCE_FILES at {head_ref}",
+        }
+        group_result = process_translation_group(
+            "full SOURCE_FILES",
+            source_files_translation_mode="full",
+            source_files=SOURCE_FILES,
+            source_folder=SOURCE_FOLDER,
+            diff_context=diff_context,
+            filtered_changed_files=[],
+            pr_diff="",
+            github_client=github_client,
+            ai_client=ai_client,
+            repo_config=repo_config,
+            repo_configs=repo_configs,
+            glossary_matcher=glossary_matcher,
+            commit_ignore_files=commit_ignore_files,
+            translation_stats=translation_stats,
+        )
+        all_successful_file_paths.update(group_result["successful_file_paths"])
+        add_counts(total_counts, group_result["counts"])
+    else:
+        try:
+            base_ref, head_ref = resolve_compare_range()
+        except Exception as e:
+            thread_safe_print(f"❌ Failed to resolve compare range: {sanitize_exception_message(e)}")
+            return 1
+
+        thread_safe_print(f"\n🚀 Starting commit-based sync for: {base_ref}...{head_ref}")
+
+        try:
+            diff_context = build_incremental_diff_context(
+                base_ref,
+                head_ref,
+                github_client,
+                repo_config,
+                repo_configs,
+            )
+        except Exception as e:
+            thread_safe_print(f"❌ Failed to build commit diff context: {sanitize_exception_message(e)}")
+            return 1
+
+        filtered_changed_files = filter_changed_files(
+            diff_context["changed_files"],
+            source_folder=SOURCE_FOLDER,
+            source_files=SOURCE_FILES,
+        )
+        marker_groups = {}
+        marker_file_paths = set()
+        if run_type == "scheduled":
+            filtered_changed_files, marker_groups, marker_file_paths = split_changed_files_by_corresponding_en_commit(
+                filtered_changed_files,
+                TARGET_REPO_PATH,
+                base_ref,
+            )
+            if marker_groups:
+                thread_safe_print("\n📌 Files with per-file Corresponding EN commit cursors:")
+                for marker_ref, file_paths in sorted(marker_groups.items()):
+                    thread_safe_print(
+                        f"   {marker_ref}: {', '.join(sorted(file_paths))}"
+                    )
+            if len(marker_groups) > PER_FILE_MARKER_GROUP_WARNING_THRESHOLD:
+                thread_safe_print(
+                    "   ⚠️  Many distinct per-file Corresponding EN commit cursors "
+                    f"detected ({len(marker_groups)} groups). This may increase compare API calls."
+                )
+
+        if filtered_changed_files:
+            diff_context["changed_files"] = filtered_changed_files
+            pr_diff = build_diff_text(filtered_changed_files)
+            group_result = process_translation_group(
+                f"global cursor {base_ref}...{head_ref}",
+                source_files_translation_mode="incremental",
+                source_files=SOURCE_FILES,
+                source_folder=SOURCE_FOLDER,
+                diff_context=diff_context,
+                filtered_changed_files=filtered_changed_files,
+                pr_diff=pr_diff,
+                github_client=github_client,
+                ai_client=ai_client,
+                repo_config=repo_config,
+                repo_configs=repo_configs,
+                glossary_matcher=glossary_matcher,
+                commit_ignore_files=commit_ignore_files,
+                translation_stats=translation_stats,
+            )
+            all_successful_file_paths.update(group_result["successful_file_paths"])
+            add_counts(total_counts, group_result["counts"])
+        elif not marker_groups:
+            thread_safe_print("ℹ️  No matching source changes found after folder/file filtering.")
+            return 0
+
+        for marker_ref, file_paths in sorted(marker_groups.items()):
+            if commits_match(marker_ref, head_ref):
+                thread_safe_print(
+                    f"ℹ️  Skipping per-file cursor {marker_ref}; it already matches SOURCE_HEAD_REF."
+                )
+                continue
+
+            try:
+                marker_diff_context = build_incremental_diff_context(
+                    marker_ref,
+                    head_ref,
+                    github_client,
+                    repo_config,
+                    repo_configs,
+                )
+            except Exception as e:
+                translation_stats.mark_failure(
+                    ",".join(sorted(file_paths)),
+                    f"Failed to build per-file cursor diff context: {sanitize_exception_message(e)}",
+                )
+                continue
+
+            marker_source_files = ",".join(sorted(file_paths))
+            marker_filtered_changed_files = filter_changed_files(
+                marker_diff_context["changed_files"],
+                source_folder="",
+                source_files=marker_source_files,
+            )
+            marker_diff_context["changed_files"] = marker_filtered_changed_files
+            if not marker_filtered_changed_files:
+                thread_safe_print(
+                    "ℹ️  No source changes found since per-file cursor "
+                    f"{marker_ref} for: {marker_source_files}"
+                )
+                continue
+
+            marker_pr_diff = build_diff_text(marker_filtered_changed_files)
+            group_result = process_translation_group(
+                f"per-file cursor {marker_ref}...{head_ref}",
+                source_files_translation_mode="incremental",
+                source_files=marker_source_files,
+                source_folder="",
+                diff_context=marker_diff_context,
+                filtered_changed_files=marker_filtered_changed_files,
+                pr_diff=marker_pr_diff,
+                github_client=github_client,
+                ai_client=ai_client,
+                repo_config=repo_config,
+                repo_configs=repo_configs,
+                glossary_matcher=glossary_matcher,
+                commit_ignore_files=commit_ignore_files,
+                translation_stats=translation_stats,
+            )
+            all_successful_file_paths.update(group_result["successful_file_paths"])
+            add_counts(total_counts, group_result["counts"])
+
+    if all_successful_file_paths and run_type in {"manual", "scheduled"}:
+        add_if_missing = run_type == "manual"
+        remove_if_present = run_type == "scheduled"
+        marker_update_paths = (
+            all_successful_file_paths
+            if add_if_missing
+            else all_successful_file_paths & marker_file_paths
+        )
+    else:
+        marker_update_paths = set()
+
+    if marker_update_paths:
+        updated_marker_files, marker_failures = update_corresponding_en_commit_for_files(
+            marker_update_paths,
+            TARGET_REPO_PATH,
+            SOURCE_HEAD_REF.strip(),
+            add_if_missing=add_if_missing,
+            remove_if_present=remove_if_present,
+        )
+        if updated_marker_files:
+            if add_if_missing:
+                thread_safe_print(
+                    "\n📌 Added or updated Corresponding EN commit markers: "
+                    f"{', '.join(updated_marker_files)}"
+                )
+            else:
+                thread_safe_print(
+                    "\n📌 Removed Corresponding EN commit markers from scheduled successes: "
+                    f"{', '.join(updated_marker_files)}"
+                )
+            git_add_changes(TARGET_REPO_PATH)
+        for file_path, reason in marker_failures.items():
+            translation_stats.mark_failure(
+                file_path,
+                f"Failed to update Corresponding EN commit marker: {reason}",
+            )
+
     thread_safe_print("\n" + "=" * 80)
     thread_safe_print("📊 Final Summary:")
     thread_safe_print("=" * 80)
-    thread_safe_print(f"   📄 Added files: {len(added_files)} processed")
-    thread_safe_print(f"   🗑️  Deleted files: {len(deleted_files)} processed")
-    thread_safe_print(f"   📋 TOC files: {len(toc_files)} processed")
-    thread_safe_print(f"   📋 Keyword files: {len(keyword_files)} processed")
-    thread_safe_print(f"   📝 Modified files: {len(modified_sections)} processed")
-    thread_safe_print(f"   🖼️  Added images: {len(added_images)} processed")
-    thread_safe_print(f"   🖼️  Modified images: {len(modified_images)} processed")
-    thread_safe_print(f"   🖼️  Deleted images: {len(deleted_images)} processed")
+    thread_safe_print(f"   📄 Added files: {total_counts['added_files']} processed")
+    thread_safe_print(f"   🗑️  Deleted files: {total_counts['deleted_files']} processed")
+    thread_safe_print(f"   📋 TOC files: {total_counts['toc_files']} processed")
+    thread_safe_print(f"   📋 Keyword files: {total_counts['keyword_files']} processed")
+    thread_safe_print(f"   📝 Modified files: {total_counts['modified_sections']} processed")
+    thread_safe_print(f"   🖼️  Added images: {total_counts['added_images']} processed")
+    thread_safe_print(f"   🖼️  Modified images: {total_counts['modified_images']} processed")
+    thread_safe_print(f"   🖼️  Deleted images: {total_counts['deleted_images']} processed")
     translation_stats.print_summary()
     translation_stats.write_failure_report(os.path.join(os.path.dirname(__file__), "temp_output"))
     thread_safe_print("=" * 80)

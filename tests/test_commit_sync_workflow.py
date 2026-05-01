@@ -55,6 +55,10 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
             config["SOURCE_FILES_TRANSLATION_MODE"],
             commit_sync_workflow_local.SOURCE_FILES_TRANSLATION_MODE,
         )
+        self.assertEqual(
+            config["COMMIT_SYNC_RUN_TYPE"],
+            commit_sync_workflow_local.COMMIT_SYNC_RUN_TYPE,
+        )
 
     def test_normalize_source_files_prefixes_folder(self):
         normalized = workflow.normalize_source_files("foo.md, ai/bar.md ,baz/qux.md", "ai")
@@ -110,6 +114,140 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
             workflow.get_effective_source_files_translation_mode("full", "guide.md"),
             "full",
         )
+
+    def test_commits_match_accepts_seven_char_prefixes(self):
+        self.assertTrue(
+            workflow.commits_match(
+                "abcdef1",
+                "abcdef1234567890",
+            )
+        )
+        self.assertFalse(
+            workflow.commits_match(
+                "abcdef",
+                "abcdef1234567890",
+            )
+        )
+        self.assertFalse(
+            workflow.commits_match(
+                "abcdef1",
+                "abcdef2234567890",
+            )
+        )
+
+    def test_get_safe_target_file_path_blocks_symlink_escape(self):
+        with tempfile.TemporaryDirectory() as tmpdir, tempfile.TemporaryDirectory() as outside:
+            symlink_path = Path(tmpdir, "outside-link")
+            try:
+                symlink_path.symlink_to(outside, target_is_directory=True)
+            except OSError as e:
+                self.skipTest(f"symlink creation is unavailable: {e}")
+
+            self.assertIsNone(
+                workflow.get_safe_target_file_path(
+                    tmpdir,
+                    "outside-link/escaped.md",
+                )
+            )
+
+    def test_upsert_corresponding_en_commit_adds_marker_after_h1(self):
+        content = "---\ntitle: 系统变量\n---\n\n# 系统变量\n\nBody\n"
+
+        updated, changed = workflow.upsert_corresponding_en_commit(
+            content,
+            "abcdef1234567890",
+            add_if_missing=True,
+        )
+
+        self.assertTrue(changed)
+        self.assertIn(
+            "# 系统变量 <!--Corresponding EN commit: abcdef1234567890-->",
+            updated,
+        )
+
+    def test_upsert_corresponding_en_commit_inserts_first_line_without_h1(self):
+        updated, changed = workflow.upsert_corresponding_en_commit(
+            "Body\n",
+            "abcdef1234567890",
+            add_if_missing=True,
+        )
+
+        self.assertTrue(changed)
+        self.assertTrue(
+            updated.startswith("<!--Corresponding EN commit: abcdef1234567890-->\n")
+        )
+
+    def test_remove_corresponding_en_commit_removes_inline_marker(self):
+        content = "# 系统变量 <!--Corresponding EN commit: abcdef1234567890-->\n\nBody\n"
+
+        updated, changed = workflow.remove_corresponding_en_commit(content)
+
+        self.assertTrue(changed)
+        self.assertEqual(updated, "# 系统变量\n\nBody\n")
+
+    def test_split_changed_files_uses_per_file_marker_only_when_mismatched(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "guide.md").write_text(
+                "# Guide <!--Corresponding EN commit: bbbbbbb222222222-->\n",
+                encoding="utf-8",
+            )
+            Path(tmpdir, "global.md").write_text(
+                "# Global <!--Corresponding EN commit: aaaaaaa111111111-->\n",
+                encoding="utf-8",
+            )
+            Path(tmpdir, "plain.md").write_text("# Plain\n", encoding="utf-8")
+            changed_files = [
+                SimpleNamespace(filename="guide.md"),
+                SimpleNamespace(filename="global.md"),
+                SimpleNamespace(filename="plain.md"),
+            ]
+
+            global_files, marker_groups, marker_file_paths = workflow.split_changed_files_by_corresponding_en_commit(
+                changed_files,
+                tmpdir,
+                "aaaaaaa111111111",
+            )
+
+        self.assertEqual([file.filename for file in global_files], ["global.md", "plain.md"])
+        self.assertEqual(marker_groups, {"bbbbbbb222222222": {"guide.md"}})
+        self.assertEqual(marker_file_paths, {"guide.md", "global.md"})
+
+    def test_update_corresponding_en_commit_rejects_conflicting_modes(self):
+        with self.assertRaises(ValueError):
+            workflow.update_corresponding_en_commit_for_files(
+                {"guide.md"},
+                "/tmp/target",
+                "ccccccc333333333",
+                add_if_missing=True,
+                remove_if_present=True,
+            )
+
+    def test_update_corresponding_en_commit_removes_marker_for_scheduled_success(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "guide.md").write_text(
+                "# Guide <!--Corresponding EN commit: bbbbbbb222222222-->\n\nBody\n",
+                encoding="utf-8",
+            )
+            Path(tmpdir, "plain.md").write_text("# Plain\n", encoding="utf-8")
+
+            updated_files, failures = workflow.update_corresponding_en_commit_for_files(
+                {"guide.md", "plain.md"},
+                tmpdir,
+                "ccccccc333333333",
+                add_if_missing=False,
+                remove_if_present=True,
+            )
+
+            self.assertEqual(updated_files, ["guide.md"])
+            self.assertEqual(failures, {})
+            self.assertNotIn(
+                "Corresponding EN commit",
+                Path(tmpdir, "guide.md").read_text(encoding="utf-8"),
+            )
+            self.assertNotIn(
+                "Corresponding EN commit",
+                Path(tmpdir, "plain.md").read_text(encoding="utf-8"),
+            )
 
     def test_full_translation_source_content_prefers_local_source_repo_path(self):
         completed = subprocess.CompletedProcess(
@@ -396,6 +534,336 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
         process_added_files.assert_called_once()
         self.assertEqual(process_added_files.call_args.args[0], {"guide.md": "# Guide\n"})
         self.assertTrue(process_added_files.call_args.kwargs["overwrite_existing"])
+
+    def test_manual_success_adds_corresponding_en_commit_marker(self):
+        fake_github_client = object()
+        fake_ai_client = SimpleNamespace(model="fake-model")
+        zero_counts = {
+            "added_files": 0,
+            "deleted_files": 0,
+            "toc_files": 0,
+            "keyword_files": 0,
+            "modified_sections": 0,
+            "added_images": 0,
+            "modified_images": 0,
+            "deleted_images": 0,
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "guide.md").write_text("# Guide\n\nBody\n", encoding="utf-8")
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_REPO", "acme/docs"))
+                stack.enter_context(mock.patch.object(workflow, "TARGET_REPO", "acme/docs-cn"))
+                stack.enter_context(mock.patch.object(workflow, "GITHUB_TOKEN", "token"))
+                stack.enter_context(mock.patch.object(workflow, "TARGET_REPO_PATH", tmpdir))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_BASE_REF", ""))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_HEAD_REF", "abcdef1234567890"))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_FILES", "guide.md"))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_FOLDER", ""))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_FILES_TRANSLATION_MODE", "full"))
+                stack.enter_context(mock.patch.object(workflow, "COMMIT_SYNC_RUN_TYPE", "workflow_dispatch"))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_REPO_PATH", ""))
+                stack.enter_context(mock.patch.object(workflow, "TARGET_REF", ""))
+                stack.enter_context(mock.patch.object(workflow, "clean_temp_output_dir"))
+                stack.enter_context(mock.patch.object(workflow.Auth, "Token", return_value="token-auth"))
+                stack.enter_context(mock.patch.object(workflow, "Github", return_value=fake_github_client))
+                stack.enter_context(mock.patch.object(workflow, "UnifiedAIClient", return_value=fake_ai_client))
+                stack.enter_context(mock.patch.object(workflow, "load_glossary", return_value=[]))
+                stack.enter_context(mock.patch.object(workflow, "create_glossary_matcher", return_value=None))
+                stack.enter_context(
+                    mock.patch.object(
+                        workflow,
+                        "process_translation_group",
+                        return_value={
+                            "attempted": True,
+                            "successful_file_paths": {"guide.md"},
+                            "counts": zero_counts,
+                        },
+                    )
+                )
+                stack.enter_context(mock.patch.object(workflow, "git_add_changes"))
+                stack.enter_context(mock.patch.object(workflow.TranslationStats, "write_failure_report"))
+
+                result = workflow.main()
+
+            self.assertEqual(result, 0)
+            self.assertIn(
+                "# Guide <!--Corresponding EN commit: abcdef1234567890-->",
+                Path(tmpdir, "guide.md").read_text(encoding="utf-8"),
+            )
+
+    def test_scheduled_run_splits_marker_mismatches_and_removes_successful_marker(self):
+        fake_github_client = object()
+        fake_ai_client = SimpleNamespace(model="fake-model")
+        zero_counts = {
+            "added_files": 0,
+            "deleted_files": 0,
+            "toc_files": 0,
+            "keyword_files": 0,
+            "modified_sections": 0,
+            "added_images": 0,
+            "modified_images": 0,
+            "deleted_images": 0,
+        }
+        global_context = {
+            "mode": "commit",
+            "source_repo": "acme/docs",
+            "target_repo": "acme/docs-cn",
+            "base_ref": "aaaaaaa111111111",
+            "head_ref": "ccccccc333333333",
+            "changed_files": [
+                SimpleNamespace(filename="guide.md", status="modified", patch="@@ -1 +1 @@\n-a\n+b\n"),
+                SimpleNamespace(filename="global.md", status="modified", patch="@@ -1 +1 @@\n-a\n+b\n"),
+                SimpleNamespace(filename="other.md", status="modified", patch="@@ -1 +1 @@\n-a\n+b\n"),
+            ],
+        }
+        marker_context = {
+            "mode": "commit",
+            "source_repo": "acme/docs",
+            "target_repo": "acme/docs-cn",
+            "base_ref": "bbbbbbb222222222",
+            "head_ref": "ccccccc333333333",
+            "changed_files": [
+                SimpleNamespace(filename="guide.md", status="modified", patch="@@ -1 +1 @@\n-b\n+c\n"),
+            ],
+        }
+        group_paths = []
+
+        def fake_process_translation_group(*args, **kwargs):
+            filtered_changed_files = kwargs["filtered_changed_files"]
+            paths = {file.filename for file in filtered_changed_files}
+            group_paths.append(paths)
+            return {
+                "attempted": True,
+                "successful_file_paths": paths,
+                "counts": zero_counts,
+            }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "guide.md").write_text(
+                "# Guide <!--Corresponding EN commit: bbbbbbb222222222-->\n\nBody\n",
+                encoding="utf-8",
+            )
+            Path(tmpdir, "global.md").write_text(
+                "# Global <!--Corresponding EN commit: aaaaaaa111111111-->\n\nBody\n",
+                encoding="utf-8",
+            )
+            Path(tmpdir, "other.md").write_text("# Other\n\nBody\n", encoding="utf-8")
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_REPO", "acme/docs"))
+                stack.enter_context(mock.patch.object(workflow, "TARGET_REPO", "acme/docs-cn"))
+                stack.enter_context(mock.patch.object(workflow, "GITHUB_TOKEN", "token"))
+                stack.enter_context(mock.patch.object(workflow, "TARGET_REPO_PATH", tmpdir))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_BASE_REF", "aaaaaaa111111111"))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_HEAD_REF", "ccccccc333333333"))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_FILES", ""))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_FOLDER", ""))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_FILES_TRANSLATION_MODE", "incremental"))
+                stack.enter_context(mock.patch.object(workflow, "COMMIT_SYNC_RUN_TYPE", "schedule"))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_REPO_PATH", ""))
+                stack.enter_context(mock.patch.object(workflow, "TARGET_REF", ""))
+                stack.enter_context(mock.patch.object(workflow, "clean_temp_output_dir"))
+                stack.enter_context(mock.patch.object(workflow.Auth, "Token", return_value="token-auth"))
+                stack.enter_context(mock.patch.object(workflow, "Github", return_value=fake_github_client))
+                stack.enter_context(mock.patch.object(workflow, "UnifiedAIClient", return_value=fake_ai_client))
+                stack.enter_context(mock.patch.object(workflow, "load_glossary", return_value=[]))
+                stack.enter_context(mock.patch.object(workflow, "create_glossary_matcher", return_value=None))
+                stack.enter_context(
+                    mock.patch.object(
+                        workflow,
+                        "build_incremental_diff_context",
+                        side_effect=[global_context, marker_context],
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        workflow,
+                        "process_translation_group",
+                        side_effect=fake_process_translation_group,
+                    )
+                )
+                update_markers = stack.enter_context(
+                    mock.patch.object(
+                        workflow,
+                        "update_corresponding_en_commit_for_files",
+                        wraps=workflow.update_corresponding_en_commit_for_files,
+                    )
+                )
+                stack.enter_context(mock.patch.object(workflow, "git_add_changes"))
+                stack.enter_context(mock.patch.object(workflow.TranslationStats, "write_failure_report"))
+
+                result = workflow.main()
+
+            self.assertEqual(result, 0)
+            self.assertEqual(group_paths, [{"global.md", "other.md"}, {"guide.md"}])
+            self.assertEqual(
+                update_markers.call_args.args[0],
+                {"global.md", "guide.md"},
+            )
+            self.assertNotIn(
+                "Corresponding EN commit",
+                Path(tmpdir, "guide.md").read_text(encoding="utf-8"),
+            )
+            self.assertNotIn(
+                "Corresponding EN commit",
+                Path(tmpdir, "global.md").read_text(encoding="utf-8"),
+            )
+            self.assertNotIn(
+                "Corresponding EN commit",
+                Path(tmpdir, "other.md").read_text(encoding="utf-8"),
+            )
+
+    def test_unspecified_run_type_keeps_legacy_global_diff_path(self):
+        fake_github_client = object()
+        fake_ai_client = SimpleNamespace(model="fake-model")
+        zero_counts = {
+            "added_files": 0,
+            "deleted_files": 0,
+            "toc_files": 0,
+            "keyword_files": 0,
+            "modified_sections": 0,
+            "added_images": 0,
+            "modified_images": 0,
+            "deleted_images": 0,
+        }
+        global_context = {
+            "mode": "commit",
+            "source_repo": "acme/docs",
+            "target_repo": "acme/docs-cn",
+            "base_ref": "aaaaaaa111111111",
+            "head_ref": "ccccccc333333333",
+            "changed_files": [
+                SimpleNamespace(filename="guide.md", status="modified", patch="@@ -1 +1 @@\n-a\n+b\n"),
+                SimpleNamespace(filename="other.md", status="modified", patch="@@ -1 +1 @@\n-a\n+b\n"),
+            ],
+        }
+        group_paths = []
+
+        def fake_process_translation_group(*args, **kwargs):
+            paths = {file.filename for file in kwargs["filtered_changed_files"]}
+            group_paths.append(paths)
+            return {
+                "attempted": True,
+                "successful_file_paths": paths,
+                "counts": zero_counts,
+            }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "guide.md").write_text(
+                "# Guide <!--Corresponding EN commit: bbbbbbb222222222-->\n\nBody\n",
+                encoding="utf-8",
+            )
+            Path(tmpdir, "other.md").write_text("# Other\n\nBody\n", encoding="utf-8")
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_REPO", "acme/docs"))
+                stack.enter_context(mock.patch.object(workflow, "TARGET_REPO", "acme/docs-cn"))
+                stack.enter_context(mock.patch.object(workflow, "GITHUB_TOKEN", "token"))
+                stack.enter_context(mock.patch.object(workflow, "TARGET_REPO_PATH", tmpdir))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_BASE_REF", "aaaaaaa111111111"))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_HEAD_REF", "ccccccc333333333"))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_FILES", ""))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_FOLDER", ""))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_FILES_TRANSLATION_MODE", "incremental"))
+                stack.enter_context(mock.patch.object(workflow, "COMMIT_SYNC_RUN_TYPE", ""))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_REPO_PATH", ""))
+                stack.enter_context(mock.patch.object(workflow, "TARGET_REF", ""))
+                stack.enter_context(mock.patch.object(workflow, "clean_temp_output_dir"))
+                stack.enter_context(mock.patch.object(workflow.Auth, "Token", return_value="token-auth"))
+                stack.enter_context(mock.patch.object(workflow, "Github", return_value=fake_github_client))
+                stack.enter_context(mock.patch.object(workflow, "UnifiedAIClient", return_value=fake_ai_client))
+                stack.enter_context(mock.patch.object(workflow, "load_glossary", return_value=[]))
+                stack.enter_context(mock.patch.object(workflow, "create_glossary_matcher", return_value=None))
+                build_context = stack.enter_context(
+                    mock.patch.object(
+                        workflow,
+                        "build_incremental_diff_context",
+                        return_value=global_context,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        workflow,
+                        "process_translation_group",
+                        side_effect=fake_process_translation_group,
+                    )
+                )
+                update_markers = stack.enter_context(
+                    mock.patch.object(workflow, "update_corresponding_en_commit_for_files")
+                )
+                stack.enter_context(mock.patch.object(workflow.TranslationStats, "write_failure_report"))
+
+                result = workflow.main()
+
+            self.assertEqual(result, 0)
+            build_context.assert_called_once()
+            self.assertEqual(group_paths, [{"guide.md", "other.md"}])
+            update_markers.assert_not_called()
+            self.assertIn(
+                "Corresponding EN commit",
+                Path(tmpdir, "guide.md").read_text(encoding="utf-8"),
+            )
+
+    def test_scheduled_marker_group_diff_failure_continues_with_failure_report(self):
+        fake_github_client = object()
+        fake_ai_client = SimpleNamespace(model="fake-model")
+        global_context = {
+            "mode": "commit",
+            "source_repo": "acme/docs",
+            "target_repo": "acme/docs-cn",
+            "base_ref": "aaaaaaa111111111",
+            "head_ref": "ccccccc333333333",
+            "changed_files": [
+                SimpleNamespace(filename="guide.md", status="modified", patch="@@ -1 +1 @@\n-a\n+b\n"),
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "guide.md").write_text(
+                "# Guide <!--Corresponding EN commit: bbbbbbb222222222-->\n\nBody\n",
+                encoding="utf-8",
+            )
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_REPO", "acme/docs"))
+                stack.enter_context(mock.patch.object(workflow, "TARGET_REPO", "acme/docs-cn"))
+                stack.enter_context(mock.patch.object(workflow, "GITHUB_TOKEN", "token"))
+                stack.enter_context(mock.patch.object(workflow, "TARGET_REPO_PATH", tmpdir))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_BASE_REF", "aaaaaaa111111111"))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_HEAD_REF", "ccccccc333333333"))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_FILES", ""))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_FOLDER", ""))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_FILES_TRANSLATION_MODE", "incremental"))
+                stack.enter_context(mock.patch.object(workflow, "COMMIT_SYNC_RUN_TYPE", "schedule"))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_REPO_PATH", ""))
+                stack.enter_context(mock.patch.object(workflow, "TARGET_REF", ""))
+                stack.enter_context(mock.patch.object(workflow, "clean_temp_output_dir"))
+                stack.enter_context(mock.patch.object(workflow.Auth, "Token", return_value="token-auth"))
+                stack.enter_context(mock.patch.object(workflow, "Github", return_value=fake_github_client))
+                stack.enter_context(mock.patch.object(workflow, "UnifiedAIClient", return_value=fake_ai_client))
+                stack.enter_context(mock.patch.object(workflow, "load_glossary", return_value=[]))
+                stack.enter_context(mock.patch.object(workflow, "create_glossary_matcher", return_value=None))
+                stack.enter_context(
+                    mock.patch.object(
+                        workflow,
+                        "build_incremental_diff_context",
+                        side_effect=[global_context, RuntimeError("compare failed")],
+                    )
+                )
+                process_group = stack.enter_context(
+                    mock.patch.object(workflow, "process_translation_group")
+                )
+                update_markers = stack.enter_context(
+                    mock.patch.object(workflow, "update_corresponding_en_commit_for_files")
+                )
+                write_failure_report = stack.enter_context(
+                    mock.patch.object(workflow.TranslationStats, "write_failure_report")
+                )
+
+                result = workflow.main()
+
+            self.assertEqual(result, 0)
+            process_group.assert_not_called()
+            update_markers.assert_not_called()
+            write_failure_report.assert_called_once()
 
     def test_apply_full_translation_mode_uses_head_file_content_and_removes_incremental_work(self):
         changed_files = [
