@@ -254,6 +254,84 @@ def find_best_toc_match(target_link, target_lines, source_line_num):
     matches.sort(key=lambda x: x['distance'])
     return matches[0]
 
+
+def find_best_toc_plain_match(target_line, target_lines, source_line_num):
+    """Find the best matching plain TOC line in the target by translated text."""
+    if not target_line:
+        return None
+
+    target_anchor_entry = parse_toc_line(target_line)
+    if target_anchor_entry["type"] not in ("list_text", "heading"):
+        return None
+
+    matches = []
+    for i, line in enumerate(target_lines):
+        entry = parse_toc_line(line)
+        if entry["type"] != target_anchor_entry["type"]:
+            continue
+        if line != target_line:
+            continue
+        matches.append({
+            "line_num": i + 1,
+            "line": line.strip(),
+            "distance": abs((i + 1) - source_line_num),
+        })
+
+    if not matches:
+        return None
+
+    matches.sort(key=lambda x: x["distance"])
+    return matches[0]
+
+
+def build_toc_plain_anchor_map(source_base_lines, target_lines):
+    """Map unchanged plain source TOC anchors to their translated target lines."""
+    if source_base_lines is None:
+        return {}
+
+    base_plain_entries = []
+    target_plain_entries = []
+
+    for line in source_base_lines:
+        entry = parse_toc_line(line)
+        key = plain_translation_key(entry)
+        if key:
+            base_plain_entries.append((entry, key))
+
+    for line in target_lines:
+        entry = parse_toc_line(line)
+        if plain_translation_key(entry):
+            target_plain_entries.append((entry, line))
+
+    plain_anchor_map = {}
+    for (base_entry, key), (target_entry, target_line) in zip(base_plain_entries, target_plain_entries):
+        if base_entry["type"] != target_entry["type"]:
+            continue
+        plain_anchor_map.setdefault(key, target_line)
+
+    return plain_anchor_map
+
+
+def find_toc_plain_anchor_match(source_line, target_lines, source_line_num, plain_anchor_map):
+    entry = parse_toc_line(source_line)
+    key = plain_translation_key(entry)
+    if not key:
+        return None
+
+    target_line = plain_anchor_map.get(key)
+    if not target_line:
+        return None
+
+    match = find_best_toc_plain_match(target_line, target_lines, source_line_num)
+    if not match:
+        return None
+
+    return {
+        "target_line": target_line,
+        "source_line": source_line_num,
+        "match": match,
+    }
+
 def group_consecutive_lines(lines):
     """Group consecutive lines together"""
     if not lines:
@@ -280,36 +358,72 @@ def group_consecutive_lines(lines):
     return groups
 
 
-def find_toc_group_anchors(source_lines, target_lines, start_line_num, end_line_num):
+def find_toc_group_anchors(source_lines, target_lines, start_line_num, end_line_num, source_base_lines=None):
     """Find the nearest surrounding link anchors for a TOC diff group."""
     previous_anchor = None
     next_anchor = None
+    plain_anchor_map = build_toc_plain_anchor_map(source_base_lines, target_lines)
 
     for line_num in range(start_line_num - 1, 0, -1):
-        previous_link = extract_toc_link_from_line(source_lines[line_num - 1])
-        if not previous_link:
-            continue
-
-        if find_best_toc_match(previous_link, target_lines, line_num):
+        source_line = source_lines[line_num - 1]
+        previous_link = extract_toc_link_from_line(source_line)
+        if previous_link and find_best_toc_match(previous_link, target_lines, line_num):
             previous_anchor = {
                 "link": previous_link,
                 "source_line": line_num,
             }
             break
 
-    for line_num in range(end_line_num + 1, len(source_lines) + 1):
-        next_link = extract_toc_link_from_line(source_lines[line_num - 1])
-        if not next_link:
-            continue
+        previous_plain_anchor = find_toc_plain_anchor_match(
+            source_line,
+            target_lines,
+            line_num,
+            plain_anchor_map,
+        )
+        if previous_plain_anchor:
+            previous_anchor = previous_plain_anchor
+            break
 
-        if find_best_toc_match(next_link, target_lines, line_num):
+    for line_num in range(end_line_num + 1, len(source_lines) + 1):
+        source_line = source_lines[line_num - 1]
+        next_link = extract_toc_link_from_line(source_line)
+        if next_link and find_best_toc_match(next_link, target_lines, line_num):
             next_anchor = {
                 "link": next_link,
                 "source_line": line_num,
             }
             break
 
+        next_plain_anchor = find_toc_plain_anchor_match(
+            source_line,
+            target_lines,
+            line_num,
+            plain_anchor_map,
+        )
+        if next_plain_anchor:
+            next_anchor = next_plain_anchor
+            break
+
     return previous_anchor, next_anchor
+
+
+def describe_toc_anchor(anchor):
+    if not anchor:
+        return ""
+    if anchor.get("link"):
+        return f"link: {anchor['link']}"
+    return f"plain line: {anchor['target_line'].strip()}"
+
+
+def add_toc_anchor_fields(operation, position, anchor):
+    if not anchor:
+        return
+
+    operation[f"anchor_{position}_source_line"] = anchor["source_line"]
+    if anchor.get("link"):
+        operation[f"anchor_{position}_link"] = anchor["link"]
+    elif anchor.get("target_line") is not None:
+        operation[f"anchor_{position}_target_line"] = anchor["target_line"]
 
 
 def build_toc_line_signature(line):
@@ -435,30 +549,35 @@ def process_toc_operations(file_path, operations, source_lines, target_lines, ta
             target_lines,
             first_deleted_line["line_number"],
             last_deleted_line["line_number"],
+            source_base_lines=source_base_lines,
         )
 
         if previous_anchor:
-            thread_safe_print(f"      📍 Using previous anchor link: {previous_anchor['link']}")
+            thread_safe_print(f"      📍 Using previous anchor {describe_toc_anchor(previous_anchor)}")
         if next_anchor:
-            thread_safe_print(f"      📍 Using next anchor link: {next_anchor['link']}")
+            thread_safe_print(f"      📍 Using next anchor {describe_toc_anchor(next_anchor)}")
         if not previous_anchor and not next_anchor:
             thread_safe_print("      ❌ No target anchor found for deleted TOC group")
             continue
 
         previous_match = None
         next_match = None
-        if previous_anchor:
+        if previous_anchor and previous_anchor.get("link"):
             previous_match = find_best_toc_match(
                 previous_anchor["link"],
                 target_lines,
                 previous_anchor["source_line"],
             )
-        if next_anchor:
+        elif previous_anchor:
+            previous_match = previous_anchor["match"]
+        if next_anchor and next_anchor.get("link"):
             next_match = find_best_toc_match(
                 next_anchor["link"],
                 target_lines,
                 next_anchor["source_line"],
             )
+        elif next_anchor:
+            next_match = next_anchor["match"]
 
         expected_lines = [line["content"] for line in group]
         candidate_ranges = find_verified_toc_group_ranges(
@@ -499,12 +618,13 @@ def process_toc_operations(file_path, operations, source_lines, target_lines, ta
                 target_lines,
                 first_added_line['line_number'],
                 last_added_line['line_number'],
+                source_base_lines=source_base_lines,
             )
 
             if previous_anchor:
-                thread_safe_print(f"      📍 Using previous anchor link: {previous_anchor['link']}")
+                thread_safe_print(f"      📍 Using previous anchor {describe_toc_anchor(previous_anchor)}")
             if next_anchor:
-                thread_safe_print(f"      📍 Using next anchor link: {next_anchor['link']}")
+                thread_safe_print(f"      📍 Using next anchor {describe_toc_anchor(next_anchor)}")
             if not previous_anchor and not next_anchor:
                 thread_safe_print("      ❌ No target anchor found for added TOC group")
                 continue
@@ -520,12 +640,8 @@ def process_toc_operations(file_path, operations, source_lines, target_lines, ta
                     'content': added_content,
                     'needs_translation': is_toc_translation_needed(added_content),
                 }
-                if previous_anchor:
-                    operation['anchor_previous_link'] = previous_anchor['link']
-                    operation['anchor_previous_source_line'] = previous_anchor['source_line']
-                if next_anchor:
-                    operation['anchor_next_link'] = next_anchor['link']
-                    operation['anchor_next_source_line'] = next_anchor['source_line']
+                add_toc_anchor_fields(operation, "previous", previous_anchor)
+                add_toc_anchor_fields(operation, "next", next_anchor)
 
                 results['added'].append(operation)
                 if operation['needs_translation']:
@@ -546,12 +662,13 @@ def process_toc_operations(file_path, operations, source_lines, target_lines, ta
                 target_lines,
                 first_modified_line['line_number'],
                 last_modified_line['line_number'],
+                source_base_lines=source_base_lines,
             )
 
             if previous_anchor:
-                thread_safe_print(f"      📍 Using previous anchor link: {previous_anchor['link']}")
+                thread_safe_print(f"      📍 Using previous anchor {describe_toc_anchor(previous_anchor)}")
             if next_anchor:
-                thread_safe_print(f"      📍 Using next anchor link: {next_anchor['link']}")
+                thread_safe_print(f"      📍 Using next anchor {describe_toc_anchor(next_anchor)}")
             if not previous_anchor and not next_anchor:
                 thread_safe_print("      ❌ No target anchor found for modified TOC group")
                 continue
@@ -568,12 +685,8 @@ def process_toc_operations(file_path, operations, source_lines, target_lines, ta
                     'original_content': modified_line.get('original_content'),
                     'needs_translation': is_toc_translation_needed(modified_content),
                 }
-                if previous_anchor:
-                    operation['anchor_previous_link'] = previous_anchor['link']
-                    operation['anchor_previous_source_line'] = previous_anchor['source_line']
-                if next_anchor:
-                    operation['anchor_next_link'] = next_anchor['link']
-                    operation['anchor_next_source_line'] = next_anchor['source_line']
+                add_toc_anchor_fields(operation, "previous", previous_anchor)
+                add_toc_anchor_fields(operation, "next", next_anchor)
 
                 results['modified'].append(operation)
                 if operation['needs_translation']:
@@ -635,11 +748,23 @@ def resolve_toc_group_anchor_matches(group_ops, target_lines):
             target_lines,
             first_op.get("anchor_previous_source_line", 0),
         )
+    elif first_op.get("anchor_previous_target_line") is not None:
+        previous_match = find_best_toc_plain_match(
+            first_op["anchor_previous_target_line"],
+            target_lines,
+            first_op.get("anchor_previous_source_line", 0),
+        )
 
     next_link = first_op.get("anchor_next_link")
     if next_link:
         next_match = find_best_toc_match(
             next_link,
+            target_lines,
+            first_op.get("anchor_next_source_line", 0),
+        )
+    elif first_op.get("anchor_next_target_line") is not None:
+        next_match = find_best_toc_plain_match(
+            first_op["anchor_next_target_line"],
             target_lines,
             first_op.get("anchor_next_source_line", 0),
         )

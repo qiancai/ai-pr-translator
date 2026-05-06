@@ -521,6 +521,120 @@ class TocProcessorOperationLevelTest(unittest.TestCase):
         self.assertTrue(success)
         self.assertEqual(["## 指南", "  - [子项](/child.md)", "- [已有](/existing.md)"], result)
 
+    def test_moved_group_uses_translated_plain_heading_anchor(self):
+        source_base_lines = [
+            "  - [6.1.0](/releases/release-6.1.0.md)",
+            "- v6.0",
+            "  - [6.0.0-DMR](/releases/release-6.0.0-dmr.md)",
+            "- v5.4",
+            "  - [5.4.3](/releases/release-5.4.3.md)",
+            "  - [5.4.2](/releases/release-5.4.2.md)",
+            "  - [5.4.1](/releases/release-5.4.1.md)",
+            "  - [5.4.0](/releases/release-5.4.0.md)",
+            "- End of Life Releases",
+            "  - v5.3",
+            "    - [5.3.4](/releases/release-5.3.4.md)",
+        ]
+        source_head_lines = [
+            "  - [6.1.0](/releases/release-6.1.0.md)",
+            "- v6.0",
+            "  - [6.0.0-DMR](/releases/release-6.0.0-dmr.md)",
+            "- End of Life Releases",
+            "  - v5.4",
+            "    - [5.4.3](/releases/release-5.4.3.md)",
+            "    - [5.4.2](/releases/release-5.4.2.md)",
+            "    - [5.4.1](/releases/release-5.4.1.md)",
+            "    - [5.4.0](/releases/release-5.4.0.md)",
+            "  - v5.3",
+            "    - [5.3.4](/releases/release-5.3.4.md)",
+        ]
+        target_lines = [
+            "  - [6.1.0](/releases/release-6.1.0.md)",
+            "- v6.0",
+            "  - [6.0.0-DMR](/releases/release-6.0.0-dmr.md)",
+            "- v5.4",
+            "  - [5.4.3](/releases/release-5.4.3.md)",
+            "  - [5.4.2](/releases/release-5.4.2.md)",
+            "  - [5.4.1](/releases/release-5.4.1.md)",
+            "  - [5.4.0](/releases/release-5.4.0.md)",
+            "- End of Life 版本",
+            "  - v5.3",
+            "    - [5.3.4](/releases/release-5.3.4.md)",
+        ]
+        toc_results = process_toc_operations(
+            "TOC-tidb-releases.md",
+            {
+                "added_lines": [
+                    {"line_number": 5, "content": "  - v5.4", "is_header": False},
+                    {"line_number": 6, "content": "    - [5.4.3](/releases/release-5.4.3.md)", "is_header": False},
+                    {"line_number": 7, "content": "    - [5.4.2](/releases/release-5.4.2.md)", "is_header": False},
+                    {"line_number": 8, "content": "    - [5.4.1](/releases/release-5.4.1.md)", "is_header": False},
+                    {"line_number": 9, "content": "    - [5.4.0](/releases/release-5.4.0.md)", "is_header": False},
+                ],
+                "modified_lines": [],
+                "deleted_lines": [
+                    {"line_number": 4, "content": "- v5.4", "is_header": False},
+                    {"line_number": 5, "content": "  - [5.4.3](/releases/release-5.4.3.md)", "is_header": False},
+                    {"line_number": 6, "content": "  - [5.4.2](/releases/release-5.4.2.md)", "is_header": False},
+                    {"line_number": 7, "content": "  - [5.4.1](/releases/release-5.4.1.md)", "is_header": False},
+                    {"line_number": 8, "content": "  - [5.4.0](/releases/release-5.4.0.md)", "is_header": False},
+                ],
+            },
+            source_head_lines,
+            target_lines,
+            "",
+            source_base_lines=source_base_lines,
+        )
+
+        self.assertEqual(
+            "- End of Life 版本",
+            toc_results["added"][0]["anchor_previous_target_line"],
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            toc_path = Path(tmpdir) / "TOC-tidb-releases.md"
+            toc_path.write_text("\n".join(target_lines), encoding="utf-8")
+
+            success = process_toc_file(
+                "TOC-tidb-releases.md",
+                {
+                    "type": "toc",
+                    "operations": (
+                        toc_results["added"]
+                        + toc_results["modified"]
+                        + toc_results["deleted"]
+                    ),
+                },
+                {"mode": "pr"},
+                None,
+                EmptyAIClient(),
+                {
+                    "target_local_path": tmpdir,
+                    "source_language": "English",
+                    "target_language": "Chinese",
+                },
+            )
+
+            result = toc_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertTrue(success)
+        self.assertEqual(
+            [
+                "  - [6.1.0](/releases/release-6.1.0.md)",
+                "- v6.0",
+                "  - [6.0.0-DMR](/releases/release-6.0.0-dmr.md)",
+                "- End of Life 版本",
+                "  - v5.4",
+                "    - [5.4.3](/releases/release-5.4.3.md)",
+                "    - [5.4.2](/releases/release-5.4.2.md)",
+                "    - [5.4.1](/releases/release-5.4.1.md)",
+                "    - [5.4.0](/releases/release-5.4.0.md)",
+                "  - v5.3",
+                "    - [5.3.4](/releases/release-5.3.4.md)",
+            ],
+            result,
+        )
+
     def test_deleted_plain_group_is_skipped_when_target_range_is_ambiguous(self):
         source_base_lines = [
             "- [A](/a.md)",
