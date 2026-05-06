@@ -3,6 +3,7 @@
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 import re
+from typing import Optional
 
 
 FENCE_RE = re.compile(r"^ {0,3}(```+|~~~+)")
@@ -110,8 +111,8 @@ def compare_heading_structure(file_path, source_content, target_content):
 
 def validate_markdown_heading_structures(
     file_paths: Iterable[str],
-    source_content_loader: Callable[[str], str | None],
-    target_content_loader: Callable[[str], str | None],
+    source_content_loader: Callable[[str], Optional[str]],
+    target_content_loader: Callable[[str], Optional[str]],
 ):
     """Validate all Markdown files and return structure issues."""
     issues = []
