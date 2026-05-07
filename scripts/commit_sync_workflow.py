@@ -593,6 +593,77 @@ def split_changed_files_by_corresponding_en_commit(
     return global_changed_files, marker_groups, marker_file_paths
 
 
+def changed_file_candidate_paths(file):
+    paths = [getattr(file, "filename", "")]
+    previous_filename = getattr(file, "previous_filename", None)
+    if previous_filename:
+        paths.append(previous_filename)
+    return [path for path in paths if path]
+
+
+def read_target_corresponding_en_commit(target_repo_path, file_path):
+    try:
+        target_content = read_target_file_content(target_repo_path, file_path)
+    except Exception as e:
+        thread_safe_print(
+            f"   ⚠️  Could not read target marker for {file_path}: "
+            f"{sanitize_exception_message(e)}"
+        )
+        target_content = None
+    return get_corresponding_en_commit(target_content or "")
+
+
+def split_manual_source_files_by_corresponding_en_commit(
+    changed_files,
+    source_files,
+    source_folder,
+    target_repo_path,
+    global_base_ref,
+):
+    """Split manually requested files so per-file cursors override the global cursor."""
+    requested_paths = normalize_source_files(source_files, source_folder)
+    if not requested_paths:
+        return changed_files, {}, set()
+
+    changed_candidate_paths = {
+        path
+        for file in changed_files
+        for path in changed_file_candidate_paths(file)
+    }
+    grouped_marker_paths = set()
+    marker_groups = {}
+    marker_file_paths = set()
+
+    for file_path in sorted(requested_paths):
+        if not file_path.endswith(".md"):
+            continue
+
+        marker_commit = read_target_corresponding_en_commit(
+            target_repo_path,
+            file_path,
+        )
+        if not marker_commit:
+            continue
+
+        marker_file_paths.add(file_path)
+        if (
+            not commits_match(marker_commit, global_base_ref)
+            or file_path not in changed_candidate_paths
+        ):
+            marker_groups.setdefault(marker_commit, set()).add(file_path)
+            grouped_marker_paths.add(file_path)
+
+    if not grouped_marker_paths:
+        return changed_files, marker_groups, marker_file_paths
+
+    global_changed_files = [
+        file
+        for file in changed_files
+        if not (set(changed_file_candidate_paths(file)) & grouped_marker_paths)
+    ]
+    return global_changed_files, marker_groups, marker_file_paths
+
+
 def filter_changed_files(changed_files, source_folder="", source_files=""):
     """Filter changed files by folder and/or explicit file list.
 
@@ -603,14 +674,8 @@ def filter_changed_files(changed_files, source_folder="", source_files=""):
     folder_prefix = f"{folder_prefix}/" if folder_prefix else ""
     normalized_files = normalize_source_files(source_files, source_folder)
 
-    def candidate_paths(file):
-        paths = [file.filename]
-        if getattr(file, "previous_filename", None):
-            paths.append(file.previous_filename)
-        return [path for path in paths if path]
-
     def matches(file):
-        paths = candidate_paths(file)
+        paths = changed_file_candidate_paths(file)
 
         if folder_prefix and not any(
             path.startswith(folder_prefix) or path == folder_prefix.rstrip("/")
@@ -1578,17 +1643,26 @@ def main():
                 TARGET_REPO_PATH,
                 base_ref,
             )
-            if marker_groups:
-                thread_safe_print("\n📌 Files with per-file Corresponding EN commit cursors:")
-                for marker_ref, file_paths in sorted(marker_groups.items()):
-                    thread_safe_print(
-                        f"   {marker_ref}: {', '.join(sorted(file_paths))}"
-                    )
-            if len(marker_groups) > PER_FILE_MARKER_GROUP_WARNING_THRESHOLD:
+        elif run_type == "manual" and SOURCE_FILES.strip():
+            filtered_changed_files, marker_groups, marker_file_paths = split_manual_source_files_by_corresponding_en_commit(
+                filtered_changed_files,
+                SOURCE_FILES,
+                SOURCE_FOLDER,
+                TARGET_REPO_PATH,
+                base_ref,
+            )
+
+        if marker_groups:
+            thread_safe_print("\n📌 Files with per-file Corresponding EN commit cursors:")
+            for marker_ref, file_paths in sorted(marker_groups.items()):
                 thread_safe_print(
-                    "   ⚠️  Many distinct per-file Corresponding EN commit cursors "
-                    f"detected ({len(marker_groups)} groups). This may increase compare API calls."
+                    f"   {marker_ref}: {', '.join(sorted(file_paths))}"
                 )
+        if len(marker_groups) > PER_FILE_MARKER_GROUP_WARNING_THRESHOLD:
+            thread_safe_print(
+                "   ⚠️  Many distinct per-file Corresponding EN commit cursors "
+                f"detected ({len(marker_groups)} groups). This may increase compare API calls."
+            )
 
         if filtered_changed_files:
             diff_context["changed_files"] = filtered_changed_files
@@ -1686,7 +1760,7 @@ def main():
         add_if_missing = run_type == "manual"
         remove_if_present = run_type == "scheduled"
         marker_update_paths = (
-            all_successful_file_paths
+            all_successful_file_paths | marker_aligned_file_paths
             if add_if_missing
             else (all_successful_file_paths | marker_aligned_file_paths) & marker_file_paths
         )
