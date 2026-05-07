@@ -1495,6 +1495,7 @@ def main():
     glossary_matcher = create_glossary_matcher(glossary)
     translation_stats = TranslationStats()
     all_successful_file_paths = set()
+    marker_aligned_file_paths = set()
     marker_file_paths = set()
     total_counts = {
         "added_files": 0,
@@ -1619,6 +1620,7 @@ def main():
                 thread_safe_print(
                     f"ℹ️  Skipping per-file cursor {marker_ref}; it already matches SOURCE_HEAD_REF."
                 )
+                marker_aligned_file_paths.update(file_paths)
                 continue
 
             try:
@@ -1642,6 +1644,16 @@ def main():
                 source_folder="",
                 source_files=marker_source_files,
             )
+            marker_changed_paths = {
+                path
+                for file in marker_filtered_changed_files
+                for path in (
+                    getattr(file, "filename", None),
+                    getattr(file, "previous_filename", None),
+                )
+                if path
+            }
+            marker_aligned_file_paths.update(set(file_paths) - marker_changed_paths)
             marker_diff_context["changed_files"] = marker_filtered_changed_files
             if not marker_filtered_changed_files:
                 thread_safe_print(
@@ -1670,13 +1682,13 @@ def main():
             all_successful_file_paths.update(group_result["successful_file_paths"])
             add_counts(total_counts, group_result["counts"])
 
-    if all_successful_file_paths and run_type in {"manual", "scheduled"}:
+    if run_type in {"manual", "scheduled"}:
         add_if_missing = run_type == "manual"
         remove_if_present = run_type == "scheduled"
         marker_update_paths = (
             all_successful_file_paths
             if add_if_missing
-            else all_successful_file_paths & marker_file_paths
+            else (all_successful_file_paths | marker_aligned_file_paths) & marker_file_paths
         )
     else:
         marker_update_paths = set()
