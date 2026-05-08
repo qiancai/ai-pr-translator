@@ -151,7 +151,7 @@ IMPORTANT INSTRUCTIONS:
    - Technical terms like "TiDB", "TiKV", "PD", API names, etc.
    - File paths, URLs, and command line examples
    - Variable names and system configuration parameters
-   - Keep UI button/label names wrapped in ** such as **My TiDB** in English.
+   - Some text wrapped in ** (such as **Create Resource** on the **My TiDB** page) are UI button or label names, keep them in English if the context of that paragraph indicates that it is UI text.
 3. Translate only the descriptive text and explanations (for such content, you can rewrite it from {source_language} to {target_language} in a more natural and fluent way without changing its original meaning)
 4. Maintain the exact structure and indentation
 5. Keep all special characters and formatting intact
