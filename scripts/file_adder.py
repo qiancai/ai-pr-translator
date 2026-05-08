@@ -136,32 +136,33 @@ def translate_file_batch(batch_content, ai_client, source_language="English", ta
         if matched_terms:
             glossary_text = format_terms_for_prompt(matched_terms)
             glossary_prompt_section = f"\n{glossary_text}\n"
-            glossary_instruction = "\n6. When translating terms listed in the glossary above, use the provided translations for consistency."
+            glossary_instruction = "\n6. When translating terms listed in the glossary, use the provided translations for consistency."
             thread_safe_print(f"   📚 Matched {len(matched_terms)} glossary terms for batch translation")
 
     doc_variable_example = "{{{ .starter }}}"
 
-    prompt = f"""You are a professional technical writer. Please translate the following {source_language} content to {target_language}.
+    prompt = f"""You are a senior technical writer. Please translate the following document content from {source_language} to {target_language}.
 
 IMPORTANT INSTRUCTIONS:
 1. Preserve ALL Markdown formatting (headers, links, code blocks, tables, etc.)
 2. Do NOT translate:
    - Code examples, SQL queries, configuration values, and doc variables/placeholders such as {doc_variable_example}. Preserve doc variables exactly as they appear, including triple braces and when they appear inside HTML attributes or tab labels.
+   - Explicit heading anchors such as {{#example-test}} in the section titles.
    - Technical terms like "TiDB", "TiKV", "PD", API names, etc.
    - File paths, URLs, and command line examples
    - Variable names and system configuration parameters
-3. Translate only the descriptive text and explanations
+   - Keep UI button/label names wrapped in ** such as **My TiDB** in English.
+3. Translate only the descriptive text and explanations (for such content, you can rewrite it from {source_language} to {target_language} in a more natural and fluent way without changing its original meaning)
 4. Maintain the exact structure and indentation
-5. Keep all special characters and formatting intact{glossary_instruction}
-6. Preserve explicit heading anchors such as {{#example-test}} exactly as they appear.
+5. Keep all special characters and formatting intact
+{glossary_instruction}
 
 Glossary for terms in {source_language} and {target_language}:
 {glossary_prompt_section}
 
 Content to translate:
 {prompt_batch_content}
-
-Please provide the translated content maintaining all formatting and structure."""
+"""
 
     # Add token estimation
     try:
