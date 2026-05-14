@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check local English/Chinese Markdown heading structures for Cloud docs."""
+"""Check local English/Chinese Markdown document structures for Cloud docs."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import sys
 from resolve_cloud_source_files import extract_markdown_doc_links
 from translation_structure_validator import (
     StructureValidationIssue,
-    compare_heading_structure,
+    validate_markdown_heading_structures,
 )
 
 
@@ -59,22 +59,26 @@ def read_text(path: Path) -> str | None:
     return path.read_text(encoding="utf-8")
 
 
-def check_file(en_root: Path, zh_root: Path, rel_path: str) -> StructureValidationIssue | None:
+def check_file(en_root: Path, zh_root: Path, rel_path: str) -> list[StructureValidationIssue]:
     en_content = read_text(en_root / rel_path)
     zh_content = read_text(zh_root / rel_path)
 
     if en_content is None:
-        return StructureValidationIssue(rel_path, "source file missing")
+        return [StructureValidationIssue(rel_path, "source file missing")]
     if zh_content is None:
-        return StructureValidationIssue(rel_path, "target file missing")
+        return [StructureValidationIssue(rel_path, "target file missing")]
 
-    return compare_heading_structure(rel_path, en_content, zh_content)
+    return validate_markdown_heading_structures(
+        [rel_path],
+        source_content_loader=lambda _: en_content,
+        target_content_loader=lambda _: zh_content,
+    )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Compare local English and Chinese Markdown heading level sequences "
+            "Compare local English and Chinese Markdown heading and CustomContent structures "
             "for all Markdown files linked from the five TiDB Cloud TOCs."
         )
     )
@@ -110,19 +114,17 @@ def main() -> int:
 
     issues = []
     for rel_path in file_paths:
-        issue = check_file(en_root, zh_root, rel_path)
-        if issue:
-            issues.append(issue)
+        issues.extend(check_file(en_root, zh_root, rel_path))
 
     print(f"English root: {en_root}")
     print(f"Chinese root: {zh_root}")
     print(f"Cloud TOCs: {', '.join(toc_files)}")
     print(f"Markdown files in Cloud scope: {len(file_paths)}")
-    print(f"Structure issues: {len(issues)}")
+    print(f"Document structure issues: {len(issues)}")
 
     if issues:
         print()
-        print("Mismatched files:")
+        print("Structure issues:")
         printable = issues if args.limit <= 0 else issues[: args.limit]
         for issue in printable:
             print(f"- {issue.file_path}: {issue.reason}")

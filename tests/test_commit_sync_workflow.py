@@ -1562,7 +1562,7 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
 
             self.assertFalse(Path(tmpdir, "translation-failures.json").exists())
 
-        self.assertIn("### Docs with section structure mismatches after translation", report)
+        self.assertIn("### Docs with document structure mismatches after translation", report)
         self.assertIn("- `cloud.md`: heading level sequence differs", report)
         self.assertIn("Source: `#x1 ##x1`", report)
         self.assertEqual("cloud.md", structure_json[0]["file_path"])
@@ -1590,7 +1590,7 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
             )
 
         failure_heading = "### Translation failures"
-        structure_heading = "### Docs with section structure mismatches after translation"
+        structure_heading = "### Docs with document structure mismatches after translation"
         self.assertIn(failure_heading, report)
         self.assertIn(structure_heading, report)
         self.assertLess(report.index(failure_heading), report.index(structure_heading))

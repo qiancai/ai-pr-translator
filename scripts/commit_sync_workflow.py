@@ -125,7 +125,7 @@ class TranslationStats:
         thread_safe_print(f"   📄 Files attempted for translation: {self.total}")
         thread_safe_print(f"   ✅ Successfully translated: {len(self.succeeded)}")
         thread_safe_print(f"   ❌ Failed to translate: {len(self.failed)}")
-        thread_safe_print(f"   ⚠️  Section structure mismatches: {len(self.structure_errors)}")
+        thread_safe_print(f"   ⚠️  Document structure mismatches: {len(self.structure_errors)}")
 
         if self.failed:
             thread_safe_print("   ❌ Failed files:")
@@ -162,9 +162,9 @@ class TranslationStats:
                     f.write("\n")
 
             if self.structure_errors:
-                f.write("### Docs with section structure mismatches after translation\n\n")
+                f.write("### Docs with document structure mismatches after translation\n\n")
                 f.write(
-                    "The following files were translated successfully, but their Markdown heading structure does not match the source HEAD file.\n\n"
+                    "The following files were translated successfully, but their Markdown heading or CustomContent structure does not match the source HEAD file.\n\n"
                 )
                 for issue in self.structure_errors:
                     f.write(f"- `{issue.file_path}`: {issue.reason}\n")
@@ -409,7 +409,7 @@ def validate_successful_translation_structures(
     github_client,
     translation_stats,
 ):
-    """Validate heading-level structure for successfully translated Markdown files."""
+    """Validate document structure for successfully translated Markdown files."""
     markdown_file_paths = {
         file_path
         for file_path in successful_file_paths
@@ -419,7 +419,7 @@ def validate_successful_translation_structures(
         return []
 
     thread_safe_print(
-        f"\n🔎 Validating heading structure for {len(markdown_file_paths)} translated Markdown file(s)..."
+        f"\n🔎 Validating document structure for {len(markdown_file_paths)} translated Markdown file(s)..."
     )
 
     issues = validate_markdown_heading_structures(
@@ -437,11 +437,11 @@ def validate_successful_translation_structures(
     )
 
     if not issues:
-        thread_safe_print("   ✅ Heading structures match source HEAD")
+        thread_safe_print("   ✅ Document structures match source HEAD")
         return []
 
     thread_safe_print(
-        f"   ⚠️  Found {len(issues)} document(s) with heading structure mismatch"
+        f"   ⚠️  Found {len(issues)} document structure mismatch(es)"
     )
     for issue in issues:
         thread_safe_print(f"      - {issue.file_path}: {issue.reason}")
@@ -1810,7 +1810,7 @@ def main():
     if translation_stats.failed:
         thread_safe_print("⚠️  The commit-based sync workflow completed with per-file translation failures.")
     if translation_stats.structure_errors:
-        thread_safe_print("⚠️  The commit-based sync workflow completed with section structure mismatches.")
+        thread_safe_print("⚠️  The commit-based sync workflow completed with document structure mismatches.")
     if translation_stats.failed and FAIL_ON_TRANSLATION_ERROR:
         return 1
     if not translation_stats.failed and not translation_stats.structure_errors:

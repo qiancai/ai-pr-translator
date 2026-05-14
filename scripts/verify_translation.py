@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 try:
@@ -30,16 +31,22 @@ try:
 except ImportError:
     sys.exit("openpyxl is required: pip install openpyxl")
 
+from translation_structure_validator import (
+    compare_custom_content_structure,
+    compact_custom_content_tags,
+    extract_custom_content_tags,
+)
+
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Mode: "commit-based" uses a compare URL; "pr" uses a source PR URL.
 MODE = "commit-based"
 
 SOURCE_COMMIT_COMPARE = (
-    "https://github.com/pingcap/docs/compare/f013e32b3fa831a3d64aa064632240a8c11c01bf...c51660507b71937437ce283a6c837934c0e0750c"
+    "https://github.com/pingcap/docs/compare/992bd07e5f8fd1b88460ad98020632d12048c146...aa63093b1a90c6d816373829ab86a485b41d8071"
 )
 SOURCE_PR = ""
-TARGET_PR = "https://github.com/pingcap/docs/pull/22833"
+TARGET_PR = "https://github.com/pingcap/docs/pull/22884"
 
 # Optional: local clone of the source repo.  When set, `git diff --numstat`
 # is used instead of the GitHub compare API, which avoids the 300-file cap.
@@ -51,6 +58,20 @@ WARNING_THRESHOLD = 5
 EXCLUDE_FILES = {"latest_translation_commit.json"}
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+
+
+def _positive_int_env(name, default):
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return max(1, value)
+
+
+DOCUMENT_STRUCTURE_WORKERS = _positive_int_env(
+    "DOCUMENT_STRUCTURE_WORKERS",
+    _positive_int_env("CUSTOM_CONTENT_WORKERS", 3),
+)
 
 
 # ── URL Parsers ──────────────────────────────────────────────────────────────
@@ -275,6 +296,32 @@ def _fetch_content(ctx, filepath, github_client):
     return None
 
 
+def _structure_worker_count(total, max_workers=None):
+    configured_workers = DOCUMENT_STRUCTURE_WORKERS
+    if max_workers is not None:
+        try:
+            configured_workers = max(1, int(max_workers))
+        except (TypeError, ValueError):
+            configured_workers = DOCUMENT_STRUCTURE_WORKERS
+    return min(total, configured_workers)
+
+
+def _build_heading_structure(filepath, src, tgt):
+    src_headings = _extract_headings(src) if src else []
+    tgt_headings = _extract_headings(tgt) if tgt else []
+    src_levels = [h[0] for h in src_headings]
+    tgt_levels = [h[0] for h in tgt_headings]
+
+    return {
+        "file": filepath,
+        "source_headings": src_headings,
+        "target_headings": tgt_headings,
+        "source_compact": _compact_structure(src_headings),
+        "target_compact": _compact_structure(tgt_headings),
+        "match": src_levels == tgt_levels,
+    }
+
+
 def collect_heading_structures(exceed_files, source_ctx, target_ctx, github_client):
     """Compare heading structures of *exceed_files* between source and target.
 
@@ -288,20 +335,185 @@ def collect_heading_structures(exceed_files, source_ctx, target_ctx, github_clie
         src = _fetch_content(source_ctx, filepath, github_client)
         tgt = _fetch_content(target_ctx, filepath, github_client)
 
-        src_headings = _extract_headings(src) if src else []
-        tgt_headings = _extract_headings(tgt) if tgt else []
-        src_levels = [h[0] for h in src_headings]
-        tgt_levels = [h[0] for h in tgt_headings]
-
-        results.append({
-            "file": filepath,
-            "source_headings": src_headings,
-            "target_headings": tgt_headings,
-            "source_compact": _compact_structure(src_headings),
-            "target_compact": _compact_structure(tgt_headings),
-            "match": src_levels == tgt_levels,
-        })
+        results.append(_build_heading_structure(filepath, src, tgt))
     return results
+
+
+def _build_custom_content_structure(filepath, src, tgt):
+    src_tags = extract_custom_content_tags(src) if src is not None else []
+    tgt_tags = extract_custom_content_tags(tgt) if tgt is not None else []
+
+    if src is None:
+        issue_reason = "could not read source HEAD content"
+        first_difference = ""
+    elif tgt is None:
+        issue_reason = "could not read translated target content"
+        first_difference = ""
+    else:
+        issue = compare_custom_content_structure(filepath, src, tgt)
+        issue_reason = issue.reason if issue else ""
+        first_difference = issue.first_difference if issue else ""
+
+    return {
+        "file": filepath,
+        "source_tags": src_tags,
+        "target_tags": tgt_tags,
+        "source_compact": compact_custom_content_tags(src_tags),
+        "target_compact": compact_custom_content_tags(tgt_tags),
+        "match": not issue_reason,
+        "issue": issue_reason,
+        "first_difference": first_difference,
+    }
+
+
+def _collect_custom_content_structure(filepath, source_ctx, target_ctx, github_client):
+    src = _fetch_content(source_ctx, filepath, github_client)
+    tgt = _fetch_content(target_ctx, filepath, github_client)
+    return _build_custom_content_structure(filepath, src, tgt)
+
+
+def _custom_content_failure_row(filepath, exc):
+    return {
+        "file": filepath,
+        "source_tags": [],
+        "target_tags": [],
+        "source_compact": "0 CustomContent tags",
+        "target_compact": "0 CustomContent tags",
+        "match": False,
+        "issue": f"CustomContent comparison failed: {exc}",
+        "first_difference": "",
+    }
+
+
+def _collect_document_structures(
+    filepath, source_ctx, target_ctx, github_client, include_heading
+):
+    src = _fetch_content(source_ctx, filepath, github_client)
+    tgt = _fetch_content(target_ctx, filepath, github_client)
+    return {
+        "custom_content": _build_custom_content_structure(filepath, src, tgt),
+        "heading": _build_heading_structure(filepath, src, tgt) if include_heading else None,
+    }
+
+
+def collect_custom_content_structures(
+    file_paths, source_ctx, target_ctx, github_client, max_workers=None
+):
+    """Compare CustomContent tag sequences between full source and target docs."""
+    file_paths = list(file_paths)
+    total = len(file_paths)
+    if not total:
+        return []
+
+    worker_count = _structure_worker_count(total, max_workers)
+    if worker_count <= 1:
+        results = []
+        for idx, filepath in enumerate(file_paths, 1):
+            print(f"    [{idx}/{total}] {filepath}")
+            try:
+                results.append(
+                    _collect_custom_content_structure(filepath, source_ctx, target_ctx, github_client)
+                )
+            except Exception as exc:
+                results.append(_custom_content_failure_row(filepath, exc))
+        return results
+
+    print(f"    Using {worker_count} CustomContent worker(s)")
+    results = [None] * total
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = {
+            executor.submit(
+                _collect_custom_content_structure,
+                filepath,
+                source_ctx,
+                target_ctx,
+                github_client,
+            ): (index, filepath)
+            for index, filepath in enumerate(file_paths)
+        }
+        for completed, future in enumerate(as_completed(futures), 1):
+            index, filepath = futures[future]
+            print(f"    [{completed}/{total}] {filepath}")
+            try:
+                results[index] = future.result()
+            except Exception as exc:
+                results[index] = _custom_content_failure_row(filepath, exc)
+
+    return results
+
+
+def collect_document_structures(
+    file_paths, heading_files, source_ctx, target_ctx, github_client, max_workers=None
+):
+    """Collect CustomContent and selected heading structures with one fetch per file."""
+    file_paths = list(file_paths)
+    heading_files = set(heading_files)
+    total = len(file_paths)
+    if not total:
+        return [], []
+
+    worker_count = _structure_worker_count(total, max_workers)
+    custom_results = [None] * total
+    heading_results_by_index = {}
+
+    if worker_count <= 1:
+        for index, filepath in enumerate(file_paths):
+            print(f"    [{index + 1}/{total}] {filepath}")
+            include_heading = filepath in heading_files
+            try:
+                result = _collect_document_structures(
+                    filepath, source_ctx, target_ctx, github_client, include_heading
+                )
+            except Exception as exc:
+                result = {
+                    "custom_content": _custom_content_failure_row(filepath, exc),
+                    "heading": None,
+                }
+            custom_results[index] = result["custom_content"]
+            if include_heading and result["heading"] is not None:
+                heading_results_by_index[index] = result["heading"]
+        heading_results = [
+            heading_results_by_index[i] for i in sorted(heading_results_by_index)
+        ]
+        return custom_results, heading_results
+
+    print(f"    Using {worker_count} document structure worker(s)")
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = {
+            executor.submit(
+                _collect_document_structures,
+                filepath,
+                source_ctx,
+                target_ctx,
+                github_client,
+                filepath in heading_files,
+            ): (index, filepath)
+            for index, filepath in enumerate(file_paths)
+        }
+        for completed, future in enumerate(as_completed(futures), 1):
+            index, filepath = futures[future]
+            print(f"    [{completed}/{total}] {filepath}")
+            include_heading = filepath in heading_files
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = {
+                    "custom_content": _custom_content_failure_row(filepath, exc),
+                    "heading": None,
+                }
+            custom_results[index] = result["custom_content"]
+            if include_heading and result["heading"] is not None:
+                heading_results_by_index[index] = result["heading"]
+
+    heading_results = [
+        heading_results_by_index[i] for i in sorted(heading_results_by_index)
+    ]
+    return custom_results, heading_results
+
+
+def has_custom_content_report_entry(data):
+    """Return True when a CustomContent row should appear in the report."""
+    return bool(data.get("source_tags") or data.get("target_tags") or data.get("issue"))
 
 
 # ── Report Building ──────────────────────────────────────────────────────────
@@ -394,7 +606,7 @@ _LEVEL_FILL = {
 def _write_detail_sheet(wb, rows, threshold):
     """Write the main detail sheet with per-file comparison."""
     ws = wb.active
-    ws.title = "Detail"
+    ws.title = "Structure Details"
 
     headers = [
         "File",
@@ -763,11 +975,188 @@ def _write_heading_matched_sheet(wb, heading_data):
     _apply_heading_col_widths(ws)
 
 
-def write_excel(rows, output_path, source_label, target_label, threshold, heading_data=None):
+_CUSTOM_CONTENT_DETAIL_HEADERS = ["#", "Source Line", "Source Tag", "Target Line", "Target Tag", "Tag Match"]
+_CUSTOM_CONTENT_COL_WIDTHS = [5, 12, 60, 12, 60, 12]
+
+
+def _tag_signature(tag):
+    return (tag.kind, tag.text) if tag else None
+
+
+def _tag_line(tag):
+    return tag.line_number if tag else ""
+
+
+def _tag_text(tag):
+    return tag.text if tag else "(missing)"
+
+
+def _write_custom_content_detail_rows(ws, row_num, file_list):
+    """Write tag-by-tag CustomContent detail rows for mismatched files."""
+    headers = _CUSTOM_CONTENT_DETAIL_HEADERS
+    for data in file_list:
+        row_num += 1
+        file_cell = ws.cell(row=row_num, column=1, value=data["file"])
+        file_cell.font = _FILE_FONT
+        for col in range(1, len(headers) + 1):
+            ws.cell(row=row_num, column=col).fill = _FILE_FILL
+            ws.cell(row=row_num, column=col).border = _THIN_BORDER
+        ws.cell(
+            row=row_num, column=len(headers),
+            value=(
+                f"Source: {len(data['source_tags'])} tags  |  "
+                f"Target: {len(data['target_tags'])} tags"
+            ),
+        ).font = Font(italic=True, size=10, color="404040")
+        row_num += 1
+
+        for col, h in enumerate(headers, 1):
+            cell = ws.cell(row=row_num, column=col, value=h)
+            cell.font = _HEADER_FONT
+            cell.fill = _HEADER_FILL
+            cell.alignment = Alignment(horizontal="center")
+            cell.border = _THIN_BORDER
+        row_num += 1
+
+        source_tags = data["source_tags"]
+        target_tags = data["target_tags"]
+        max_len = max(len(source_tags), len(target_tags)) if (source_tags or target_tags) else 0
+
+        for pos in range(max_len):
+            src_tag = source_tags[pos] if pos < len(source_tags) else None
+            tgt_tag = target_tags[pos] if pos < len(target_tags) else None
+            tags_match = _tag_signature(src_tag) == _tag_signature(tgt_tag)
+
+            values = [
+                pos + 1,
+                _tag_line(src_tag),
+                _tag_text(src_tag),
+                _tag_line(tgt_tag),
+                _tag_text(tgt_tag),
+            ]
+            for col, value in enumerate(values, 1):
+                cell = ws.cell(row=row_num, column=col, value=value)
+                cell.border = _THIN_BORDER
+                cell.alignment = Alignment(
+                    horizontal="center" if col in (1, 2, 4) else "left",
+                    vertical="center",
+                )
+
+            match_cell = ws.cell(row=row_num, column=6)
+            match_cell.border = _THIN_BORDER
+            match_cell.alignment = Alignment(horizontal="center")
+            if tags_match:
+                match_cell.value = "✓"
+                match_cell.font = _MATCH_FONT
+                fill = _EXACT_FILL
+            else:
+                match_cell.value = "✗"
+                match_cell.font = _MISMATCH_FONT
+                fill = _MISSING_FILL if src_tag is None or tgt_tag is None else _EXCEED_FILL
+
+            for col in range(1, len(headers) + 1):
+                ws.cell(row=row_num, column=col).fill = fill
+            row_num += 1
+
+    return row_num
+
+
+def _write_custom_content_sheet(wb, custom_content_data):
+    """Write CustomContent structure comparison sheet."""
+    report_data = [
+        data for data in (custom_content_data or [])
+        if has_custom_content_report_entry(data)
+    ]
+    if not report_data:
+        return
+
+    ws = wb.create_sheet("CustomContent")
+    matched_list = [data for data in report_data if data["match"]]
+    mismatched_list = [data for data in report_data if not data["match"]]
+
+    row_num = 1
+    ws.cell(row=row_num, column=1, value="CustomContent Structure Comparison").font = Font(
+        bold=True, size=14, color="1F4E79"
+    )
+    row_num += 1
+    ws.cell(
+        row=row_num, column=1,
+        value=(
+            f"Files with CustomContent: {len(report_data)}  |  "
+            f"Match: {len(matched_list)}  |  "
+            f"Mismatch: {len(mismatched_list)}"
+        ),
+    ).font = Font(size=11, color="404040")
+    row_num += 2
+
+    overview_headers = [
+        "File",
+        "Source Tags",
+        "Target Tags",
+        "Source CustomContent",
+        "Target CustomContent",
+        "Result",
+        "Issue",
+        "First Difference",
+    ]
+    for col, header in enumerate(overview_headers, 1):
+        cell = ws.cell(row=row_num, column=col, value=header)
+        cell.font = _HEADER_FONT
+        cell.fill = _HEADER_FILL
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = _THIN_BORDER
+    row_num += 1
+
+    for data in mismatched_list + matched_list:
+        values = [
+            data["file"],
+            len(data["source_tags"]),
+            len(data["target_tags"]),
+            data["source_compact"],
+            data["target_compact"],
+            "Match" if data["match"] else "Mismatch",
+            data["issue"],
+            data["first_difference"],
+        ]
+        fill = _EXACT_FILL if data["match"] else _EXCEED_FILL
+        for col, value in enumerate(values, 1):
+            cell = ws.cell(row=row_num, column=col, value=value)
+            cell.fill = fill
+            cell.border = _THIN_BORDER
+            cell.alignment = Alignment(
+                horizontal="left" if col in (1, 4, 5, 7, 8) else "center",
+                vertical="center",
+                wrap_text=col in (4, 5, 7, 8),
+            )
+        row_num += 1
+
+    overview_widths = [60, 13, 13, 70, 70, 12, 34, 70]
+    for idx, width in enumerate(overview_widths, 1):
+        ws.column_dimensions[get_column_letter(idx)].width = width
+
+    if mismatched_list:
+        row_num += 2
+        ws.cell(
+            row=row_num, column=1,
+            value=f"Detailed CustomContent Comparison — Mismatch ({len(mismatched_list)} files)",
+        ).font = Font(bold=True, size=12, color="9C0006")
+        row_num += 1
+        row_num = _write_custom_content_detail_rows(ws, row_num, mismatched_list)
+
+    for idx, width in enumerate(_CUSTOM_CONTENT_COL_WIDTHS, 1):
+        ws.column_dimensions[get_column_letter(idx)].width = max(
+            ws.column_dimensions[get_column_letter(idx)].width or 0,
+            width,
+        )
+
+
+def write_excel(rows, output_path, source_label, target_label, threshold, heading_data=None, custom_content_data=None):
     """Generate the full Excel report."""
     wb = Workbook()
     _write_detail_sheet(wb, rows, threshold)
     _write_summary_sheet(wb, rows, source_label, target_label, threshold)
+    if custom_content_data:
+        _write_custom_content_sheet(wb, custom_content_data)
     if heading_data:
         _write_heading_sheet(wb, heading_data)
         _write_heading_matched_sheet(wb, heading_data)
@@ -809,32 +1198,62 @@ def main():
     print(f"    Exceeds threshold:   {len(md_exceed)}")
     print(f"    Target-only:         {len(md_target_only)}")
 
+    source_ctx = _source_content_context()
+    target_ctx = _target_content_context(github_client)
+
+    custom_content_data = []
+    custom_mismatch = 0
     heading_data = []
-    if md_exceed:
-        print(f"\n[4/4] Comparing heading structures for {len(md_exceed)} exceed-threshold files...")
-        source_ctx = _source_content_context()
-        target_ctx = _target_content_context(github_client)
+    if md_rows:
+        print(f"\n[4/4] Comparing document structures for {len(md_rows)} changed markdown files...")
+        md_files = [r["file"] for r in md_rows]
         exceed_files = [r["file"] for r in md_exceed]
-        heading_data = collect_heading_structures(
-            exceed_files, source_ctx, target_ctx, github_client
+        custom_content_data, heading_data = collect_document_structures(
+            md_files, exceed_files, source_ctx, target_ctx, github_client
         )
-        h_match = sum(1 for h in heading_data if h["match"])
-        h_mismatch = len(heading_data) - h_match
-        print(f"  Heading structure: {h_match} match, {h_mismatch} mismatch")
+        custom_report_data = [
+            item for item in custom_content_data
+            if has_custom_content_report_entry(item)
+        ]
+        custom_match = sum(1 for item in custom_report_data if item["match"])
+        custom_mismatch = len(custom_report_data) - custom_match
+        custom_skipped = len(custom_content_data) - len(custom_report_data)
+        print(
+            f"  CustomContent structure: {custom_match} match, "
+            f"{custom_mismatch} mismatch, {custom_skipped} without CustomContent"
+        )
+        if md_exceed:
+            h_match = sum(1 for h in heading_data if h["match"])
+            h_mismatch = len(heading_data) - h_match
+            print(f"  Heading structure: {h_match} match, {h_mismatch} mismatch")
+        else:
+            print("  Heading structure: no exceed-threshold files — skipped")
     else:
-        print("\n[4/4] No exceed-threshold files — skipping heading structure analysis.")
+        print("\n[4/4] No markdown files — skipping document structure analysis.")
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = os.path.join(script_dir, f"translation_verify_{timestamp}.xlsx")
 
-    write_excel(rows, output_path, source_label, target_label, WARNING_THRESHOLD, heading_data)
+    write_excel(
+        rows,
+        output_path,
+        source_label,
+        target_label,
+        WARNING_THRESHOLD,
+        heading_data,
+        custom_content_data,
+    )
 
-    flagged = len(md_exceed) + len(md_target_only)
+    line_count_flagged = len(md_exceed) + len(md_target_only)
+    flagged = line_count_flagged + custom_mismatch
     if flagged:
-        print(f"\n  ⚠  {flagged} file(s) need attention — review the Excel for details.")
+        print(
+            f"\n  ⚠  {line_count_flagged} line-count file(s) and "
+            f"{custom_mismatch} CustomContent file(s) need attention — review the Excel for details."
+        )
     else:
-        print(f"\n  ✓  All md files match or are within threshold.")
+        print(f"\n  ✓  All md files match or are within threshold, and CustomContent tags match.")
 
 
 if __name__ == "__main__":

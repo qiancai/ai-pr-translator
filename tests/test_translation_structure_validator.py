@@ -7,8 +7,10 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from translation_structure_validator import (
+    compare_custom_content_structure,
     compare_heading_structure,
     compact_heading_levels,
+    extract_custom_content_tags,
     extract_heading_levels,
     validate_markdown_heading_structures,
 )
@@ -73,6 +75,67 @@ class TranslationStructureValidatorTest(unittest.TestCase):
         self.assertEqual("#x1 ##x2", issue.target_compact)
         self.assertEqual("heading 3: source ###, target ##", issue.first_difference)
 
+    def test_extract_custom_content_tags_skips_code_blocks_and_keeps_inline_order(self):
+        content = "\n".join(
+            [
+                "# Guide",
+                '<CustomContent plan="dedicated">{{{ .dedicated }}}</CustomContent><CustomContent plan="essential">',
+                "```md",
+                '<CustomContent plan="ignored">',
+                "```",
+                "</CustomContent>",
+            ]
+        )
+
+        tags = extract_custom_content_tags(content)
+
+        self.assertEqual(
+            [
+                '<CustomContent plan="dedicated">',
+                "</CustomContent>",
+                '<CustomContent plan="essential">',
+                "</CustomContent>",
+            ],
+            [tag.text for tag in tags],
+        )
+        self.assertEqual([2, 2, 2, 6], [tag.line_number for tag in tags])
+
+    def test_compare_custom_content_structure_reports_missing_target_wrapper(self):
+        issue = compare_custom_content_structure(
+            "guide.md",
+            '# Guide\n\n<CustomContent plan="essential">\n\n## Section\n\n</CustomContent>\n',
+            "# 指南\n\n## Section\n",
+        )
+
+        self.assertIsNotNone(issue)
+        self.assertEqual("CustomContent tag sequence differs", issue.reason)
+        self.assertIn('2 CustomContent tags', issue.source_compact)
+        self.assertEqual("0 CustomContent tags", issue.target_compact)
+        self.assertIn('<CustomContent plan="essential">', issue.first_difference)
+
+    def test_compare_custom_content_structure_reports_same_count_different_tag(self):
+        issue = compare_custom_content_structure(
+            "guide.md",
+            '<CustomContent plan="essential">\n\n</CustomContent>\n',
+            '<CustomContent plan="dedicated">\n\n</CustomContent>\n',
+        )
+
+        self.assertIsNotNone(issue)
+        self.assertEqual("CustomContent tag sequence differs", issue.reason)
+        self.assertIn('plan="essential"', issue.first_difference)
+        self.assertIn('plan="dedicated"', issue.first_difference)
+
+    def test_compare_custom_content_structure_reports_unbalanced_target_tags(self):
+        issue = compare_custom_content_structure(
+            "guide.md",
+            '<CustomContent plan="essential">\n\n</CustomContent>\n',
+            '<CustomContent plan="essential">\n\n## Section\n',
+        )
+
+        self.assertIsNotNone(issue)
+        self.assertEqual("target CustomContent tags are unbalanced", issue.reason)
+        self.assertIn("opening tag without matching closing tag", issue.first_difference)
+
     def test_validate_markdown_heading_structures_checks_only_markdown_files(self):
         calls = []
 
@@ -93,6 +156,21 @@ class TranslationStructureValidatorTest(unittest.TestCase):
         self.assertEqual(1, len(issues))
         self.assertEqual("guide.md", issues[0].file_path)
         self.assertEqual([("source", "guide.md"), ("target", "guide.md")], calls)
+
+    def test_validate_markdown_heading_structures_includes_custom_content_issues(self):
+        def source_loader(file_path):
+            return '<CustomContent plan="essential">\n\n# Guide\n\n</CustomContent>\n'
+
+        def target_loader(file_path):
+            return "# 指南\n"
+
+        issues = validate_markdown_heading_structures(
+            ["guide.md"],
+            source_loader,
+            target_loader,
+        )
+
+        self.assertEqual(["CustomContent tag sequence differs"], [issue.reason for issue in issues])
 
     def test_validate_markdown_heading_structures_reports_loader_none_and_exceptions(self):
         def source_loader(file_path):
