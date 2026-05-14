@@ -1445,6 +1445,16 @@ def is_structural_added_heading_prefix_line(line):
     return re.match(r'^<CustomContent\b[^>]*>\s*$', stripped) is not None
 
 
+def is_structural_mdx_wrapper_line(line):
+    """Return True for standalone MDX component boundary lines."""
+    stripped = (line or "").strip()
+    if not stripped:
+        return False
+    if stripped.endswith("/>"):
+        return False
+    return re.match(r'^</?[A-Z][A-Za-z0-9]*(?:\s+[^<>]*)?>\s*$', stripped) is not None
+
+
 def collect_added_heading_prefix_lines(file_lines, operations):
     """Collect structural added lines immediately before added headings.
 
@@ -1498,6 +1508,52 @@ def collect_added_heading_prefix_lines(file_lines, operations):
                 prefix_lines_by_heading[heading_line] = content_prefixes
 
     return prefix_lines_by_heading, ignored_line_numbers
+
+
+def find_previous_heading_line(line_number, all_headers):
+    """Return the nearest heading line strictly before line_number."""
+    previous = None
+    for header_line in sorted(all_headers.keys()):
+        if header_line >= line_number:
+            break
+        previous = header_line
+    return previous
+
+
+def collect_structural_wrapper_boundary_sections(operations, all_headers, ignored_added_lines=None):
+    """Find existing sections whose direct ranges changed only by wrapper tags.
+
+    A standalone MDX wrapper can sit between headings, for example just before a
+    heading or just after a wrapped section. In that case normal "containing
+    section" lookup can attach the change to the next heading and later filter
+    it out because that section's direct content is unchanged. Marking the
+    previous section preserves the boundary edit as a regular modified range.
+    """
+    ignored_added_lines = ignored_added_lines or set()
+    boundary_sections = set()
+
+    for operation_key in ("added_lines", "deleted_lines", "modified_lines"):
+        for entry in operations.get(operation_key, []):
+            if entry.get("is_header"):
+                continue
+            if not is_structural_mdx_wrapper_line(entry.get("content", "")):
+                continue
+
+            if operation_key == "deleted_lines":
+                boundary_line = get_head_line_number(entry)
+            else:
+                boundary_line = entry.get("line_number")
+                if operation_key == "added_lines" and boundary_line in ignored_added_lines:
+                    continue
+
+            if boundary_line is None:
+                continue
+
+            section_line = find_previous_heading_line(boundary_line, all_headers)
+            if section_line is not None:
+                boundary_sections.add(section_line)
+
+    return boundary_sections
 
 def find_previous_section_for_added(added_sections, hierarchy_dict):
     """Find the previous section hierarchy for each added section group"""
@@ -2355,6 +2411,11 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
         # Get only lines that have actual content changes (exclude headers)
         real_content_changes = set()
         _, structural_added_prefix_lines = collect_added_heading_prefix_lines(lines, operations)
+        structural_wrapper_boundary_sections = collect_structural_wrapper_boundary_sections(
+            operations,
+            all_headers,
+            ignored_added_lines=structural_added_prefix_lines,
+        )
         
         # Added lines (new content, excluding headers)
         for added_line in operations['added_lines']:
@@ -2437,6 +2498,15 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
                     #print(f"   📝 Content change at line {changed_line} affects section at line {containing_section} (distance: {distance_to_section})")
         
         # Add content-modified sections to the modified set, but exclude sections that are already marked as added or deleted
+        for line_num in sorted(structural_wrapper_boundary_sections):
+            if (
+                line_num not in sections_by_type['added']
+                and line_num not in sections_by_type['deleted']
+            ):
+                if line_num not in sections_by_type['modified']:
+                    print(f"   🧩 Added structural-wrapper-modified section at line {line_num}")
+                sections_by_type['modified'].add(line_num)
+
         for line_num in content_affected_sections:
             if (line_num not in sections_by_type['modified'] and 
                 line_num not in sections_by_type['added'] and

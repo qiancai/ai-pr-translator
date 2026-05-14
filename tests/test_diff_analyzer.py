@@ -314,6 +314,122 @@ class DiffAnalyzerContextTest(unittest.TestCase):
         self.assertIn("added_9", source_diff)
         self.assertIn("New paragraph.", source_diff["modified_3"]["new_content"])
 
+    def test_deleted_mdx_wrapper_between_headings_is_preserved_as_structural_changes(self):
+        file_path = "guide.md"
+        base_content = "\n".join(
+            [
+                "# Guide",
+                "",
+                "## Limitations",
+                "",
+                "### Filtered out and deleted databases",
+                "",
+                "Filtered body.",
+                "",
+                '<CustomContent plan="essential">',
+                "",
+                "### Limitations of Alibaba Cloud RDS",
+                "",
+                "RDS body.",
+                "",
+                "### Limitations of Alibaba Cloud PolarDB-X",
+                "",
+                "PolarDB-X body.",
+                "",
+                "</CustomContent>",
+                "",
+                "### Limitations of existing data migration",
+                "",
+                "Existing data body.",
+            ]
+        )
+        head_content = "\n".join(
+            [
+                "# Guide",
+                "",
+                "## Limitations",
+                "",
+                "### Filtered out and deleted databases",
+                "",
+                "Filtered body.",
+                "",
+                "### Limitations of Alibaba Cloud RDS",
+                "",
+                "RDS body.",
+                "",
+                "### Limitations of Alibaba Cloud PolarDB-X",
+                "",
+                "PolarDB-X body.",
+                "",
+                "### Limitations of existing data migration",
+                "",
+                "Existing data body.",
+            ]
+        )
+        patch = "\n".join(
+            [
+                "@@ -5,17 +5,13 @@",
+                " ### Filtered out and deleted databases",
+                " ",
+                " Filtered body.",
+                " ",
+                '-<CustomContent plan="essential">',
+                "-",
+                " ### Limitations of Alibaba Cloud RDS",
+                " ",
+                " RDS body.",
+                " ",
+                " ### Limitations of Alibaba Cloud PolarDB-X",
+                " ",
+                " PolarDB-X body.",
+                " ",
+                "-</CustomContent>",
+                "-",
+                " ### Limitations of existing data migration",
+            ]
+        )
+        changed_file = SimpleNamespace(
+            filename=file_path,
+            status="modified",
+            patch=patch,
+            previous_filename=None,
+        )
+        repository = FakeRepository(
+            {
+                (file_path, "base123"): base_content,
+                (file_path, "head123"): head_content,
+            },
+            FakePR([changed_file], "Remove essential wrapper", "base123", "head123"),
+            {("base123", "head123"): [changed_file]},
+        )
+        github = FakeGithub({"acme/docs": repository})
+        context = build_commit_diff_context(
+            "acme/docs",
+            "acme/docs-cn",
+            "base123",
+            "head123",
+            github,
+            self.repo_configs,
+        )
+
+        analyze_source_changes(
+            context,
+            github,
+            special_files=["TOC.md", "keywords.md"],
+            ignore_files=[],
+            repo_configs=self.repo_configs,
+        )
+
+        source_diff = json.loads(self.generated_file.read_text(encoding="utf-8"))
+        self.assertIn("modified_5", source_diff)
+        self.assertIn("modified_13", source_diff)
+        self.assertNotIn("modified_9", source_diff)
+
+        self.assertIn('<CustomContent plan="essential">', source_diff["modified_5"]["old_content"])
+        self.assertNotIn('<CustomContent plan="essential">', source_diff["modified_5"]["new_content"])
+        self.assertIn("</CustomContent>", source_diff["modified_13"]["old_content"])
+        self.assertNotIn("</CustomContent>", source_diff["modified_13"]["new_content"])
+
     def test_deleted_line_uses_head_position_for_section_mapping(self):
         file_path = "guide.md"
         base_content = "# Guide\n\n## First\n\nkeep\n\n## Second\n\nold line\nmore\n"
