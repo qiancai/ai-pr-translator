@@ -142,6 +142,53 @@ class FileAdderRegressionTest(unittest.TestCase):
             self.assertEqual(failures, {})
             self.assertEqual(target_file.read_text(encoding="utf-8"), "translated target")
 
+    def test_process_added_files_preserves_related_resources_when_called_directly(self):
+        repo_config = {
+            "target_local_path": "",
+            "source_language": "English",
+            "target_language": "Chinese",
+        }
+        source_content = "\n".join(
+            [
+                "# Guide",
+                "",
+                "## Usage",
+                "",
+                "Use TiDB.",
+                "",
+                "## Related resources",
+                "",
+                "<RelatedResources>",
+                '  <ResourceCard title="Example" type="blog" link="https://example.com" />',
+                "</RelatedResources>",
+                "",
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_config["target_local_path"] = tmpdir
+            target_file = Path(tmpdir, "guide.md")
+
+            with mock.patch(
+                "file_adder.translate_file_batch",
+                side_effect=lambda batch, *args, **kwargs: batch,
+            ):
+                success, failures = process_added_files(
+                    {"guide.md": source_content},
+                    {"mode": "commit"},
+                    object(),
+                    object(),
+                    repo_config,
+                    return_details=True,
+                )
+
+            self.assertTrue(success)
+            self.assertEqual(failures, {})
+            translated = target_file.read_text(encoding="utf-8")
+            self.assertIn("## Usage", translated)
+            self.assertIn("RelatedResources", translated)
+            self.assertIn("ResourceCard", translated)
+
     def test_process_added_files_still_rejects_existing_target_file_by_default(self):
         repo_config = {
             "target_local_path": "",

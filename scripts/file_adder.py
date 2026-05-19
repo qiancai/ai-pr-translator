@@ -252,7 +252,7 @@ def process_added_files(
                 failure_reasons[file_path] = reason
                 all_success = False
                 continue
-        
+
         # Create section batches for translation
         batches = create_section_batches(file_content, max_lines_per_batch=200)
         thread_safe_print(f"   📦 Created {len(batches)} batches for translation")

@@ -18,6 +18,9 @@ SOURCE_FILES_TRANSLATION_MODE = "full"
 # Options: "manual" to add/update per-file Corresponding EN commit markers,
 # or "scheduled" to remove existing markers after successful translation.
 COMMIT_SYNC_RUN_TYPE = "manual"
+# Options: "Yes" to ignore RelatedResources sections containing ResourceCard,
+# or "No" to keep those sections in the normal commit-mode translation flow.
+IGNORE_RESOURCE_CARD_SECTION = "Yes"
 
 
 COMMON_CONFIG = {
@@ -25,6 +28,7 @@ COMMON_CONFIG = {
     "AI_PROVIDER": "azure",  # Options: "deepseek", "gemini", "openai", "azure"
     "SOURCE_FILES_TRANSLATION_MODE": SOURCE_FILES_TRANSLATION_MODE,
     "COMMIT_SYNC_RUN_TYPE": COMMIT_SYNC_RUN_TYPE,
+    "IGNORE_RESOURCE_CARD_SECTION": IGNORE_RESOURCE_CARD_SECTION,
     "TIDB_CLOUD_ABSOLUTE_LINK_PREFIX": "https://docs.pingcap.com/tidbcloud/",
     # Keep local verification going after per-file failures so successful outputs can be reviewed.
     "FAIL_ON_TRANSLATION_ERROR": False,

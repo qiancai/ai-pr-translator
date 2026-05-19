@@ -369,12 +369,23 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
             workflow, "TARGET_REF", "i18n-zh-release-8.5"
         ), mock.patch.object(
             workflow, "PREFER_LOCAL_TARGET_FOR_READ", True
+        ), mock.patch.object(
+            workflow, "IGNORE_RESOURCE_CARD_SECTION", "No"
         ):
             repo_config = workflow.get_commit_repo_config()
 
         self.assertEqual(repo_config["target_ref"], "i18n-zh-release-8.5")
         self.assertTrue(repo_config["prefer_local_target_for_read"])
         self.assertEqual(repo_config["target_local_path"], "/tmp/docs")
+        self.assertFalse(repo_config["ignore_resource_card_section"])
+
+    def test_commit_repo_config_ignores_resource_card_sections_by_default(self):
+        with mock.patch.object(workflow, "SOURCE_REPO", "pingcap/docs"), mock.patch.object(
+            workflow, "TARGET_REPO", "pingcap/docs-cn"
+        ), mock.patch.object(workflow, "IGNORE_RESOURCE_CARD_SECTION", "Yes"):
+            repo_config = workflow.get_commit_repo_config()
+
+        self.assertTrue(repo_config["ignore_resource_card_section"])
 
     def test_commit_ignore_files_do_not_inherit_pr_mode_defaults(self):
         with mock.patch.object(
@@ -1404,6 +1415,282 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
         self.assertIn("deleted.md", deleted_sections)
         self.assertEqual(toc_files, {})
         self.assertEqual(stats.failed, [])
+
+    def test_full_translation_collection_strips_related_resources_sections(self):
+        source_content = "\n".join(
+            [
+                "# Guide",
+                "",
+                "## Usage",
+                "",
+                "Use TiDB.",
+                "",
+                "## Related resources",
+                "",
+                "<RelatedResources>",
+                '  <ResourceCard title="Example" type="blog" link="https://example.com" />',
+                "</RelatedResources>",
+                "",
+            ]
+        )
+
+        with mock.patch.object(
+            workflow,
+            "get_full_translation_source_content",
+            return_value=source_content,
+        ):
+            files, failures = workflow.collect_source_files_for_full_translation(
+                {"guide.md"},
+                [],
+                {"head_ref": "head"},
+                object(),
+            )
+
+        self.assertEqual(failures, {})
+        self.assertEqual(set(files), {"guide.md"})
+        self.assertIn("## Usage", files["guide.md"])
+        self.assertNotIn("RelatedResources", files["guide.md"])
+        self.assertNotIn("ResourceCard", files["guide.md"])
+
+    def test_full_translation_collection_skips_related_resources_only_file(self):
+        source_content = "\n".join(
+            [
+                "## Related resources",
+                "",
+                "<RelatedResources>",
+                '  <ResourceCard title="Example" type="blog" link="https://example.com" />',
+                "</RelatedResources>",
+                "",
+            ]
+        )
+
+        with mock.patch.object(
+            workflow,
+            "get_full_translation_source_content",
+            return_value=source_content,
+        ):
+            files, failures = workflow.collect_source_files_for_full_translation(
+                {"guide.md"},
+                [],
+                {"head_ref": "head"},
+                object(),
+            )
+
+        self.assertEqual(files, {})
+        self.assertEqual(failures, {})
+
+    def test_commit_modified_file_filters_related_resources_from_ai_diff_context(self):
+        base_content = "\n".join(
+            [
+                "# Guide",
+                "",
+                "## Usage",
+                "",
+                "Old usage.",
+                "",
+                "## Related resources",
+                "",
+                "<RelatedResources>",
+                '  <ResourceCard title="Old" />',
+                "</RelatedResources>",
+                "",
+            ]
+        )
+        head_content = base_content.replace("Old usage.", "New usage.").replace(
+            'title="Old"',
+            'title="New"',
+        )
+        pr_diff = "\n".join(
+            [
+                "File: guide.md",
+                "@@ -3,9 +3,9 @@",
+                " ## Usage",
+                " ",
+                "-Old usage.",
+                "+New usage.",
+                " ",
+                " ## Related resources",
+                " ",
+                " <RelatedResources>",
+                '-  <ResourceCard title="Old" />',
+                '+  <ResourceCard title="New" />',
+                " </RelatedResources>",
+                "-" * 80,
+            ]
+        )
+
+        def fake_get_source_file_content(file_path, diff_context, github_client, ref_name="head_ref"):
+            return base_content if ref_name == "base_ref" else head_content
+
+        with mock.patch.object(
+            workflow,
+            "get_source_file_content",
+            side_effect=fake_get_source_file_content,
+        ), mock.patch.object(
+            workflow,
+            "should_process_modified_file_as_added",
+            return_value=False,
+        ), mock.patch.object(
+            workflow,
+            "determine_file_processing_type",
+            return_value="regular_modified",
+        ), mock.patch.object(
+            workflow,
+            "process_regular_modified_file",
+            return_value=(True, ""),
+        ) as process_regular_modified_file:
+            result = workflow._process_commit_modified_file(
+                "guide.md",
+                {"sections": {"3": "## Usage"}},
+                pr_diff,
+                {"base_ref": "base", "head_ref": "head"},
+                object(),
+                object(),
+                {},
+                None,
+            )
+
+        self.assertEqual(result["status"], "success")
+        filtered_diff = process_regular_modified_file.call_args.args[2]
+        self.assertIn("-Old usage.", filtered_diff)
+        self.assertIn("+New usage.", filtered_diff)
+        self.assertNotIn("RelatedResources", filtered_diff)
+        self.assertNotIn("ResourceCard", filtered_diff)
+
+    def test_commit_modified_file_keeps_related_resources_when_filter_disabled(self):
+        base_content = "\n".join(
+            [
+                "# Guide",
+                "",
+                "## Usage",
+                "",
+                "Old usage.",
+                "",
+                "## Related resources",
+                "",
+                "<RelatedResources>",
+                '  <ResourceCard title="Old" />',
+                "</RelatedResources>",
+                "",
+            ]
+        )
+        head_content = base_content.replace("Old usage.", "New usage.").replace(
+            'title="Old"',
+            'title="New"',
+        )
+        pr_diff = "\n".join(
+            [
+                "File: guide.md",
+                "@@ -3,9 +3,9 @@",
+                " ## Usage",
+                " ",
+                "-Old usage.",
+                "+New usage.",
+                " ",
+                " ## Related resources",
+                " ",
+                " <RelatedResources>",
+                '-  <ResourceCard title="Old" />',
+                '+  <ResourceCard title="New" />',
+                " </RelatedResources>",
+                "-" * 80,
+            ]
+        )
+
+        def fake_get_source_file_content(file_path, diff_context, github_client, ref_name="head_ref"):
+            return base_content if ref_name == "base_ref" else head_content
+
+        with mock.patch.object(
+            workflow,
+            "get_source_file_content",
+            side_effect=fake_get_source_file_content,
+        ), mock.patch.object(
+            workflow,
+            "should_process_modified_file_as_added",
+            return_value=False,
+        ), mock.patch.object(
+            workflow,
+            "determine_file_processing_type",
+            return_value="regular_modified",
+        ), mock.patch.object(
+            workflow,
+            "process_regular_modified_file",
+            return_value=(True, ""),
+        ) as process_regular_modified_file:
+            result = workflow._process_commit_modified_file(
+                "guide.md",
+                {"sections": {"3": "## Usage"}},
+                pr_diff,
+                {"base_ref": "base", "head_ref": "head"},
+                object(),
+                object(),
+                {"ignore_resource_card_section": False},
+                None,
+            )
+
+        self.assertEqual(result["status"], "success")
+        kept_diff = process_regular_modified_file.call_args.args[2]
+        self.assertIn("RelatedResources", kept_diff)
+        self.assertIn("ResourceCard", kept_diff)
+
+    def test_added_file_fallback_strips_related_resources_sections(self):
+        source_content = "\n".join(
+            [
+                "# Guide",
+                "",
+                "## Usage",
+                "",
+                "Use TiDB.",
+                "",
+                "## Related resources",
+                "",
+                "<RelatedResources>",
+                '  <ResourceCard title="Example" />',
+                "</RelatedResources>",
+                "",
+            ]
+        )
+        pr_diff = "\n".join(
+            [
+                "File: guide.md",
+                "@@ -3,1 +3,1 @@",
+                "-Old usage.",
+                "+Use TiDB.",
+            ]
+        )
+
+        def fake_get_source_file_content(file_path, diff_context, github_client, ref_name="head_ref"):
+            return "# Guide\n\n## Usage\n\nOld usage.\n" if ref_name == "base_ref" else source_content
+
+        with mock.patch.object(
+            workflow,
+            "get_source_file_content",
+            side_effect=fake_get_source_file_content,
+        ), mock.patch.object(
+            workflow,
+            "should_process_modified_file_as_added",
+            return_value=True,
+        ), mock.patch.object(
+            workflow,
+            "process_added_files",
+            return_value=(True, {}),
+        ) as process_added_files:
+            result = workflow._process_commit_modified_file(
+                "guide.md",
+                {"sections": {"3": "## Usage"}},
+                pr_diff,
+                {"base_ref": "base", "head_ref": "head"},
+                object(),
+                object(),
+                {},
+                None,
+            )
+
+        self.assertEqual(result["status"], "success")
+        added_content = process_added_files.call_args.args[0]["guide.md"]
+        self.assertIn("## Usage", added_content)
+        self.assertNotIn("RelatedResources", added_content)
+        self.assertNotIn("ResourceCard", added_content)
 
     def test_collect_toc_scope_added_files_detects_new_cloud_links(self):
         toc_files = {

@@ -19,6 +19,11 @@ SOURCE_HEAD_REF = os.getenv("SOURCE_HEAD_REF", "")
 SOURCE_FOLDER = os.getenv("SOURCE_FOLDER", "")
 SOURCE_FILES = os.getenv("SOURCE_FILES", "")
 SOURCE_FILES_TRANSLATION_MODE = os.getenv("SOURCE_FILES_TRANSLATION_MODE", "incremental")
+IGNORE_RESOURCE_CARD_SECTION = (
+    os.getenv("IGNORE_RESOURCE_CARD_SECTION")
+    or os.getenv("ignore-resource-card-section")
+    or "Yes"
+)
 CLOUD_TOC_FILES = os.getenv("CLOUD_TOC_FILES", "")
 SOURCE_REPO_PATH = os.getenv("SOURCE_REPO_PATH", "")
 TARGET_REF = os.getenv("TARGET_REF", "")
@@ -46,6 +51,9 @@ from diff_analyzer import (
     get_source_file_content,
     infer_language_direction,
     analyze_source_changes,
+    filter_related_resources_resource_card_diff,
+    is_yes_option_enabled,
+    remove_related_resources_resource_card_sections,
 )
 from file_adder import process_added_files
 from file_deleter import process_deleted_files
@@ -77,6 +85,16 @@ from workflow_ignore_config import load_workflow_ignore_config
 WORKFLOW_IGNORE_CONFIG = load_workflow_ignore_config()
 COMMIT_BASED_MODE_IGNORE_FILES = WORKFLOW_IGNORE_CONFIG["COMMIT_BASED_MODE_IGNORE_FILES"]
 COMMIT_BASED_MODE_IGNORE_FOLDERS = WORKFLOW_IGNORE_CONFIG["COMMIT_BASED_MODE_IGNORE_FOLDERS"]
+
+
+def should_ignore_resource_card_section(repo_config):
+    """Return whether commit mode should ignore RelatedResources ResourceCard sections."""
+    return is_yes_option_enabled(
+        (repo_config or {}).get("ignore_resource_card_section", True),
+        default=True,
+    )
+
+
 SOURCE_FILES_TRANSLATION_MODE_ALIASES = {
     "incremental": "incremental",
     "diff": "incremental",
@@ -248,6 +266,7 @@ def _process_commit_modified_file(
         if pr_diff:
             return make_task_result("failure", "No file-specific diff found")
         return make_task_result("failure", "No markdown patch text available")
+
     thread_safe_print(f"   📊 File-specific diff: {len(file_specific_diff)} chars")
 
     if should_process_modified_file_as_added(source_file_path, repo_config, github_client):
@@ -266,6 +285,20 @@ def _process_commit_modified_file(
                 "failure",
                 f"Could not get source file content for added-file fallback: {sanitize_exception_message(e)}",
             )
+        if should_ignore_resource_card_section(repo_config):
+            source_content, skipped_sections = remove_related_resources_resource_card_sections(source_content)
+            if skipped_sections:
+                thread_safe_print(
+                    f"   🧹 Skipped {len(skipped_sections)} RelatedResources section(s) "
+                    "from added-file fallback"
+                )
+                for section in skipped_sections:
+                    thread_safe_print(f"      - {section['hierarchy']}")
+            if not source_content.strip():
+                return make_task_result(
+                    "skipped",
+                    "No translatable content remains after RelatedResources filtering",
+                )
 
         success, failure_reasons = process_added_files(
             {source_file_path: source_content},
@@ -293,6 +326,36 @@ def _process_commit_modified_file(
         return make_task_result("skipped", "Already handled in keyword step")
     if file_type != "regular_modified":
         return make_task_result("failure", f"Unknown file processing type: {file_type}")
+
+    if should_ignore_resource_card_section(repo_config):
+        try:
+            base_content_for_diff = get_source_file_content(
+                source_file_path,
+                diff_context,
+                github_client,
+                ref_name="base_ref",
+            )
+            head_content_for_diff = get_source_file_content(
+                source_file_path,
+                diff_context,
+                github_client,
+                ref_name="head_ref",
+            )
+            filtered_file_specific_diff = filter_related_resources_resource_card_diff(
+                file_specific_diff,
+                base_content_for_diff,
+                head_content_for_diff,
+            )
+            if filtered_file_specific_diff != file_specific_diff:
+                thread_safe_print(
+                    "   🧹 Removed RelatedResources section lines from commit-mode AI diff context"
+                )
+                file_specific_diff = filtered_file_specific_diff
+        except Exception as e:
+            thread_safe_print(
+                "   ⚠️  Could not filter RelatedResources from file diff context: "
+                f"{sanitize_exception_message(e)}"
+            )
 
     success, failure_reason = process_regular_modified_file(
         source_file_path,
@@ -326,6 +389,10 @@ def get_commit_repo_config():
         "source_mode": "commit",
         "source_language": source_language,
         "target_language": target_language,
+        "ignore_resource_card_section": is_yes_option_enabled(
+            IGNORE_RESOURCE_CARD_SECTION,
+            default=True,
+        ),
     }
 
 
@@ -769,11 +836,27 @@ def collect_source_files_for_full_translation(
             continue
 
         try:
-            full_translation_files[source_file_path] = get_full_translation_source_content(
+            file_content = get_full_translation_source_content(
                 source_file_path,
                 diff_context,
                 github_client,
             )
+            if should_ignore_resource_card_section(diff_context.get("repo_config")):
+                file_content, skipped_sections = remove_related_resources_resource_card_sections(file_content)
+                if skipped_sections:
+                    thread_safe_print(
+                        f"   🧹 Skipped {len(skipped_sections)} RelatedResources section(s) "
+                        f"from full commit-mode file translation: {source_file_path}"
+                    )
+                    for section in skipped_sections:
+                        thread_safe_print(f"      - {section['hierarchy']}")
+                if not file_content.strip():
+                    thread_safe_print(
+                        f"   ⏭️  Skipping {source_file_path}: no translatable content remains "
+                        "after RelatedResources filtering"
+                    )
+                    continue
+            full_translation_files[source_file_path] = file_content
         except Exception as e:
             failures[source_file_path] = (
                 f"Could not get source file content for full translation: "

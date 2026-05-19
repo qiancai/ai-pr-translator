@@ -20,6 +20,7 @@ from diff_analyzer import (
     build_hierarchy_dict,
     build_source_diff_dict,
     collect_added_heading_prefix_lines,
+    filter_related_resources_resource_card_diff,
     get_target_file_content,
     get_target_hierarchy_and_content,
     maybe_use_normalized_snapshot_operations,
@@ -169,6 +170,646 @@ class DiffAnalyzerContextTest(unittest.TestCase):
         source_diff = self.generated_file.read_text(encoding="utf-8")
         self.assertIn('"operation": "modified"', source_diff)
         self.assertIn("New text", source_diff)
+
+    def test_commit_related_resources_added_section_is_filtered(self):
+        file_path = "guide.md"
+        base_content = "# Guide\n\n## Usage\n\nUse TiDB.\n"
+        head_content = "\n".join(
+            [
+                "# Guide",
+                "",
+                "## Usage",
+                "",
+                "Use TiDB.",
+                "",
+                "## Related resources",
+                "",
+                "<RelatedResources>",
+                "  <ResourceCard",
+                '    title="Example"',
+                '    type="blog"',
+                '    link="https://example.com"',
+                "  />",
+                "</RelatedResources>",
+                "",
+            ]
+        )
+        patch = "\n".join(
+            [
+                "@@ -3,3 +3,13 @@",
+                " ## Usage",
+                " ",
+                " Use TiDB.",
+                "+",
+                "+## Related resources",
+                "+",
+                "+<RelatedResources>",
+                "+  <ResourceCard",
+                '+    title="Example"',
+                '+    type="blog"',
+                '+    link="https://example.com"',
+                "+  />",
+                "+</RelatedResources>",
+            ]
+        )
+        changed_file = SimpleNamespace(
+            filename=file_path,
+            status="modified",
+            patch=patch,
+            previous_filename=None,
+        )
+        repository = FakeRepository(
+            {
+                (file_path, "base123"): base_content,
+                (file_path, "head123"): head_content,
+            },
+            FakePR([changed_file], "Add related resources", "base123", "head123"),
+            {("base123", "head123"): [changed_file]},
+        )
+        github = FakeGithub({"acme/docs": repository})
+        context = build_commit_diff_context(
+            "acme/docs",
+            "acme/docs-cn",
+            "base123",
+            "head123",
+            github,
+            self.repo_configs,
+        )
+
+        result = analyze_source_changes(
+            context,
+            github,
+            special_files=["TOC.md", "keywords.md"],
+            ignore_files=[],
+            repo_configs=self.repo_configs,
+        )
+
+        self.assertEqual(result, ({}, {}, {}, {}, [], {}, {}, [], [], []))
+        self.assertFalse(self.generated_file.exists())
+
+    def test_commit_related_resources_modified_section_is_filtered(self):
+        file_path = "guide.md"
+        base_content = "\n".join(
+            [
+                "# Guide",
+                "",
+                "## Usage",
+                "",
+                "Use TiDB.",
+                "",
+                "## Related resources",
+                "",
+                "<RelatedResources>",
+                "  <ResourceCard",
+                '    title="Old example"',
+                '    type="blog"',
+                '    link="https://example.com"',
+                "  />",
+                "</RelatedResources>",
+                "",
+            ]
+        )
+        head_content = base_content.replace("Old example", "New example")
+        patch = "\n".join(
+            [
+                "@@ -7,9 +7,9 @@",
+                " ## Related resources",
+                " ",
+                " <RelatedResources>",
+                "   <ResourceCard",
+                '-    title="Old example"',
+                '+    title="New example"',
+                '     type="blog"',
+                '     link="https://example.com"',
+                "   />",
+                " </RelatedResources>",
+            ]
+        )
+        changed_file = SimpleNamespace(
+            filename=file_path,
+            status="modified",
+            patch=patch,
+            previous_filename=None,
+        )
+        repository = FakeRepository(
+            {
+                (file_path, "base123"): base_content,
+                (file_path, "head123"): head_content,
+            },
+            FakePR([changed_file], "Update related resources", "base123", "head123"),
+            {("base123", "head123"): [changed_file]},
+        )
+        github = FakeGithub({"acme/docs": repository})
+        context = build_commit_diff_context(
+            "acme/docs",
+            "acme/docs-cn",
+            "base123",
+            "head123",
+            github,
+            self.repo_configs,
+        )
+
+        result = analyze_source_changes(
+            context,
+            github,
+            special_files=["TOC.md", "keywords.md"],
+            ignore_files=[],
+            repo_configs=self.repo_configs,
+        )
+
+        self.assertEqual(result, ({}, {}, {}, {}, [], {}, {}, [], [], []))
+        self.assertFalse(self.generated_file.exists())
+
+    def test_commit_related_resources_deleted_section_is_filtered(self):
+        file_path = "guide.md"
+        base_content = "\n".join(
+            [
+                "# Guide",
+                "",
+                "## Usage",
+                "",
+                "Use TiDB.",
+                "",
+                "## Related resources",
+                "",
+                "<RelatedResources>",
+                "  <ResourceCard",
+                '    title="Example"',
+                '    type="blog"',
+                '    link="https://example.com"',
+                "  />",
+                "</RelatedResources>",
+                "",
+            ]
+        )
+        head_content = "# Guide\n\n## Usage\n\nUse TiDB.\n"
+        patch = "\n".join(
+            [
+                "@@ -3,13 +3,3 @@",
+                " ## Usage",
+                " ",
+                " Use TiDB.",
+                "-",
+                "-## Related resources",
+                "-",
+                "-<RelatedResources>",
+                "-  <ResourceCard",
+                '-    title="Example"',
+                '-    type="blog"',
+                '-    link="https://example.com"',
+                "-  />",
+                "-</RelatedResources>",
+            ]
+        )
+        changed_file = SimpleNamespace(
+            filename=file_path,
+            status="modified",
+            patch=patch,
+            previous_filename=None,
+        )
+        repository = FakeRepository(
+            {
+                (file_path, "base123"): base_content,
+                (file_path, "head123"): head_content,
+            },
+            FakePR([changed_file], "Delete related resources", "base123", "head123"),
+            {("base123", "head123"): [changed_file]},
+        )
+        github = FakeGithub({"acme/docs": repository})
+        context = build_commit_diff_context(
+            "acme/docs",
+            "acme/docs-cn",
+            "base123",
+            "head123",
+            github,
+            self.repo_configs,
+        )
+
+        result = analyze_source_changes(
+            context,
+            github,
+            special_files=["TOC.md", "keywords.md"],
+            ignore_files=[],
+            repo_configs=self.repo_configs,
+        )
+
+        self.assertEqual(result, ({}, {}, {}, {}, [], {}, {}, [], [], []))
+        self.assertFalse(self.generated_file.exists())
+
+    def test_pr_related_resources_section_is_not_filtered(self):
+        file_path = "guide.md"
+        base_content = "# Guide\n\n## Usage\n\nUse TiDB.\n"
+        head_content = "\n".join(
+            [
+                "# Guide",
+                "",
+                "## Usage",
+                "",
+                "Use TiDB.",
+                "",
+                "## Related resources",
+                "",
+                "<RelatedResources>",
+                "  <ResourceCard",
+                '    title="Example"',
+                "  />",
+                "</RelatedResources>",
+                "",
+            ]
+        )
+        patch = "\n".join(
+            [
+                "@@ -3,3 +3,11 @@",
+                " ## Usage",
+                " ",
+                " Use TiDB.",
+                "+",
+                "+## Related resources",
+                "+",
+                "+<RelatedResources>",
+                "+  <ResourceCard",
+                '+    title="Example"',
+                "+  />",
+                "+</RelatedResources>",
+            ]
+        )
+        changed_file = SimpleNamespace(
+            filename=file_path,
+            status="modified",
+            patch=patch,
+            previous_filename=None,
+        )
+        repository = FakeRepository(
+            {
+                (file_path, "base123"): base_content,
+                (file_path, "head123"): head_content,
+            },
+            FakePR([changed_file], "Add related resources", "base123", "head123"),
+            {("base123", "head123"): [changed_file]},
+        )
+        github = FakeGithub({"acme/docs": repository})
+        context = build_pr_diff_context(self.pr_url, github, self.repo_configs)
+
+        analyze_source_changes(
+            context,
+            github,
+            special_files=["TOC.md", "keywords.md"],
+            ignore_files=[],
+            repo_configs=self.repo_configs,
+        )
+
+        source_diff = json.loads(self.generated_file.read_text(encoding="utf-8"))
+        self.assertIn("added_7", source_diff)
+        self.assertIn("<RelatedResources>", source_diff["added_7"]["new_content"])
+
+    def test_commit_related_resources_filter_can_be_disabled(self):
+        file_path = "guide.md"
+        base_content = "# Guide\n\n## Usage\n\nUse TiDB.\n"
+        head_content = "\n".join(
+            [
+                "# Guide",
+                "",
+                "## Usage",
+                "",
+                "Use TiDB.",
+                "",
+                "## Related resources",
+                "",
+                "<RelatedResources>",
+                "  <ResourceCard",
+                '    title="Example"',
+                "  />",
+                "</RelatedResources>",
+                "",
+            ]
+        )
+        patch = "\n".join(
+            [
+                "@@ -3,3 +3,11 @@",
+                " ## Usage",
+                " ",
+                " Use TiDB.",
+                "+",
+                "+## Related resources",
+                "+",
+                "+<RelatedResources>",
+                "+  <ResourceCard",
+                '+    title="Example"',
+                "+  />",
+                "+</RelatedResources>",
+            ]
+        )
+        changed_file = SimpleNamespace(
+            filename=file_path,
+            status="modified",
+            patch=patch,
+            previous_filename=None,
+        )
+        repository = FakeRepository(
+            {
+                (file_path, "base123"): base_content,
+                (file_path, "head123"): head_content,
+            },
+            FakePR([changed_file], "Add related resources", "base123", "head123"),
+            {("base123", "head123"): [changed_file]},
+        )
+        github = FakeGithub({"acme/docs": repository})
+        context = build_commit_diff_context(
+            "acme/docs",
+            "acme/docs-cn",
+            "base123",
+            "head123",
+            github,
+            self.repo_configs,
+        )
+        context["repo_config"]["ignore_resource_card_section"] = False
+
+        analyze_source_changes(
+            context,
+            github,
+            special_files=["TOC.md", "keywords.md"],
+            ignore_files=[],
+            repo_configs=self.repo_configs,
+        )
+
+        source_diff = json.loads(self.generated_file.read_text(encoding="utf-8"))
+        self.assertIn("added_7", source_diff)
+        self.assertIn("<RelatedResources>", source_diff["added_7"]["new_content"])
+        self.assertIn("<ResourceCard", source_diff["added_7"]["new_content"])
+
+    def test_commit_related_resources_inside_code_block_is_not_filtered(self):
+        file_path = "guide.md"
+        base_content = "# Guide\n\n## Examples\n\nOld examples.\n"
+        head_content = "\n".join(
+            [
+                "# Guide",
+                "",
+                "## Examples",
+                "",
+                "Old examples.",
+                "",
+                "```html",
+                "<RelatedResources>",
+                '  <ResourceCard title="Demo" />',
+                "</RelatedResources>",
+                "```",
+                "",
+            ]
+        )
+        patch = "\n".join(
+            [
+                "@@ -3,3 +3,10 @@",
+                " ## Examples",
+                " ",
+                " Old examples.",
+                "+",
+                "+```html",
+                "+<RelatedResources>",
+                '+  <ResourceCard title="Demo" />',
+                "+</RelatedResources>",
+                "+```",
+            ]
+        )
+        changed_file = SimpleNamespace(
+            filename=file_path,
+            status="modified",
+            patch=patch,
+            previous_filename=None,
+        )
+        repository = FakeRepository(
+            {
+                (file_path, "base123"): base_content,
+                (file_path, "head123"): head_content,
+            },
+            FakePR([changed_file], "Add example", "base123", "head123"),
+            {("base123", "head123"): [changed_file]},
+        )
+        github = FakeGithub({"acme/docs": repository})
+        context = build_commit_diff_context(
+            "acme/docs",
+            "acme/docs-cn",
+            "base123",
+            "head123",
+            github,
+            self.repo_configs,
+        )
+
+        analyze_source_changes(
+            context,
+            github,
+            special_files=["TOC.md", "keywords.md"],
+            ignore_files=[],
+            repo_configs=self.repo_configs,
+        )
+
+        source_diff = json.loads(self.generated_file.read_text(encoding="utf-8"))
+        self.assertIn("modified_3", source_diff)
+        self.assertIn("<RelatedResources>", source_diff["modified_3"]["new_content"])
+
+    def test_related_resources_diff_filter_keeps_other_section_changes(self):
+        base_content = "\n".join(
+            [
+                "# Guide",
+                "",
+                "## Usage",
+                "",
+                "Old usage.",
+                "",
+                "## Related resources",
+                "",
+                "<RelatedResources>",
+                '  <ResourceCard title="Old" />',
+                "</RelatedResources>",
+                "",
+            ]
+        )
+        head_content = base_content.replace("Old usage.", "New usage.").replace(
+            'title="Old"',
+            'title="New"',
+        )
+        diff_text = "\n".join(
+            [
+                "File: guide.md",
+                "@@ -3,9 +3,9 @@",
+                " ## Usage",
+                " ",
+                "-Old usage.",
+                "+New usage.",
+                " ",
+                " ## Related resources",
+                " ",
+                " <RelatedResources>",
+                '-  <ResourceCard title="Old" />',
+                '+  <ResourceCard title="New" />',
+                " </RelatedResources>",
+            ]
+        )
+
+        filtered_diff = filter_related_resources_resource_card_diff(
+            diff_text,
+            base_content,
+            head_content,
+        )
+
+        self.assertIn("-Old usage.", filtered_diff)
+        self.assertIn("+New usage.", filtered_diff)
+        self.assertNotIn("Related resources", filtered_diff)
+        self.assertNotIn("RelatedResources", filtered_diff)
+        self.assertNotIn("ResourceCard", filtered_diff)
+
+    def test_commit_added_file_strips_multiple_related_resources_sections(self):
+        file_path = "new-guide.md"
+        file_content = "\n".join(
+            [
+                "# New Guide",
+                "",
+                "## Related resources",
+                "",
+                "<RelatedResources>",
+                '  <ResourceCard title="Example A" type="blog" link="https://example.com/a" />',
+                "</RelatedResources>",
+                "",
+                "## Usage",
+                "",
+                "Use TiDB.",
+                "",
+                "## More resources",
+                "",
+                "<RelatedResources>",
+                '  <ResourceCard title="Example B" type="blog" link="https://example.com/b" />',
+                "</RelatedResources>",
+                "",
+            ]
+        )
+        changed_file = SimpleNamespace(
+            filename=file_path,
+            status="added",
+            patch="",
+            previous_filename=None,
+        )
+        repository = FakeRepository(
+            {
+                (file_path, "head123"): file_content,
+            },
+            FakePR([changed_file], "Add guide", "base123", "head123"),
+            {("base123", "head123"): [changed_file]},
+        )
+        github = FakeGithub({"acme/docs": repository})
+        context = build_commit_diff_context(
+            "acme/docs",
+            "acme/docs-cn",
+            "base123",
+            "head123",
+            github,
+            self.repo_configs,
+        )
+
+        (
+            added_sections,
+            modified_sections,
+            deleted_sections,
+            added_files,
+            deleted_files,
+            toc_files,
+            keyword_files,
+            added_images,
+            modified_images,
+            deleted_images,
+        ) = analyze_source_changes(
+            context,
+            github,
+            special_files=["TOC.md", "keywords.md"],
+            ignore_files=[],
+            repo_configs=self.repo_configs,
+        )
+
+        self.assertEqual(added_sections, {})
+        self.assertEqual(modified_sections, {})
+        self.assertEqual(deleted_sections, {})
+        self.assertIn(file_path, added_files)
+        self.assertIn("## Usage", added_files[file_path])
+        self.assertNotIn("RelatedResources", added_files[file_path])
+        self.assertNotIn("ResourceCard", added_files[file_path])
+        self.assertEqual(deleted_files, [])
+        self.assertEqual(toc_files, {})
+        self.assertEqual(keyword_files, {})
+        self.assertEqual(added_images, [])
+        self.assertEqual(modified_images, [])
+        self.assertEqual(deleted_images, [])
+
+    def test_commit_renamed_file_strips_related_resources_section(self):
+        file_path = "new-guide.md"
+        file_content = "\n".join(
+            [
+                "# New Guide",
+                "",
+                "## Usage",
+                "",
+                "Use TiDB.",
+                "",
+                "## Related resources",
+                "",
+                "<RelatedResources>",
+                '  <ResourceCard title="Example" type="blog" link="https://example.com" />',
+                "</RelatedResources>",
+                "",
+            ]
+        )
+        changed_file = SimpleNamespace(
+            filename=file_path,
+            status="renamed",
+            patch="",
+            previous_filename="old-guide.md",
+        )
+        repository = FakeRepository(
+            {
+                (file_path, "head123"): file_content,
+            },
+            FakePR([changed_file], "Rename guide", "base123", "head123"),
+            {("base123", "head123"): [changed_file]},
+        )
+        github = FakeGithub({"acme/docs": repository})
+        context = build_commit_diff_context(
+            "acme/docs",
+            "acme/docs-cn",
+            "base123",
+            "head123",
+            github,
+            self.repo_configs,
+        )
+
+        (
+            added_sections,
+            modified_sections,
+            deleted_sections,
+            added_files,
+            deleted_files,
+            toc_files,
+            keyword_files,
+            added_images,
+            modified_images,
+            deleted_images,
+        ) = analyze_source_changes(
+            context,
+            github,
+            special_files=["TOC.md", "keywords.md"],
+            ignore_files=[],
+            repo_configs=self.repo_configs,
+        )
+
+        self.assertEqual(added_sections, {})
+        self.assertEqual(modified_sections, {})
+        self.assertEqual(deleted_sections, {})
+        self.assertEqual(deleted_files, ["old-guide.md"])
+        self.assertIn(file_path, added_files)
+        self.assertIn("## Usage", added_files[file_path])
+        self.assertNotIn("RelatedResources", added_files[file_path])
+        self.assertNotIn("ResourceCard", added_files[file_path])
+        self.assertEqual(toc_files, {})
+        self.assertEqual(keyword_files, {})
+        self.assertEqual(added_images, [])
+        self.assertEqual(modified_images, [])
+        self.assertEqual(deleted_images, [])
 
     def test_bottom_modified_keeps_matching_hierarchy_in_source_diff_dict(self):
         base_content = "# Title\n\n## Section\nOld text\n"

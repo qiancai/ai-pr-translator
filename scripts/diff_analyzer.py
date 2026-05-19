@@ -102,6 +102,34 @@ def get_repo_config(pr_url, repo_configs):
     return config
 
 
+def is_yes_option_enabled(value, default=True):
+    """Interpret Yes/No style workflow options."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return default
+    if normalized in {"no", "false", "0", "n", "off"}:
+        return False
+    if normalized in {"yes", "true", "1", "y", "on"}:
+        return True
+    return default
+
+
+def should_ignore_related_resources_resource_card_sections(source_context):
+    """Return True when commit mode should skip language-specific resources."""
+    if not isinstance(source_context, dict) or source_context.get("mode") != "commit":
+        return False
+    repo_config = source_context.get("repo_config") or {}
+    return is_yes_option_enabled(
+        repo_config.get("ignore_resource_card_section", True),
+        default=True,
+    )
+
+
 def build_diff_text(changed_files):
     """Render a unified diff text block from normalized changed files."""
     diff_content = []
@@ -873,6 +901,50 @@ def build_hierarchy_for_modified_section(file_content, target_line_num, original
     
     return hierarchy_line if hierarchy_line else None
 
+
+def get_fence_marker(line):
+    """Return a markdown fence marker for code block boundaries."""
+    match = re.match(r'^(`{3,}|~{3,})', (line or "").strip())
+    return match.group(1) if match else None
+
+
+def find_section_end_index(lines, start_index, current_level, stop_level1_at_next_heading=False):
+    """Find the 0-based exclusive end index for a markdown section.
+
+    By default, a level-1 heading owns the document until the next level-1
+    heading. Some call sites need title-like behavior where a level-1 heading
+    stops at the first child heading; pass stop_level1_at_next_heading=True for
+    that narrower boundary.
+    """
+    in_code_block = False
+    code_block_delimiter = None
+
+    for index in range(start_index + 1, len(lines)):
+        raw_line = lines[index]
+        stripped_line = raw_line.strip()
+        fence_marker = get_fence_marker(stripped_line)
+
+        if fence_marker:
+            if not in_code_block:
+                in_code_block = True
+                code_block_delimiter = fence_marker
+            elif stripped_line.startswith(code_block_delimiter):
+                in_code_block = False
+                code_block_delimiter = None
+            continue
+
+        if in_code_block or not is_markdown_heading(raw_line):
+            continue
+
+        line_level = len(stripped_line.split()[0]) if stripped_line.split() else 0
+        if line_level <= current_level or (
+            stop_level1_at_next_heading and current_level == 1
+        ):
+            return index
+
+    return len(lines)
+
+
 def find_section_boundaries(lines, hierarchy_dict):
     """Find the start and end line for each section based on hierarchy"""
     section_boundaries = {}
@@ -883,9 +955,6 @@ def find_section_boundaries(lines, hierarchy_dict):
     for i, (line_num, hierarchy) in enumerate(sorted_sections):
         start_line = int(line_num) - 1  # Convert to 0-based index
         
-        # Find end line (start of next section at same or higher level)
-        end_line = len(lines)  # Default to end of document
-        
         if start_line >= len(lines):
             continue
             
@@ -895,15 +964,7 @@ def find_section_boundaries(lines, hierarchy_dict):
             continue
             
         current_level = len(current_line.split()[0])  # Count # characters
-        
-        # Look for next section at same or higher level
-        for j in range(start_line + 1, len(lines)):
-            line = lines[j].strip()
-            if line.startswith('#'):
-                line_level = len(line.split()[0]) if line.split() else 0
-                if line_level <= current_level:
-                    end_line = j
-                    break
+        end_line = find_section_end_index(lines, start_line, current_level)
         
         section_boundaries[line_num] = {
             'start': start_line,
@@ -913,6 +974,218 @@ def find_section_boundaries(lines, hierarchy_dict):
         }
     
     return section_boundaries
+
+
+RELATED_RESOURCES_RESOURCE_CARD_RE = re.compile(
+    r"<RelatedResources\b[^>]*>.*?<ResourceCard\b.*?</RelatedResources\s*>",
+    re.DOTALL,
+)
+
+
+def remove_fenced_code_blocks(content):
+    """Return content with markdown fenced code blocks removed."""
+    lines = split_normalized_lines(content)
+    kept_lines = []
+    in_code_block = False
+    code_block_delimiter = None
+
+    for line in lines:
+        stripped_line = line.strip()
+        fence_marker = get_fence_marker(stripped_line)
+
+        if fence_marker:
+            if not in_code_block:
+                in_code_block = True
+                code_block_delimiter = fence_marker
+            elif stripped_line.startswith(code_block_delimiter):
+                in_code_block = False
+                code_block_delimiter = None
+            continue
+
+        if not in_code_block:
+            kept_lines.append(line)
+
+    return "\n".join(kept_lines)
+
+
+def contains_related_resources_resource_card_block(content):
+    """Return True for a RelatedResources block that contains ResourceCard."""
+    if not isinstance(content, str) or not content:
+        return False
+    searchable_content = remove_fenced_code_blocks(content)
+    return RELATED_RESOURCES_RESOURCE_CARD_RE.search(searchable_content) is not None
+
+
+def find_related_resources_resource_card_sections(file_content):
+    """Find markdown sections that contain RelatedResources ResourceCard blocks."""
+    lines = split_normalized_lines(file_content)
+    hierarchy_dict = build_hierarchy_dict(file_content)
+    matching_sections = []
+
+    for line_num, hierarchy in sorted(hierarchy_dict.items(), key=lambda item: int(item[0])):
+        start = int(line_num) - 1
+        if start < 0 or start >= len(lines):
+            continue
+
+        current_line = lines[start].strip()
+        if not is_markdown_heading(lines[start]):
+            continue
+
+        current_level = len(current_line.split()[0])
+        end = find_section_end_index(
+            lines,
+            start,
+            current_level,
+            stop_level1_at_next_heading=True,
+        )
+
+        section_content = "\n".join(lines[start:end])
+        if contains_related_resources_resource_card_block(section_content):
+            matching_sections.append(
+                {
+                    "line_number": int(line_num),
+                    "hierarchy": hierarchy,
+                    "start": start,
+                    "end": end,
+                }
+            )
+
+    return matching_sections
+
+
+def remove_related_resources_resource_card_sections(file_content):
+    """Remove language-specific RelatedResources sections from source content."""
+    matching_sections = find_related_resources_resource_card_sections(file_content)
+    if not matching_sections:
+        return file_content, []
+
+    lines = split_normalized_lines(file_content)
+    removed_line_indexes = set()
+    for section in matching_sections:
+        removed_line_indexes.update(range(section["start"], section["end"]))
+
+    kept_lines = [
+        line
+        for index, line in enumerate(lines)
+        if index not in removed_line_indexes
+    ]
+    while kept_lines and not kept_lines[-1].strip():
+        kept_lines.pop()
+
+    stripped_content = "\n".join(kept_lines)
+    if stripped_content and file_content.endswith(("\n", "\r")):
+        stripped_content += "\n"
+
+    return stripped_content, matching_sections
+
+
+def build_related_resources_resource_card_line_ranges(file_content):
+    """Return 1-based line ranges for RelatedResources ResourceCard sections."""
+    return [
+        (section["start"] + 1, section["end"] + 1)
+        for section in find_related_resources_resource_card_sections(file_content)
+    ]
+
+
+def line_number_in_ranges(line_number, ranges):
+    """Return True if a 1-based line number is inside any [start, end) range."""
+    return any(start <= line_number < end for start, end in ranges)
+
+
+def filter_related_resources_resource_card_diff(diff_text, base_content, head_content):
+    """Remove RelatedResources section lines from a unified diff for AI prompts."""
+    if not diff_text:
+        return diff_text
+
+    base_ranges = build_related_resources_resource_card_line_ranges(base_content)
+    head_ranges = build_related_resources_resource_card_line_ranges(head_content)
+    if not base_ranges and not head_ranges:
+        return diff_text
+
+    filtered_lines = []
+    old_line_number = None
+    new_line_number = None
+
+    for line in diff_text.splitlines():
+        if line.startswith("@@"):
+            match = re.search(r'-(\d+),?(\d+)?\s+\+(\d+),?(\d+)?', line)
+            if match:
+                old_line_number = int(match.group(1))
+                new_line_number = int(match.group(3))
+            filtered_lines.append(line)
+            continue
+
+        if line.startswith(("+++", "---")):
+            filtered_lines.append(line)
+            continue
+
+        if line.startswith("+"):
+            should_skip = (
+                new_line_number is not None
+                and line_number_in_ranges(new_line_number, head_ranges)
+            )
+            if not should_skip:
+                filtered_lines.append(line)
+            if new_line_number is not None:
+                new_line_number += 1
+            continue
+
+        if line.startswith("-"):
+            should_skip = (
+                old_line_number is not None
+                and line_number_in_ranges(old_line_number, base_ranges)
+            )
+            if not should_skip:
+                filtered_lines.append(line)
+            if old_line_number is not None:
+                old_line_number += 1
+            continue
+
+        if line.startswith(" "):
+            should_skip = (
+                old_line_number is not None
+                and new_line_number is not None
+                and (
+                    line_number_in_ranges(old_line_number, base_ranges)
+                    or line_number_in_ranges(new_line_number, head_ranges)
+                )
+            )
+            if not should_skip:
+                filtered_lines.append(line)
+            if old_line_number is not None:
+                old_line_number += 1
+            if new_line_number is not None:
+                new_line_number += 1
+            continue
+
+        filtered_lines.append(line)
+
+    return "\n".join(filtered_lines)
+
+
+def filter_related_resources_resource_card_source_diff(source_diff_dict):
+    """Drop source-diff entries for language-specific RelatedResources sections."""
+    filtered = {}
+    skipped_entries = []
+
+    for key, diff_info in source_diff_dict.items():
+        if not isinstance(diff_info, dict):
+            filtered[key] = diff_info
+            continue
+
+        old_content = diff_info.get("old_content") or ""
+        new_content = diff_info.get("new_content") or ""
+        if (
+            contains_related_resources_resource_card_block(old_content)
+            or contains_related_resources_resource_card_block(new_content)
+        ):
+            skipped_entries.append((key, diff_info))
+            continue
+
+        filtered[key] = diff_info
+
+    return filtered, skipped_entries
+
 
 def extract_section_content(lines, start_line, hierarchy_dict):
     """Extract the content of a section starting from start_line (includes sub-sections)"""
@@ -2057,6 +2330,21 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
             print(f"   ➕ Detected new file: {file.filename}")
             try:
                 file_content = repository.get_contents(file.filename, ref=head_ref).decoded_content.decode('utf-8')
+                if should_ignore_related_resources_resource_card_sections(source_context):
+                    file_content, skipped_sections = remove_related_resources_resource_card_sections(file_content)
+                    if skipped_sections:
+                        print(
+                            f"   🧹 Skipped {len(skipped_sections)} RelatedResources section(s) "
+                            "from added commit-mode file"
+                        )
+                        for section in skipped_sections:
+                            print(f"      - {section['hierarchy']}")
+                    if not file_content.strip():
+                        print(
+                            "   ⏭️  Skipping added file because no translatable content remains "
+                            "after RelatedResources filtering"
+                        )
+                        continue
                 added_files[file.filename] = file_content
                 print(f"   ✅ Added complete file for translation")
                 continue
@@ -2080,6 +2368,21 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
 
             try:
                 file_content = repository.get_contents(file.filename, ref=head_ref).decoded_content.decode('utf-8')
+                if should_ignore_related_resources_resource_card_sections(source_context):
+                    file_content, skipped_sections = remove_related_resources_resource_card_sections(file_content)
+                    if skipped_sections:
+                        print(
+                            f"   🧹 Skipped {len(skipped_sections)} RelatedResources section(s) "
+                            "from renamed commit-mode file"
+                        )
+                        for section in skipped_sections:
+                            print(f"      - {section['hierarchy']}")
+                    if not file_content.strip():
+                        print(
+                            "   ⏭️  Skipping renamed file because no translatable content remains "
+                            "after RelatedResources filtering"
+                        )
+                        continue
                 added_files[file.filename] = file_content
                 print(f"   ✅ Treating renamed markdown as delete old + add new")
             except Exception as e:
@@ -2554,6 +2857,26 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
             if not source_diff_dict:
                 print(f"   ⏭️  No non-tabs section content remains after normalization")
                 continue
+
+        if should_ignore_related_resources_resource_card_sections(source_context):
+            source_diff_dict, skipped_related_entries = filter_related_resources_resource_card_source_diff(
+                source_diff_dict
+            )
+            if skipped_related_entries:
+                print(
+                    f"   🧹 Skipped {len(skipped_related_entries)} RelatedResources section(s) "
+                    "from commit-mode diff analysis"
+                )
+                for key, diff_info in skipped_related_entries:
+                    print(
+                        f"      - {key}: {diff_info.get('original_hierarchy', '')}"
+                    )
+                if not source_diff_dict:
+                    print(
+                        "   ⏭️  No translatable section changes remain after "
+                        "RelatedResources filtering"
+                    )
+                    continue
         
         # Breakpoint: Output source_diff_dict to file for review with file prefix
         
