@@ -141,21 +141,28 @@ def translate_file_batch(batch_content, ai_client, source_language="English", ta
 
     doc_variable_example = "{{{ .starter }}}"
 
-    prompt = f"""You are a senior technical writer. Please translate the following document content from {source_language} to {target_language}.
+    prompt = f"""You are an expert technical writer in the database domain, proficient in writing clear, concise, and easy-to-understand user documentation.
+
+Your task is to translate the following TiDB document content from {source_language} to {target_language}.
 
 IMPORTANT INSTRUCTIONS:
 1. Preserve ALL Markdown formatting (headers, links, code blocks, tables, etc.)
 2. Do NOT translate:
    - Code examples, SQL queries, configuration values, doc variables/placeholders such as {doc_variable_example}, and Mermaid diagram code blocks (```mermaid ... ```). Preserve doc variables exactly as they appear, including triple braces and when they appear inside HTML attributes or tab labels.
-   - Explicit heading anchors such as {{#example-test}} in the section titles.
+   - Explicit anchors such as {{#example-test}} in the section titles.
    - Technical terms like "TiDB", "TiKV", "PD", API names, etc.
    - File paths, URLs, and command line examples
    - Variable names and system configuration parameters
    - Some text wrapped in ** (such as **Create Resource** on the **My TiDB** page) are UI button or label names, keep them in English if the context of that paragraph indicates that it is UI text.
-3. Translate only the descriptive text and explanations (for such content, you can rewrite it from {source_language} to {target_language} in a more natural and fluent way without changing its original meaning)
+3. Translate only the descriptive text and explanations (for such content, you can rewrite it from {source_language} to {target_language} in a more natural and fluent way without changing its original meaning).
+
+    - If the {target_language} is English, use title case for #-level titles and sentence case for titles at ## level or deeper. Otherwise, skip this rule.
+
 4. Maintain the exact structure and indentation
 5. Keep all special characters and formatting intact
 {glossary_instruction}
+
+Input:
 
 Glossary for terms in {source_language} and {target_language}:
 {glossary_prompt_section}

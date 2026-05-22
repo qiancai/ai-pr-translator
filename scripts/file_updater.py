@@ -766,7 +766,7 @@ def _prepare_translation_prompt(
             thread_safe_print(f"   📚 Matched {len(matched_terms)} glossary terms for prompt")
 
     prompt = f"""````markdown
-You are an expert technical writer in the Database domain, proficient in writing clear, concise, and easy-to-understand user documentation.
+You are an expert technical writer in the database domain, proficient in writing clear, concise, and easy-to-understand user documentation.
 
 TiDB user documentation is maintained in both {source_language} and {target_language}. Some content in the {source_language} documentation has been updated through a Git diff, and the corresponding content in {target_language} needs to be updated accordingly.
 
