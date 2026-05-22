@@ -146,7 +146,7 @@ def translate_file_batch(batch_content, ai_client, source_language="English", ta
 IMPORTANT INSTRUCTIONS:
 1. Preserve ALL Markdown formatting (headers, links, code blocks, tables, etc.)
 2. Do NOT translate:
-   - Code examples, SQL queries, configuration values, and doc variables/placeholders such as {doc_variable_example}. Preserve doc variables exactly as they appear, including triple braces and when they appear inside HTML attributes or tab labels.
+   - Code examples, SQL queries, configuration values, doc variables/placeholders such as {doc_variable_example}, and Mermaid diagram code blocks (```mermaid ... ```). Preserve doc variables exactly as they appear, including triple braces and when they appear inside HTML attributes or tab labels.
    - Explicit heading anchors such as {{#example-test}} in the section titles.
    - Technical terms like "TiDB", "TiKV", "PD", API names, etc.
    - File paths, URLs, and command line examples
