@@ -19,6 +19,7 @@ AI_PROVIDER = os.getenv("AI_PROVIDER", "deepseek")
 TARGET_REPO_PATH = os.getenv("TARGET_REPO_PATH")
 SOURCE_FILES = os.getenv("SOURCE_FILES", "")
 SKIP_GIT_ADD = os.getenv("SKIP_GIT_ADD", "false").lower() == "true"
+PREFER_LOCAL_TARGET_FOR_READ = os.getenv("PREFER_LOCAL_TARGET_FOR_READ", "false").lower() == "true"
 TIDB_CLOUD_ABSOLUTE_LINK_PREFIX = os.getenv(
     "TIDB_CLOUD_ABSOLUTE_LINK_PREFIX",
     "https://docs.pingcap.com/tidbcloud/",
@@ -98,7 +99,7 @@ def get_workflow_repo_configs():
         source_repo_key: {
             "target_repo": target_repo_key,
             "target_local_path": TARGET_REPO_PATH,
-            "prefer_local_target_for_read": False,
+            "prefer_local_target_for_read": PREFER_LOCAL_TARGET_FOR_READ,
             "source_mode": "pr",
             "source_language": source_language,
             "target_language": target_language
@@ -833,6 +834,7 @@ def main():
     thread_safe_print(f"📍 Target PR URL: {TARGET_PR_URL}")
     thread_safe_print(f"🤖 AI Provider: {AI_PROVIDER}")
     thread_safe_print(f"📁 Target Repo Path: {TARGET_REPO_PATH}")
+    thread_safe_print(f"📖 Prefer Local Target Read: {PREFER_LOCAL_TARGET_FOR_READ}")
     
     # Clean and prepare temp_output directory
     clean_temp_output_dir()

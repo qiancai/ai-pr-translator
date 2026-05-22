@@ -762,15 +762,82 @@ def _prepare_translation_prompt(
         if matched_terms:
             glossary_text = format_terms_for_prompt(matched_terms)
             glossary_prompt_section = f"\n4. {glossary_text}\n"
-            glossary_instruction = "\n6. When translating terms listed in the glossary above, use the provided translations for consistency."
+            glossary_instruction = "\nWhen translating the target content, use the translations of the terms provided below to maintain consistency."
             thread_safe_print(f"   📚 Matched {len(matched_terms)} glossary terms for prompt")
 
-    prompt = f"""You are a professional technical writer in the Database domain. I will provide you with:
+    prompt = f"""````markdown
+You are an expert technical writer in the Database domain, proficient in writing clear, concise, and easy-to-understand user documentation.
+
+TiDB user documentation is maintained in both {source_language} and {target_language}. Some content in the {source_language} documentation has been updated through a Git diff, and the corresponding content in {target_language} needs to be updated accordingly.
+
+Your task is to update the target sections in {target_language} according to the Git diff in {source_language}. I will provide:
+- The latest source sections in {source_language}
+- The Git diff in {source_language}
+- The current target sections in {target_language}
+- The glossary for terms in both languages
+
+CORE PRINCIPLE:
+Treat the Git diff as the ONLY source of truth for determining what needs to be modified in the target content. In the target sections, do not introduce any changes that are not directly changed by the diff. Any content not directly changed by the diff must remain byte-for-byte unchanged in the target language output.
+
+Instructions:
+
+1. Analyze the diff precisely
+   - The source sections already represent the FINAL state after the diff is applied.
+   - The Git diff contains:
+     - Added or updated source lines (beginning with "+")
+     - Removed or replaced source lines (beginning with "-")
+     - Unchanged context lines (Lines without diff markers)
+   - Only lines that are changed in the diff are eligible for modification in the target language.
+   - Unchanged context lines are NOT eligible for any modification in the target language.
+
+2. Apply STRICT minimal edits in {target_language}
+   - Update ONLY the target-language content corresponding to actual changed source-language content.
+   - Modify only the minimum necessary text required by the diff.
+   - Do NOT rewrite entire paragraphs, lists, or sections if only a small fragment changed.
+   - If a paragraph contains both changed and unchanged sentences:
+     - Modify only the sentence fragments required by the diff
+     - Preserve all other text exactly as-is
+
+3. For lines not included in the diff or the unchanged context lines in the diff, do not modify them in {target_language}, which means:
+     - Do not retranslate them.
+     - Do not normalize whitespace or punctuation.
+     - Do not adjust terminology.
+     - Even if the translation of an unchanged line in {source_language} is not included in the target section, do not added that line to the target section unless the corresponding source line appears as an added line (lines beginning with "+") in the Git diff.
+     - Even if the current translation of an unchanged line in {source_language} does not perfectly match the latest source content, leave it unchanged in the target section unless the corresponding source line appears as an added line (lines beginning with "+") in the Git diff.
+
+4. For changed lines in {source_language}, follow the translation rules below:
+
+    - Preserve ALL Markdown formatting (headers, links, code blocks, tables, etc.)
+    - Do NOT translate:
+        - Code examples, SQL queries, configuration values, doc variables/placeholders such as {DOC_VARIABLE_EXAMPLE}, and Mermaid diagram code blocks (```mermaid ... ```). Preserve doc variables exactly as they appear, including triple braces and when they appear inside HTML attributes or tab labels.
+        - Explicit heading anchors such as {{#example-test}} in the section titles.
+        - Technical terms like "TiDB", "TiKV", "PD", API names, etc.
+        - HTML/MDX component tags, including tag names, attributes, and closing tags, such as <CustomContent plan="premium"> and </CustomContent>.
+        - File paths, URLs, and command line examples
+        - Variable names and system configuration parameters
+        - Some text wrapped in ** (such as **Create Resource** on the **My TiDB** page) are UI button or label names, keep them in English if the context of that paragraph indicates that it is UI text.
+    - Translate only the descriptive text and explanations (for such content, you can rewrite it from {source_language} to {target_language} in a more natural and fluent way without changing its original meaning)
+    - Maintain the exact structure and indentation
+    - Keep all special characters and formatting intact
+    - {glossary_instruction}
+
+5. Keep the JSON structure unchanged, only modify section content where required by the diff.
+
+6. Conflict-resolution priority
+
+    When rules conflict, follow this priority order:
+    1. Preserve unchanged target content exactly
+    2. Apply minimal edits in {target_language} according to specifically changed lines in {target_language}
+    3. Maintain valid syntax/formatting
+
+Input:
 
 1. Latest source sections in {source_language}:
 {formatted_source_sections}
 
-2. GitHub PR changes (Diff):
+Note: These sections are provided only to understand the final source context. Do not use them to introduce any target-language changes unless the exact source lines are changed in the Git diff.
+
+2. GitHub PR changes (Git Diff):
 {prompt_pr_diff}
 
 3. Current target sections in {target_language}:
@@ -779,21 +846,8 @@ def _prepare_translation_prompt(
 4. Glossary for terms in {source_language} and {target_language}:
 {glossary_prompt_section}
 
-Task: Update the target sections in {target_language} according to the diff in {source_language}.
-
-Instructions:
-1. The source sections above show the final state after the diff was applied. Carefully analyze the PR diff to identify exactly which source lines and words changed in {source_language}. Make sure the returned translation covers ALL content in each source section — do not omit any paragraph or sentence.
-2. According to the diff, identify the lines that should be updated accordingly in {target_language}. For lines that needs to be updated in {target_language}, apply the corresponding minimal edits according to the diff. For lines not changed or not included in the diff, make sure to keep the corresponding target lines byte-for-byte identical (same wording, punctuation, spacing, indentation, list markers, and line breaks), which means Do Not add, remove, or modify lines not included in the diff. Never rewrite style, improve wording, or rephrase unaffected content.
-3. Translation rules:
-   - Preserve doc variables/placeholders exactly as they appear, including triple braces, such as {DOC_VARIABLE_EXAMPLE}. This also applies when they appear inside HTML attributes or tab labels.
-   - Preserve content inside Mermaid diagram code blocks (```mermaid ... ```) in English.
-   - Preserve HTML/MDX component tags exactly as they appear, including tag names, attributes, and closing tags, such as <CustomContent plan="premium"> and </CustomContent>.
-   - Keep UI button/label names wrapped in ** such as **My TiDB** in English.
-   - Preserve explicit heading anchors such as {{#example-test}} exactly as they appear.
-4. Keep the JSON structure unchanged, only modify section content where required by the diff.
-5. Ensure updated target content is logically consistent with the source diff. If uncertain, prefer leaving a line unchanged rather than rewriting.{glossary_instruction}
-
-Please return the complete updated JSON in the same format as target sections, without any additional explanatory text."""
+Please return the complete updated JSON in the same format as target sections, without any additional explanatory text.
+````"""
 
     return prompt, prompt_pr_diff
 
@@ -807,7 +861,7 @@ def _execute_ai_translation(
     formatted_source_preview = ""
     formatted_target_preview = ""
     try:
-        src_json = json.loads(prompt.split("1. Source sections in")[1].split("\n2. GitHub PR changes")[0].strip().rsplit("\n", 1)[0])
+        src_json = json.loads(prompt.split("1. Latest source sections in")[1].split("\n2. GitHub PR changes (Git Diff):")[0].strip().rsplit("\n", 1)[0])
         formatted_source_preview = json.dumps(src_json, ensure_ascii=False, indent=2)[:500]
     except Exception:
         formatted_source_preview = "(preview unavailable)"
