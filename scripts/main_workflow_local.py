@@ -13,7 +13,10 @@ SOURCE_PR_URL = "https://github.com/pingcap/docs-cn/pull/21454"
 AI_PROVIDER = "deepseek"  # Options: "deepseek", "gemini", "openai", "azure"
 
 # Optional local scope filter. Separate multiple source files with commas.
-SOURCE_FILES = "TOC.md"
+SOURCE_FILES = "pessimistic-transaction.md"
+
+# Read target-language document content from the local checkout when available.
+PREFER_LOCAL_TARGET_FOR_READ = True
 
 DOCS_CN_LOCAL_PATH = "/Users/grcai/Documents/GitHub/docs-cn"
 DOCS_LOCAL_PATH = "/Users/grcai/Documents/GitHub/docs"
@@ -85,6 +88,7 @@ def main():
         "TARGET_REPO_PATH": target["target_repo_path"],
         "AI_PROVIDER": AI_PROVIDER,
         "SOURCE_FILES": SOURCE_FILES,
+        "PREFER_LOCAL_TARGET_FOR_READ": str(PREFER_LOCAL_TARGET_FOR_READ).lower(),
         "TERMS_PATH": TERMS_PATH,
         "TIDB_CLOUD_ABSOLUTE_LINK_PREFIX": TIDB_CLOUD_ABSOLUTE_LINK_PREFIX,
         "SKIP_GIT_ADD": str(SKIP_GIT_ADD).lower(),
