@@ -49,6 +49,38 @@ def _custom_content_data(file_path, source_content, target_content, match=True, 
 
 
 class VerifyTranslationReportTest(unittest.TestCase):
+    def test_noop_line_change_pairs_ignore_eof_newline_noise(self):
+        patch = "\n".join(
+            [
+                "@@ -220,2 +220,2 @@",
+                '-    <td style="text-align:center;">❌</td>',
+                '-    <td style="text-align:center;">❌</td>',
+                '+    <td style="text-align:center;">✅</td>',
+                '+    <td style="text-align:center;">✅</td>',
+                "@@ -385 +385 @@",
+                '-> To request a feature in private preview, click **?**.',
+                "\\ No newline at end of file",
+                '+> To request a feature in private preview, click **?**.',
+            ]
+        )
+        stats = {
+            "tidb-cloud/features.md": {
+                "status": "modified",
+                "additions": 3,
+                "deletions": 3,
+                "changes": 6,
+                "is_md": True,
+            }
+        }
+
+        verify_translation._apply_noop_line_change_adjustments(
+            stats, {"tidb-cloud/features.md": patch}
+        )
+
+        self.assertEqual(2, stats["tidb-cloud/features.md"]["additions"])
+        self.assertEqual(2, stats["tidb-cloud/features.md"]["deletions"])
+        self.assertEqual(4, stats["tidb-cloud/features.md"]["changes"])
+
     def test_collect_custom_content_structures_parallel_preserves_input_order(self):
         contents = {
             ("source", "wrapped.md"): '<CustomContent plan="essential">\n</CustomContent>\n',

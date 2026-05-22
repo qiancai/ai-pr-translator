@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import sys
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
@@ -43,10 +44,10 @@ from translation_structure_validator import (
 MODE = "commit-based"
 
 SOURCE_COMMIT_COMPARE = (
-    "https://github.com/pingcap/docs/compare/992bd07e5f8fd1b88460ad98020632d12048c146...aa63093b1a90c6d816373829ab86a485b41d8071"
+    "https://github.com/pingcap/docs/compare/aa63093b1a90c6d816373829ab86a485b41d8071...1a75af9f55e1488abdfb9d4c6ab8b2a58849f9db"
 )
 SOURCE_PR = ""
-TARGET_PR = "https://github.com/pingcap/docs/pull/22884"
+TARGET_PR = "https://github.com/pingcap/docs/pull/22917"
 
 # Optional: local clone of the source repo.  When set, `git diff --numstat`
 # is used instead of the GitHub compare API, which avoids the 300-file cap.
@@ -96,14 +97,112 @@ def collect_file_stats(files):
     """Build a dict of {filename: stats} from GitHub file objects."""
     stats = {}
     for f in files:
+        noop_pairs = _count_noop_line_change_pairs(getattr(f, "patch", "") or "")
+        additions = max(0, f.additions - noop_pairs)
+        deletions = max(0, f.deletions - noop_pairs)
         stats[f.filename] = {
             "status": f.status,
-            "additions": f.additions,
-            "deletions": f.deletions,
-            "changes": f.changes,
+            "additions": additions,
+            "deletions": deletions,
+            "changes": additions + deletions,
             "is_md": f.filename.lower().endswith(".md"),
         }
     return stats
+
+
+def _count_noop_line_change_pairs(patch):
+    """Count changed line pairs that do not change content.
+
+    Git can report an unchanged final line as one deletion plus one addition
+    when only the EOF newline changed.  Those pairs are noise for translation
+    line-count comparison, so subtract them from both sides.
+    """
+    noop_pairs = 0
+    removed = []
+    added = []
+
+    def flush_change_block():
+        nonlocal noop_pairs, removed, added
+        if removed and added:
+            removed_counts = Counter(removed)
+            added_counts = Counter(added)
+            noop_pairs += sum(
+                min(count, added_counts[line])
+                for line, count in removed_counts.items()
+            )
+        removed = []
+        added = []
+
+    for line in patch.splitlines():
+        if line.startswith("@@"):
+            flush_change_block()
+            continue
+        if line.startswith("\\"):
+            continue
+        if line.startswith("-") and not line.startswith("--- "):
+            removed.append(line[1:])
+            continue
+        if line.startswith("+") and not line.startswith("+++ "):
+            added.append(line[1:])
+            continue
+        flush_change_block()
+
+    flush_change_block()
+    return noop_pairs
+
+
+def _normalize_diff_header_path(path):
+    path = path.strip()
+    if path == "/dev/null":
+        return path
+    if path.startswith("a/") or path.startswith("b/"):
+        return path[2:]
+    return path
+
+
+def _split_git_diff_patches(diff_output):
+    """Return {filename: patch_text} from a `git diff --patch` output."""
+    patches = {}
+    current_lines = []
+    old_path = None
+    new_path = None
+
+    def flush_file():
+        nonlocal current_lines, old_path, new_path
+        if not current_lines:
+            return
+        filepath = new_path if new_path and new_path != "/dev/null" else old_path
+        if filepath and filepath != "/dev/null":
+            patches[filepath] = "\n".join(current_lines)
+        current_lines = []
+        old_path = None
+        new_path = None
+
+    for line in diff_output.splitlines():
+        if line.startswith("diff --git "):
+            flush_file()
+        current_lines.append(line)
+        if line.startswith("--- "):
+            old_path = _normalize_diff_header_path(line[4:])
+        elif line.startswith("+++ "):
+            new_path = _normalize_diff_header_path(line[4:])
+
+    flush_file()
+    return patches
+
+
+def _apply_noop_line_change_adjustments(stats, patches):
+    for filename, patch in patches.items():
+        if filename not in stats:
+            continue
+        noop_pairs = _count_noop_line_change_pairs(patch)
+        if not noop_pairs:
+            continue
+        additions = max(0, stats[filename]["additions"] - noop_pairs)
+        deletions = max(0, stats[filename]["deletions"] - noop_pairs)
+        stats[filename]["additions"] = additions
+        stats[filename]["deletions"] = deletions
+        stats[filename]["changes"] = additions + deletions
 
 
 def _git_numstat(repo_path, base, head):
@@ -153,6 +252,11 @@ def _git_numstat(repo_path, base, head):
             "changes": additions + deletions,
             "is_md": filename.lower().endswith(".md"),
         }
+    patch_output = subprocess.check_output(
+        ["git", "-C", repo_path, "diff", "--unified=0", f"{base}...{head}"],
+        text=True,
+    )
+    _apply_noop_line_change_adjustments(stats, _split_git_diff_patches(patch_output))
     return stats
 
 
