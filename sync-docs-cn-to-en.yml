@@ -110,6 +110,7 @@ jobs:
           SOURCE_PR_URL: ${{ github.event.inputs.source_pr_url }}
           TARGET_PR_URL: ${{ github.event.inputs.target_pr_url }}
           AI_PROVIDER: ${{ github.event.inputs.ai_provider }}
+          PRODUCT: TiDB
           TARGET_REPO_PATH: ${{ github.workspace }}/target_repo
         run: |
           cd ai-pr-translator/scripts

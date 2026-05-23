@@ -9,7 +9,11 @@ from unittest import mock
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from file_adder import preprocess_added_file_batch_for_heading_anchor_stability, process_added_files
+from file_adder import (
+    preprocess_added_file_batch_for_heading_anchor_stability,
+    process_added_files,
+    translate_file_batch,
+)
 
 
 class FileAdderRegressionTest(unittest.TestCase):
@@ -113,6 +117,28 @@ class FileAdderRegressionTest(unittest.TestCase):
         self.assertEqual(
             processed,
             "See [Private Endpoints](https://docs.pingcap.com/tidbcloud/set-up-private-endpoint-connections-serverless2).",
+        )
+
+    def test_translate_file_batch_rewrites_tidb_version_anchor_in_pr_mode(self):
+        class FakeAIClient:
+            def chat_completion(self, messages, temperature=0.1):
+                return (
+                    "See [`tidb_enable_x`](/system-variables.md"
+                    "#tidb-enable-x-从-v800-版本开始引入)."
+                )
+
+        with mock.patch.dict(os.environ, {"PRODUCT": "TiDB"}, clear=False):
+            processed = translate_file_batch(
+                "请参见 [`tidb_enable_x`](/system-variables.md#tidb-enable-x-从-v800-版本开始引入)。",
+                FakeAIClient(),
+                source_language="Chinese",
+                target_language="English",
+                source_mode="pr",
+            )
+
+        self.assertEqual(
+            processed,
+            "See [`tidb_enable_x`](/system-variables.md#tidb-enable-x-new-in-v800).",
         )
 
     def test_process_added_files_can_overwrite_existing_target_file(self):

@@ -9,11 +9,12 @@ Fill in SOURCE_PR_URL and local paths, then run:
 import os
 
 
-SOURCE_PR_URL = "https://github.com/pingcap/docs-cn/pull/21454"
+SOURCE_PR_URL = "https://github.com/pingcap/docs-cn/pull/21605"
 AI_PROVIDER = "deepseek"  # Options: "deepseek", "gemini", "openai", "azure"
+PRODUCT = "TiDB"
 
 # Optional local scope filter. Separate multiple source files with commas.
-SOURCE_FILES = "pessimistic-transaction.md"
+SOURCE_FILES = "best-practices/tidb-best-practices.md"
 
 # Read target-language document content from the local checkout when available.
 PREFER_LOCAL_TARGET_FOR_READ = True
@@ -87,6 +88,7 @@ def main():
         "TARGET_PR_URL": target["target_pr_url"],
         "TARGET_REPO_PATH": target["target_repo_path"],
         "AI_PROVIDER": AI_PROVIDER,
+        "PRODUCT": PRODUCT,
         "SOURCE_FILES": SOURCE_FILES,
         "PREFER_LOCAL_TARGET_FOR_READ": str(PREFER_LOCAL_TARGET_FOR_READ).lower(),
         "TERMS_PATH": TERMS_PATH,

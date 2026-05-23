@@ -10,6 +10,7 @@ import threading
 from github import Github
 from openai import OpenAI
 from log_sanitizer import sanitize_exception_message
+from product_specific_handler import rewrite_tidb_version_anchors_in_text
 from svg_preprocessor import strip_svgs, restore_svgs
 
 # Thread-safe printing
@@ -200,6 +201,12 @@ Content to translate:
             temperature=0.1
         )
         translated_content = restore_svgs(translated_content, svg_map)
+        translated_content = rewrite_tidb_version_anchors_in_text(
+            translated_content,
+            source_language,
+            target_language,
+            source_mode=source_mode,
+        )
         thread_safe_print(f"   ✅ Batch translation completed")
         return translated_content
         

@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from github import Github
 from openai import OpenAI
 from log_sanitizer import sanitize_exception_message
+from product_specific_handler import rewrite_tidb_version_anchors_in_sections
 from special_file_utils import source_scope_includes_folder
 from svg_preprocessor import (
     strip_svgs,
@@ -854,7 +855,7 @@ Please return the complete updated JSON in the same format as target sections, w
 def _execute_ai_translation(
     prompt, ai_client, target_sections, pr_diff,
     target_file_prefix, prompt_suffix,
-    source_language, target_language,
+    source_language, target_language, source_mode="",
 ):
     """Send prompt to AI, parse, enforce minimal updates, save, and return result dict."""
     formatted_source_preview = ""
@@ -910,6 +911,12 @@ def _execute_ai_translation(
         verbose_thread_safe_print(f"   📋 AI response (first 500 chars): {(ai_response or '')[:500]}...")
 
         result = parse_updated_sections(ai_response)
+        result = rewrite_tidb_version_anchors_in_sections(
+            result,
+            source_language,
+            target_language,
+            source_mode=source_mode,
+        )
         result = enforce_minimal_target_updates(target_sections, result, pr_diff)
         thread_safe_print(f"   📊 Parsed {len(result)} sections from AI response")
 
@@ -1043,6 +1050,7 @@ def get_updated_sections_from_ai_chunked(
             f".{cp['chunk_label']}",
             source_language,
             target_language,
+            source_mode=source_mode,
         )
 
         if not chunk_result:
@@ -1173,6 +1181,7 @@ def get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_di
         prompt, ai_client, target_sections, pr_diff,
         target_file_prefix, prompt_suffix,
         source_language, target_language,
+        source_mode=source_mode,
     )
     return _restore_result(result)
 

@@ -24,6 +24,10 @@ from file_updater import (
     process_single_file,
     update_target_document_from_match_data,
 )
+from product_specific_handler import (
+    rewrite_tidb_version_anchors_in_sections,
+    rewrite_tidb_version_anchors_in_text,
+)
 
 
 class FileUpdaterRegressionTest(unittest.TestCase):
@@ -68,6 +72,260 @@ class FileUpdaterRegressionTest(unittest.TestCase):
 
         self.assertIn("+## Example test {#example-test}", processed)
         self.assertNotIn("-## Example tests {#example-tests}", processed)
+
+    def test_tidb_version_anchor_rewrite_zh_to_en_pr_mode(self):
+        text = (
+            "See [`tidb_enable_x`](/system-variables.md"
+            "#tidb-enable-x-从-v800-版本开始引入)."
+        )
+
+        with mock.patch.dict(os.environ, {"PRODUCT": "TiDB"}, clear=False):
+            processed = rewrite_tidb_version_anchors_in_text(
+                text,
+                source_language="Chinese",
+                target_language="English",
+                source_mode="pr",
+            )
+
+        self.assertEqual(
+            processed,
+            "See [`tidb_enable_x`](/system-variables.md#tidb-enable-x-new-in-v800).",
+        )
+
+    def test_tidb_version_anchor_rewrite_en_to_zh_pr_mode(self):
+        text = (
+            "请参见 [`tidb_enable_x`](/system-variables.md"
+            "#tidb-enable-x-new-in-v800)。"
+        )
+
+        with mock.patch.dict(os.environ, {"PRODUCT": "TiDB"}, clear=False):
+            processed = rewrite_tidb_version_anchors_in_text(
+                text,
+                source_language="English",
+                target_language="Chinese",
+                source_mode="pr",
+            )
+
+        self.assertEqual(
+            processed,
+            "请参见 [`tidb_enable_x`](/system-variables.md#tidb-enable-x-从-v800-版本开始引入)。",
+        )
+
+    def test_tidb_version_anchor_rewrite_supports_two_digit_versions(self):
+        text = (
+            "请参见 [`tidb_executor_concurrency`](/system-variables.md"
+            "#tidb_executor_concurrency-new-in-v50)。"
+        )
+
+        with mock.patch.dict(os.environ, {"PRODUCT": "TiDB"}, clear=False):
+            processed = rewrite_tidb_version_anchors_in_text(
+                text,
+                source_language="English",
+                target_language="Chinese",
+                source_mode="pr",
+            )
+
+        self.assertEqual(
+            processed,
+            "请参见 [`tidb_executor_concurrency`](/system-variables.md#tidb_executor_concurrency-从-v50-版本开始引入)。",
+        )
+
+    def test_tidb_version_anchor_rewrite_skips_commit_mode(self):
+        text = (
+            "请参见 [`tidb_enable_x`](/system-variables.md"
+            "#tidb-enable-x-new-in-v800)。"
+        )
+
+        with mock.patch.dict(os.environ, {"PRODUCT": "TiDB"}, clear=False):
+            processed = rewrite_tidb_version_anchors_in_text(
+                text,
+                source_language="English",
+                target_language="Chinese",
+                source_mode="commit",
+            )
+
+        self.assertEqual(processed, text)
+
+    def test_tidb_version_anchor_rewrite_skips_other_products(self):
+        text = (
+            "See [`tidb_enable_x`](/system-variables.md"
+            "#tidb-enable-x-从-v800-版本开始引入)."
+        )
+
+        with mock.patch.dict(os.environ, {"PRODUCT": "Other"}, clear=False):
+            processed = rewrite_tidb_version_anchors_in_text(
+                text,
+                source_language="Chinese",
+                target_language="English",
+                source_mode="pr",
+            )
+
+        self.assertEqual(processed, text)
+
+    def test_tidb_version_anchor_rewrite_defaults_to_tidb_product(self):
+        text = (
+            "See [`tidb_enable_x`](/system-variables.md"
+            "#tidb-enable-x-从-v800-版本开始引入)."
+        )
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            processed = rewrite_tidb_version_anchors_in_text(
+                text,
+                source_language="Chinese",
+                target_language="English",
+                source_mode="pr",
+            )
+
+        self.assertEqual(
+            processed,
+            "See [`tidb_enable_x`](/system-variables.md#tidb-enable-x-new-in-v800).",
+        )
+
+    def test_tidb_version_anchor_rewrite_defaults_blank_product_to_tidb(self):
+        text = (
+            "See [`tidb_enable_x`](/system-variables.md"
+            "#tidb-enable-x-从-v800-版本开始引入)."
+        )
+
+        with mock.patch.dict(os.environ, {"PRODUCT": ""}, clear=False):
+            processed = rewrite_tidb_version_anchors_in_text(
+                text,
+                source_language="Chinese",
+                target_language="English",
+                source_mode="pr",
+            )
+
+        self.assertEqual(
+            processed,
+            "See [`tidb_enable_x`](/system-variables.md#tidb-enable-x-new-in-v800).",
+        )
+
+    def test_tidb_version_anchor_rewrite_only_updates_markdown_link_urls(self):
+        text = (
+            "Anchor text #tidb-enable-x-从-v800-版本开始引入 and "
+            "[`tidb_enable_x`](/system-variables.md#tidb-enable-x-从-v800-版本开始引入)."
+        )
+
+        with mock.patch.dict(os.environ, {"PRODUCT": "TiDB"}, clear=False):
+            processed = rewrite_tidb_version_anchors_in_text(
+                text,
+                source_language="Chinese",
+                target_language="English",
+                source_mode="pr",
+            )
+
+        self.assertEqual(
+            processed,
+            "Anchor text #tidb-enable-x-从-v800-版本开始引入 and "
+            "[`tidb_enable_x`](/system-variables.md#tidb-enable-x-new-in-v800).",
+        )
+
+    def test_tidb_version_anchor_rewrite_requires_markdown_file_anchor_url(self):
+        text = (
+            "[`tidb_enable_x`](https://example.com/docs#tidb-enable-x-从-v800-版本开始引入) "
+            "and [`tidb_enable_y`](/system-variables#tidb-enable-y-从-v800-版本开始引入)."
+        )
+
+        with mock.patch.dict(os.environ, {"PRODUCT": "TiDB"}, clear=False):
+            processed = rewrite_tidb_version_anchors_in_text(
+                text,
+                source_language="Chinese",
+                target_language="English",
+                source_mode="pr",
+            )
+
+        self.assertEqual(processed, text)
+
+    def test_tidb_version_anchor_rewrite_skips_image_links(self):
+        text = (
+            "![alt](/system-variables.md#tidb-enable-x-从-v800-版本开始引入) "
+            "[`tidb_enable_x`](/system-variables.md#tidb-enable-x-从-v800-版本开始引入)."
+        )
+
+        with mock.patch.dict(os.environ, {"PRODUCT": "TiDB"}, clear=False):
+            processed = rewrite_tidb_version_anchors_in_text(
+                text,
+                source_language="Chinese",
+                target_language="English",
+                source_mode="pr",
+            )
+
+        self.assertEqual(
+            processed,
+            "![alt](/system-variables.md#tidb-enable-x-从-v800-版本开始引入) "
+            "[`tidb_enable_x`](/system-variables.md#tidb-enable-x-new-in-v800).",
+        )
+
+    def test_tidb_version_anchor_rewrite_preserves_translation_result_failures(self):
+        result = TranslationResult(
+            {
+                "modified_1": (
+                    "See [`tidb_enable_x`](/system-variables.md"
+                    "#tidb-enable-x-从-v800-版本开始引入)."
+                )
+            },
+            failures=["chunk failed"],
+        )
+
+        with mock.patch.dict(os.environ, {"PRODUCT": "TiDB"}, clear=False):
+            processed = rewrite_tidb_version_anchors_in_sections(
+                result,
+                source_language="Chinese",
+                target_language="English",
+                source_mode="pr",
+            )
+
+        self.assertIsInstance(processed, TranslationResult)
+        self.assertEqual(processed.failures, ["chunk failed"])
+        self.assertEqual(
+            processed["modified_1"],
+            "See [`tidb_enable_x`](/system-variables.md#tidb-enable-x-new-in-v800).",
+        )
+
+    def test_ai_translation_rewrites_tidb_version_anchor_in_pr_mode(self):
+        class FakeAIClient:
+            def chat_completion(self, messages, temperature=0.1):
+                return json.dumps(
+                    {
+                        "modified_1": (
+                            "See [`tidb_enable_x`](/system-variables.md"
+                            "#tidb-enable-x-从-v800-版本开始引入)."
+                        )
+                    }
+                )
+
+        prefix = "tidb-anchor-unit"
+        self._cleanup_chunk_test_outputs(prefix)
+        try:
+            with mock.patch.dict(os.environ, {"PRODUCT": "TiDB"}, clear=False):
+                processed = get_updated_sections_from_ai(
+                    "\n".join(
+                        [
+                            "File: system-variables.md",
+                            "@@ -1,1 +1,1 @@",
+                            "-old content",
+                            "+new content",
+                        ]
+                    ),
+                    {
+                        "modified_1": "See [`tidb_enable_x`](/system-variables.md#tidb-enable-x-从-v800-版本开始引入).",
+                    },
+                    {
+                        "modified_1": "See [`tidb_enable_x`](/system-variables.md#tidb-enable-x-从-v800-版本开始引入).",
+                    },
+                    FakeAIClient(),
+                    "Chinese",
+                    "English",
+                    f"{prefix}.md",
+                    source_mode="pr",
+                )
+
+            self.assertEqual(
+                processed["modified_1"],
+                "See [`tidb_enable_x`](/system-variables.md#tidb-enable-x-new-in-v800).",
+            )
+        finally:
+            self._cleanup_chunk_test_outputs(prefix)
 
     def test_translation_prompt_preserves_mdx_component_tags(self):
         prompt, _ = _prepare_translation_prompt(
