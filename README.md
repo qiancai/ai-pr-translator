@@ -102,10 +102,15 @@ export MAX_NON_SYSTEM_SECTIONS_FOR_AI=120
 export SOURCE_TOKEN_LIMIT=5000
 export AI_MAX_TOKENS=20000
 
+# Optional: limit PR analysis to explicit source files
+export SOURCE_FILES="docs/guide.md,docs/faq.md"
+
 # Optional: File-level parallelism
 export DIFF_PARALLEL_FILE_THRESHOLD=6  # parallelize when changed file count is greater than this
 export DIFF_PARALLEL_WORKERS=4
 ```
+
+When `SOURCE_FILES` is set in PR mode, the workflow narrows analysis to those files before diff inspection, then keeps the downstream file filter as a second guard.
 
 #### Commit-based mode (`commit_sync_workflow.py`)
 

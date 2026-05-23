@@ -5,6 +5,7 @@ import unittest
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
@@ -461,6 +462,73 @@ class DiffAnalyzerContextTest(unittest.TestCase):
         source_diff = json.loads(self.generated_file.read_text(encoding="utf-8"))
         self.assertIn("added_7", source_diff)
         self.assertIn("<RelatedResources>", source_diff["added_7"]["new_content"])
+
+    def test_pr_analysis_honors_source_files_before_processing(self):
+        included_file = SimpleNamespace(
+            filename="guide.md",
+            status="modified",
+            patch="\n".join(
+                [
+                    "@@ -1,4 +1,4 @@",
+                    " # Title",
+                    " ",
+                    " ## Section",
+                    "-Old text",
+                    "+New text",
+                ]
+            ),
+            previous_filename=None,
+        )
+        skipped_file = SimpleNamespace(
+            filename="other.md",
+            status="modified",
+            patch="\n".join(
+                [
+                    "@@ -1,4 +1,4 @@",
+                    " # Other",
+                    " ",
+                    " ## Section",
+                    "-Old text",
+                    "+New text",
+                ]
+            ),
+            previous_filename=None,
+        )
+        repository = FakeRepository(
+            {
+                ("guide.md", "base123"): "# Title\n\n## Section\nOld text\n",
+                ("guide.md", "head123"): "# Title\n\n## Section\nNew text\n",
+                ("other.md", "base123"): "# Other\n\n## Section\nOld text\n",
+                ("other.md", "head123"): "# Other\n\n## Section\nNew text\n",
+            },
+            FakePR([included_file, skipped_file], "Update guide", "base123", "head123"),
+            {("base123", "head123"): [included_file, skipped_file]},
+        )
+        content_calls = []
+
+        original_get_contents = repository.get_contents
+
+        def tracking_get_contents(path, ref):
+            content_calls.append((path, ref))
+            return original_get_contents(path, ref)
+
+        repository.get_contents = tracking_get_contents
+        github = FakeGithub({"acme/docs": repository})
+        context = build_pr_diff_context(self.pr_url, github, self.repo_configs)
+
+        result = analyze_source_changes(
+            context,
+            github,
+            special_files=["TOC.md", "keywords.md"],
+            ignore_files=[],
+            repo_configs=self.repo_configs,
+            source_files="./guide.md, guide.md",
+        )
+
+        self.assertIn("guide.md", result[1])
+        self.assertNotIn("other.md", result[1])
+        self.assertTrue(content_calls)
+        self.assertTrue(all(path == "guide.md" for path, _ in content_calls))
 
     def test_commit_related_resources_filter_can_be_disabled(self):
         file_path = "guide.md"

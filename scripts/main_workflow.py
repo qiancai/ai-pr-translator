@@ -902,6 +902,7 @@ def main():
         max_non_system_sections=MAX_NON_SYSTEM_SECTIONS_FOR_AI,
         pr_diff=pr_diff,
         exclude_folders=exclude_folders,
+        source_files=[path.strip() for path in SOURCE_FILES.split(",") if path.strip()] if SOURCE_FILES else None,
     )
     if SOURCE_FILES:
         added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images = filter_docs_by_source_files(

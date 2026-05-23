@@ -119,6 +119,24 @@ def is_yes_option_enabled(value, default=True):
     return default
 
 
+def _normalize_requested_source_files(source_files):
+    """Return a deduplicated set of repo-relative source file paths."""
+    if not source_files:
+        return set()
+
+    if isinstance(source_files, str):
+        source_files = source_files.split(",")
+
+    normalized = set()
+    for item in source_files:
+        path = str(item).strip()
+        if path.startswith("./"):
+            path = path[2:]
+        if path:
+            normalized.add(path)
+    return normalized
+
+
 def should_ignore_related_resources_resource_card_sections(source_context):
     """Return True when commit mode should skip language-specific resources."""
     if not isinstance(source_context, dict) or source_context.get("mode") != "commit":
@@ -2219,7 +2237,17 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
     
     return source_diff_dict
 
-def analyze_source_changes(source_context_or_pr_url, github_client, special_files=None, ignore_files=None, repo_configs=None, max_non_system_sections=120, pr_diff=None, exclude_folders=None):
+def analyze_source_changes(
+    source_context_or_pr_url,
+    github_client,
+    special_files=None,
+    ignore_files=None,
+    repo_configs=None,
+    max_non_system_sections=120,
+    pr_diff=None,
+    exclude_folders=None,
+    source_files=None,
+):
     """Analyze source language changes and categorize them as added, modified, or deleted
     
     Args:
@@ -2234,6 +2262,7 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
     
     if exclude_folders is None:
         exclude_folders = []
+    requested_source_files = _normalize_requested_source_files(source_files)
     
     if is_diff_context(source_context_or_pr_url):
         source_context = source_context_or_pr_url
@@ -2300,7 +2329,15 @@ def analyze_source_changes(source_context_or_pr_url, github_client, special_file
                 print(f"   ⏭️  {f.filename}")
             for f in excluded_img:
                 print(f"   ⏭️  {f.filename}")
-    
+
+    if requested_source_files:
+        markdown_files = [f for f in markdown_files if f.filename in requested_source_files]
+        image_files = [f for f in image_files if f.filename in requested_source_files]
+        print(
+            "📄 SOURCE_FILES early filter applied before diff analysis: "
+            f"{', '.join(sorted(requested_source_files))}"
+        )
+
     # Return dictionaries for different operation types
     added_sections = {}      # New sections that were added
     modified_sections = {}   # Existing sections that were modified  
