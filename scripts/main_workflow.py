@@ -20,7 +20,7 @@ PRODUCT = os.getenv("PRODUCT") or "TiDB"
 TARGET_REPO_PATH = os.getenv("TARGET_REPO_PATH")
 SOURCE_FILES = os.getenv("SOURCE_FILES", "")
 SKIP_GIT_ADD = os.getenv("SKIP_GIT_ADD", "false").lower() == "true"
-PREFER_LOCAL_TARGET_FOR_READ = os.getenv("PREFER_LOCAL_TARGET_FOR_READ", "false").lower() == "true"
+PREFER_LOCAL_TARGET_FOR_READ = os.getenv("PREFER_LOCAL_TARGET_FOR_READ", "true").lower() == "true"
 TIDB_CLOUD_ABSOLUTE_LINK_PREFIX = os.getenv(
     "TIDB_CLOUD_ABSOLUTE_LINK_PREFIX",
     "https://docs.pingcap.com/tidbcloud/",
