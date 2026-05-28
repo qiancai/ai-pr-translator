@@ -44,10 +44,10 @@ from translation_structure_validator import (
 MODE = "commit-based"
 
 SOURCE_COMMIT_COMPARE = (
-    "https://github.com/pingcap/docs/compare/aa63093b1a90c6d816373829ab86a485b41d8071...1a75af9f55e1488abdfb9d4c6ab8b2a58849f9db"
+    "https://github.com/pingcap/docs/compare/1a75af9f55e1488abdfb9d4c6ab8b2a58849f9db...6fd0a68165e85dd364c0ca853eb136d6dc58d837"
 )
 SOURCE_PR = ""
-TARGET_PR = "https://github.com/pingcap/docs/pull/22917"
+TARGET_PR = "https://github.com/pingcap/docs/pull/22958"
 
 # Optional: local clone of the source repo.  When set, `git diff --numstat`
 # is used instead of the GitHub compare API, which avoids the 300-file cap.
