@@ -1547,15 +1547,23 @@ def find_sections_by_operation_type(lines, operations, all_headers, base_hierarc
     # Process deleted lines - use base hierarchy to find deleted sections
     for deleted_line in operations['deleted_lines']:
         if deleted_line['is_header']:
-            # Find this header in the base file hierarchy (before deletion)
+            deleted_base_line_num = deleted_line['line_number']
+
+            # Try direct lookup by base line number first (most reliable)
+            if base_hierarchy_dict and deleted_base_line_num in base_hierarchy_dict:
+                sections['deleted'].add(deleted_base_line_num)
+                print(f"   🗑️  Detected deleted section: {deleted_line['content']} (line {deleted_base_line_num})")
+                continue
+
+            # Fallback to title matching
             deleted_title = clean_title_for_matching(deleted_line['content'])
-            # Use base hierarchy if available, otherwise fall back to current headers
             search_hierarchy = base_hierarchy_dict if base_hierarchy_dict else all_headers
             
             found_deleted = False
             for line_num, hierarchy_line in search_hierarchy.items():
-                # Extract title from hierarchy line
-                if ' > ' in hierarchy_line:
+                if isinstance(hierarchy_line, dict):
+                    original_title = clean_title_for_matching(hierarchy_line.get('title', ''))
+                elif ' > ' in hierarchy_line:
                     original_title = clean_title_for_matching(hierarchy_line.split(' > ')[-1])
                 else:
                     original_title = clean_title_for_matching(hierarchy_line)
@@ -1567,7 +1575,6 @@ def find_sections_by_operation_type(lines, operations, all_headers, base_hierarc
                     break
             
             if not found_deleted:
-                # If not found by exact match, try partial matching for renamed sections
                 print(f"   ⚠️  Could not find deleted section: {deleted_line['content']}")
     
     return sections
@@ -2174,26 +2181,92 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
                 else:
                     # This next section might also be new or modified
                     # Try to find it by content matching in base hierarchy
-                    found_match = False
+                    curr_leaf = curr_hierarchy.split(' > ')[-1] if ' > ' in curr_hierarchy else curr_hierarchy
+                    curr_clean = clean_title_for_matching(curr_leaf)
+
+                    leaf_match_candidates = []
                     for base_line_str, base_hierarchy in base_hierarchy_dict.items():
-                        # Compare the leaf titles (last part of hierarchy)
-                        curr_leaf = curr_hierarchy.split(' > ')[-1] if ' > ' in curr_hierarchy else curr_hierarchy
                         base_leaf = base_hierarchy.split(' > ')[-1] if ' > ' in base_hierarchy else base_hierarchy
-                        
-                        # Clean titles for comparison
-                        curr_clean = clean_title_for_matching(curr_leaf)
                         base_clean = clean_title_for_matching(base_leaf)
-                        
                         if curr_clean == base_clean:
-                            next_section_original_hierarchy = base_hierarchy
-                            print(f"   ✅ Found next section (by content): {base_hierarchy.split(' > ')[-1] if ' > ' in base_hierarchy else base_hierarchy}")
-                            found_match = True
-                            break
-                    
-                    if found_match:
+                            leaf_match_candidates.append((base_line_str, base_hierarchy))
+
+                    if len(leaf_match_candidates) == 1:
+                        next_section_original_hierarchy = leaf_match_candidates[0][1]
+                        print(f"   ✅ Found next section (by content): {leaf_match_candidates[0][1].split(' > ')[-1] if ' > ' in leaf_match_candidates[0][1] else leaf_match_candidates[0][1]}")
                         break
-                    else:
-                        print(f"   ⚠️  Next section at line {curr_line_num} not found in base, continuing search...")
+                    elif len(leaf_match_candidates) > 1:
+                        # Multiple candidates share the same leaf title (e.g. "Step 3"
+                        # under different parent sections). Disambiguate by comparing
+                        # the parent hierarchy path from the HEAD file against each
+                        # candidate in the base file.
+                        curr_parents = curr_hierarchy.split(' > ')[:-1] if ' > ' in curr_hierarchy else []
+                        scored_candidates = []
+
+                        for cand_line, cand_hierarchy in leaf_match_candidates:
+                            cand_parents = cand_hierarchy.split(' > ')[:-1] if ' > ' in cand_hierarchy else []
+                            score = 0
+                            for i in range(1, min(len(curr_parents), len(cand_parents)) + 1):
+                                if clean_title_for_matching(curr_parents[-i]) == clean_title_for_matching(cand_parents[-i]):
+                                    score += 1
+                                else:
+                                    break
+                            scored_candidates.append((score, cand_line, cand_hierarchy))
+
+                        max_score = max(sc for sc, _, _ in scored_candidates)
+                        if max_score > 0:
+                            top_tier = [(cl, ch) for sc, cl, ch in scored_candidates if sc == max_score]
+                            if len(top_tier) == 1:
+                                best_candidate = top_tier[0]
+                            else:
+                                # Tie at the same positive score: break by ordinal
+                                # position among same-titled headings.  Comparing
+                                # raw BASE vs HEAD line numbers is unreliable when
+                                # insertions/deletions shift the file, so instead we
+                                # match the Nth occurrence in HEAD to the Nth in BASE.
+                                head_same_title = sorted([
+                                    (int(ln), h) for ln, h in all_hierarchy_dict.items()
+                                    if clean_title_for_matching(
+                                        h.split(' > ')[-1] if ' > ' in h else h
+                                    ) == curr_clean
+                                ])
+                                curr_ordinal = next(
+                                    (idx for idx, (ln, _) in enumerate(head_same_title)
+                                     if ln == curr_line_num),
+                                    0,
+                                )
+
+                                base_same_title = sorted([
+                                    (int(ln), h) for ln, h in base_hierarchy_dict.items()
+                                    if clean_title_for_matching(
+                                        h.split(' > ')[-1] if ' > ' in h else h
+                                    ) == curr_clean
+                                ])
+                                base_ordinal_map = {
+                                    str(ln): idx
+                                    for idx, (ln, _) in enumerate(base_same_title)
+                                }
+
+                                top_tier.sort(
+                                    key=lambda x: abs(
+                                        base_ordinal_map.get(x[0], len(base_same_title))
+                                        - curr_ordinal
+                                    )
+                                )
+                                best_candidate = top_tier[0]
+                                print(
+                                    f"   ⚠️  {len(top_tier)} candidates tied at parent-hierarchy score {max_score} "
+                                    f"for '{curr_clean}'; chose base line {best_candidate[0]} by ordinal position "
+                                    f"(HEAD ordinal {curr_ordinal}, BASE ordinal {base_ordinal_map.get(best_candidate[0], '?')})"
+                                )
+                            next_section_original_hierarchy = best_candidate[1]
+                            leaf_for_log = best_candidate[1].split(' > ')[-1] if ' > ' in best_candidate[1] else best_candidate[1]
+                            print(f"   ✅ Found next section (by content, disambiguated among {len(leaf_match_candidates)} candidates): {leaf_for_log}")
+                            break
+                        else:
+                            print(f"   ⚠️  {len(leaf_match_candidates)} candidates for '{curr_clean}' but parent hierarchy could not disambiguate, continuing search...")
+                    
+                    print(f"   ⚠️  Next section at line {curr_line_num} not found in base, continuing search...")
         
         # If no next section found, this is being added at the end
         if not next_section_original_hierarchy:

@@ -2604,6 +2604,89 @@ def update_target_document_from_match_data(match_file_path, target_local_path, t
     
     return success
 
+def _count_markdown_headings(content):
+    """Count markdown headings in content, skipping fenced code blocks."""
+    count = 0
+    in_code_block = False
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith('```') or stripped.startswith('~~~'):
+            in_code_block = not in_code_block
+            continue
+        if not in_code_block and is_markdown_heading(line):
+            count += 1
+    return count
+
+
+def _get_first_heading_level(content):
+    """Return the heading level (1-6) of the first markdown heading, or 0."""
+    in_code_block = False
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith('```') or stripped.startswith('~~~'):
+            in_code_block = not in_code_block
+            continue
+        if not in_code_block and is_markdown_heading(line):
+            return len(line) - len(line.lstrip('#'))
+    return 0
+
+
+def _has_added_child_entries(all_sections, modified_heading_level):
+    """Check whether all_sections contains added entries whose heading level
+    is deeper than modified_heading_level.  When such entries exist the extra
+    sub-headings an AI might produce for the parent modified section are
+    already handled, so truncation is safe."""
+    for _, s_data, _ in all_sections:
+        if s_data.get('source_operation') != 'added':
+            continue
+        added_src = s_data.get('source_new_content', '')
+        if added_src:
+            added_level = _get_first_heading_level(added_src)
+            if added_level > modified_heading_level:
+                return True
+    return False
+
+
+def _truncate_overexpanded_translation(target_new_content, source_new_content):
+    """Truncate AI translation that overexpands beyond the source content scope.
+
+    When a parent section gets restructured (e.g., new ##### sub-headings added
+    under ####), the AI may include those sub-headings in the modified section's
+    translation even though they are handled as separate 'added' entries. This
+    causes duplication.  Truncate at the first heading that exceeds the heading
+    count present in source_new_content.
+    """
+    if not source_new_content or not target_new_content:
+        return target_new_content
+
+    source_heading_count = _count_markdown_headings(source_new_content)
+    if source_heading_count == 0:
+        return target_new_content
+
+    target_heading_count = 0
+    in_code_block = False
+    target_lines = target_new_content.splitlines(keepends=True)
+
+    for i, line in enumerate(target_lines):
+        stripped = line.strip()
+        if stripped.startswith('```') or stripped.startswith('~~~'):
+            in_code_block = not in_code_block
+            continue
+        if not in_code_block and is_markdown_heading(line):
+            target_heading_count += 1
+            if target_heading_count > source_heading_count:
+                truncated = ''.join(target_lines[:i]).rstrip('\n') + '\n'
+                total_target = _count_markdown_headings(target_new_content)
+                thread_safe_print(
+                    f"   ⚠️  Truncated AI overexpansion: {total_target} headings "
+                    f"in AI response vs {source_heading_count} in source; "
+                    f"trimmed at line {i + 1}"
+                )
+                return truncated
+
+    return target_new_content
+
+
 def update_target_document_sections(all_sections, target_file_path):
     """
     Update target document sections - integrated from test_target_update.py
@@ -2879,6 +2962,20 @@ def update_target_document_sections(all_sections, target_file_path):
                     continue
                     
                 thread_safe_print(f"   🔄 Replace mode: replacing section starting at line {target_line_num}")
+                
+                # Guard against AI overexpansion for modified sections:
+                # the AI may include sub-headings that are handled by
+                # separate 'added' entries, causing duplication.
+                # Only truncate when we can confirm added child entries
+                # exist that would handle the extra headings.
+                if operation == 'modified':
+                    source_new_content = section_data.get('source_new_content', '')
+                    if source_new_content:
+                        mod_level = _get_first_heading_level(source_new_content)
+                        if mod_level > 0 and _has_added_child_entries(all_sections, mod_level):
+                            target_new_content = _truncate_overexpanded_translation(
+                                target_new_content, source_new_content
+                            )
                 
                 # Ensure content format is correct
                 if not target_new_content.endswith('\n'):
