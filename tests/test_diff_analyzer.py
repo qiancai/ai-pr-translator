@@ -21,7 +21,9 @@ from diff_analyzer import (
     build_hierarchy_dict,
     build_source_diff_dict,
     collect_added_heading_prefix_lines,
+    filter_changed_files_to_pr_scope,
     filter_related_resources_resource_card_diff,
+    get_pr_diff,
     get_target_file_content,
     get_target_hierarchy_and_content,
     maybe_use_normalized_snapshot_operations,
@@ -44,11 +46,6 @@ class FakePR:
 
     def get_files(self):
         return self._files
-
-
-class ExplodingFilesPR(FakePR):
-    def get_files(self):
-        raise AssertionError("range PR context should not fetch full PR files")
 
 
 class FakeComparison:
@@ -191,9 +188,9 @@ class DiffAnalyzerContextTest(unittest.TestCase):
             ("acme", "docs", 123, "base123", "head123"),
         )
 
-    def test_pr_files_range_context_uses_compare_diff_but_stays_pr_mode(self):
+    def test_pr_files_range_context_filters_compare_diff_to_pr_scope(self):
         full_pr_file = SimpleNamespace(
-            filename="full-pr.md",
+            filename="range.md",
             status="modified",
             patch="@@ -1 +1 @@\n-full\n+full pr",
             previous_filename=None,
@@ -204,10 +201,16 @@ class DiffAnalyzerContextTest(unittest.TestCase):
             patch="@@ -1 +1 @@\n-old\n+range only",
             previous_filename=None,
         )
+        upstream_file = SimpleNamespace(
+            filename="releases/release-8.2.0.md",
+            status="modified",
+            patch="@@ -1 +1 @@\n-old\n+upstream only",
+            previous_filename=None,
+        )
         repository = FakeRepository(
             {},
-            ExplodingFilesPR([full_pr_file], "Update range", "prbase", "prhead"),
-            {("base456", "head456"): [range_file]},
+            FakePR([full_pr_file], "Update range", "prbase", "prhead"),
+            {("base456", "head456"): [range_file, upstream_file]},
         )
         github = FakeGithub({"acme/docs": repository})
 
@@ -222,9 +225,120 @@ class DiffAnalyzerContextTest(unittest.TestCase):
         self.assertEqual(context["head_ref"], "head456")
         self.assertEqual([file.filename for file in context["changed_files"]], ["range.md"])
         self.assertIn("commit range base456..head456", context["source_description"])
+        self.assertEqual(context["range_compare_file_count"], 2)
+        self.assertEqual(context["range_pr_file_count"], 1)
+        self.assertEqual(context["range_matched_file_count"], 1)
         rendered_diff = build_diff_text(context["changed_files"])
         self.assertIn("+range only", rendered_diff)
         self.assertNotIn("full pr", rendered_diff)
+        self.assertNotIn("upstream only", rendered_diff)
+
+    def test_range_file_scope_filter_matches_previous_filenames(self):
+        pr_files = [
+            SimpleNamespace(
+                filename="current.md",
+                status="renamed",
+                patch=None,
+                previous_filename="original.md",
+            )
+        ]
+        changed_files = [
+            SimpleNamespace(
+                filename="current.md",
+                status="modified",
+                patch="@@ -1 +1 @@\n-old\n+current path",
+                previous_filename=None,
+            ),
+            SimpleNamespace(
+                filename="intermediate.md",
+                status="renamed",
+                patch="@@ -1 +1 @@\n-old\n+previous path",
+                previous_filename="original.md",
+            ),
+            SimpleNamespace(
+                filename="unrelated.md",
+                status="modified",
+                patch="@@ -1 +1 @@\n-old\n+unrelated",
+                previous_filename=None,
+            ),
+        ]
+
+        matched_files = filter_changed_files_to_pr_scope(changed_files, pr_files)
+
+        self.assertEqual(
+            [file.filename for file in matched_files],
+            ["current.md", "intermediate.md"],
+        )
+
+    def test_get_pr_diff_range_filters_compare_diff_to_current_pr_files(self):
+        range_file = SimpleNamespace(
+            filename="range.md",
+            status="modified",
+            patch="@@ -1 +1 @@\n-old\n+range only",
+            previous_filename=None,
+        )
+        upstream_file = SimpleNamespace(
+            filename="releases/release-8.2.0.md",
+            status="modified",
+            patch="@@ -1 +1 @@\n-old\n+upstream only",
+            previous_filename=None,
+        )
+        repository = FakeRepository(
+            {},
+            FakePR([range_file], "Update range", "prbase", "prhead"),
+            {("base456", "head456"): [range_file, upstream_file]},
+        )
+        github = FakeGithub({"acme/docs": repository})
+
+        rendered_diff = get_pr_diff(
+            "https://github.com/acme/docs/pull/123/files/base456..head456/",
+            github,
+        )
+
+        self.assertIn("+range only", rendered_diff)
+        self.assertNotIn("upstream only", rendered_diff)
+
+    def test_pr_files_range_context_only_uses_files_changed_in_range(self):
+        pr_files = [
+            SimpleNamespace(
+                filename=f"file-{index}.md",
+                status="modified",
+                patch=f"@@ -1 +1 @@\n-old\n+full pr {index}",
+                previous_filename=None,
+            )
+            for index in range(10)
+        ]
+        range_files = [
+            SimpleNamespace(
+                filename=f"file-{index}.md",
+                status="modified",
+                patch=f"@@ -1 +1 @@\n-old\n+range {index}",
+                previous_filename=None,
+            )
+            for index in [1, 3, 5, 7]
+        ]
+        repository = FakeRepository(
+            {},
+            FakePR(pr_files, "Update ten files", "prbase", "prhead"),
+            {("base456", "head456"): range_files},
+        )
+        github = FakeGithub({"acme/docs": repository})
+
+        context = build_pr_diff_context(
+            "https://github.com/acme/docs/pull/123/files/base456..head456/",
+            github,
+            self.repo_configs,
+        )
+
+        self.assertEqual(
+            [file.filename for file in context["changed_files"]],
+            ["file-1.md", "file-3.md", "file-5.md", "file-7.md"],
+        )
+        rendered_diff = build_diff_text(context["changed_files"])
+        self.assertIn("+range 1", rendered_diff)
+        self.assertIn("+range 7", rendered_diff)
+        self.assertNotIn("+full pr 0", rendered_diff)
+        self.assertNotIn("+full pr 9", rendered_diff)
 
     def test_commit_related_resources_added_section_is_filtered(self):
         file_path = "guide.md"

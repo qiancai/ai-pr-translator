@@ -115,6 +115,38 @@ def normalize_changed_file(file):
     )
 
 
+def filter_changed_files_to_pr_scope(changed_files, pr_files):
+    """Keep only compare files that match current or previous PR paths."""
+    pr_paths = set()
+    for file in pr_files:
+        if file.filename:
+            pr_paths.add(file.filename)
+        if file.previous_filename:
+            pr_paths.add(file.previous_filename)
+
+    return [
+        file
+        for file in changed_files
+        if file.filename in pr_paths
+        or (file.previous_filename and file.previous_filename in pr_paths)
+    ]
+
+
+def print_range_scope_summary(source_context):
+    """Print commit range filtering counts when available."""
+    if not source_context.get("source_range_url"):
+        return
+    compare_count = source_context.get("range_compare_file_count")
+    pr_count = source_context.get("range_pr_file_count")
+    matched_count = source_context.get("range_matched_file_count")
+    if compare_count is None or pr_count is None or matched_count is None:
+        return
+    print(
+        f"🔎 Range scope: compare files={compare_count}, "
+        f"current PR files={pr_count}, matched files={matched_count}"
+    )
+
+
 def infer_language_direction(source_repo, target_repo):
     """Infer language direction based on repo naming convention."""
     if source_repo.endswith('-cn') and not target_repo.endswith('-cn'):
@@ -224,10 +256,17 @@ def build_pr_diff_context(pr_url, github_client, repo_configs):
         _, _, _, base_ref, head_ref = range_info
         # In range mode, base_ref/head_ref describe the incremental source diff,
         # not the PR's original base/head branch refs.
+        # GitHub compare can also include upstream commits merged into the PR
+        # branch, so keep only files that belong to the current PR.
+        pr_files = [normalize_changed_file(file) for file in pr.get_files()]
         comparison = repository.compare(base_ref, head_ref)
-        changed_files = [normalize_changed_file(file) for file in comparison.files]
+        comparison_files = [normalize_changed_file(file) for file in comparison.files]
+        changed_files = filter_changed_files_to_pr_scope(comparison_files, pr_files)
         source_description = f"PR #{pr_number} commit range {base_ref}..{head_ref}: {pr.title}"
         extra_context["source_range_url"] = pr_url
+        extra_context["range_compare_file_count"] = len(comparison_files)
+        extra_context["range_pr_file_count"] = len(pr_files)
+        extra_context["range_matched_file_count"] = len(changed_files)
     else:
         base_ref = getattr(pr.base, "sha", None) or getattr(pr.base, "ref", None) or repository.default_branch
         head_ref = getattr(pr.head, "sha", None) or getattr(pr.head, "ref", None) or repository.default_branch
@@ -368,8 +407,14 @@ def get_pr_diff(pr_url, github_client):
         range_info = parse_pr_commit_range_url(pr_url)
         if range_info:
             _, _, _, base_ref, head_ref = range_info
+            # Compare alone can include upstream files merged into the PR branch.
+            # Fetch the PR file scope so legacy callers get the same filtered diff
+            # as the main PR workflow.
+            pr = repository.get_pull(pr_number)
+            pr_files = [normalize_changed_file(file) for file in pr.get_files()]
             comparison = repository.compare(base_ref, head_ref)
-            files = [normalize_changed_file(file) for file in comparison.files]
+            comparison_files = [normalize_changed_file(file) for file in comparison.files]
+            files = filter_changed_files_to_pr_scope(comparison_files, pr_files)
         else:
             pr = repository.get_pull(pr_number)
             files = [normalize_changed_file(file) for file in pr.get_files()]
@@ -2427,6 +2472,7 @@ def analyze_source_changes(
         )
         source_description = source_context.get("source_description") or f"compare {base_ref}...{head_ref}"
         print(f"📋 Processing diff: {source_description}")
+        print_range_scope_summary(source_context)
     else:
         source_context = build_pr_diff_context(
             source_context_or_pr_url,
@@ -2446,6 +2492,7 @@ def analyze_source_changes(
             print(f"📋 Processing diff: {source_context['source_description']}")
         else:
             print(f"📋 Processing PR #{source_context['pr_number']}: {source_context['title']}")
+        print_range_scope_summary(source_context)
     
     # Separate markdown files and image files
     markdown_files = [f for f in files if f.filename.endswith('.md')]
