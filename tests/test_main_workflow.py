@@ -28,6 +28,14 @@ class MainWorkflowImageOnlyPrTest(unittest.TestCase):
         self.assertEqual(docs_cn_target["target_pr_url"], "https://github.com/pingcap/docs/pull/0")
         self.assertEqual(docs_cn_target["target_repo_path"], main_workflow_local.DOCS_LOCAL_PATH)
 
+    def test_local_workflow_infers_target_pr_url_from_pr_files_range(self):
+        docs_cn_target = main_workflow_local._target_for_source_pr(
+            "https://github.com/pingcap/docs-cn/pull/22655/files/base123..head123?plain=1"
+        )
+
+        self.assertEqual(docs_cn_target["target_pr_url"], "https://github.com/pingcap/docs/pull/0")
+        self.assertEqual(docs_cn_target["target_repo_path"], main_workflow_local.DOCS_LOCAL_PATH)
+
     def test_local_workflow_prefers_explicit_azure_env_over_trans_env(self):
         with mock.patch.dict(
             main_workflow_local.os.environ,
@@ -68,6 +76,18 @@ class MainWorkflowImageOnlyPrTest(unittest.TestCase):
             "source_language": "English",
             "target_language": "Chinese",
         }
+        source_context = {
+            "mode": "pr",
+            "source_repo": "acme/docs",
+            "target_repo": "acme/docs-cn",
+            "base_ref": "base123",
+            "head_ref": "head123",
+            "changed_files": [],
+            "repo_config": repo_config,
+            "source_description": "PR #1 commit range base123..head123: Update",
+            "pr_number": 1,
+            "title": "Update",
+        }
         fake_github_client = object()
 
         with mock.patch.object(main_workflow, "SOURCE_PR_URL", "https://github.com/acme/docs/pull/1"), mock.patch.object(
@@ -83,35 +103,54 @@ class MainWorkflowImageOnlyPrTest(unittest.TestCase):
         ), mock.patch.object(
             main_workflow, "Github", return_value=fake_github_client
         ), mock.patch.object(
+            main_workflow, "build_pr_diff_context", return_value=source_context
+        ), mock.patch.object(
             main_workflow, "UnifiedAIClient", return_value=SimpleNamespace(model="fake-model")
         ), mock.patch.object(
             main_workflow, "load_glossary", return_value=[]
         ), mock.patch.object(
             main_workflow, "create_glossary_matcher", return_value=None
         ), mock.patch.object(
-            main_workflow, "get_pr_diff", return_value=""
-        ), mock.patch.object(
             main_workflow,
             "analyze_source_changes",
             return_value=({}, {}, {}, {}, [], {}, {}, ["docs/media/example.png"], [], []),
-        ), mock.patch.object(
+        ) as analyze_source_changes, mock.patch.object(
             main_workflow, "process_all_images"
         ) as process_all_images, mock.patch.object(
             main_workflow, "git_add_changes"
         ):
             main_workflow.main()
 
+        self.assertIs(analyze_source_changes.call_args.args[0], source_context)
         process_all_images.assert_called_once_with(
             ["docs/media/example.png"],
             [],
             [],
-            "https://github.com/acme/docs/pull/1",
+            source_context,
             fake_github_client,
             repo_config,
         )
 
 
 class MainWorkflowRegressionTest(unittest.TestCase):
+    def test_workflow_repo_configs_accepts_pr_files_range_source_url(self):
+        with mock.patch.object(
+            main_workflow,
+            "SOURCE_PR_URL",
+            "https://github.com/acme/docs/pull/1/files/base123..head123?plain=1",
+        ), mock.patch.object(
+            main_workflow, "TARGET_PR_URL", "https://github.com/acme/docs-cn/pull/2"
+        ), mock.patch.object(
+            main_workflow, "TARGET_REPO_PATH", "/tmp/target"
+        ), mock.patch.object(
+            main_workflow, "PREFER_LOCAL_TARGET_FOR_READ", True
+        ):
+            configs = main_workflow.get_workflow_repo_configs()
+
+        self.assertEqual({"acme/docs"}, set(configs.keys()))
+        self.assertEqual(configs["acme/docs"]["target_repo"], "acme/docs-cn")
+        self.assertTrue(configs["acme/docs"]["prefer_local_target_for_read"])
+
     def test_filter_docs_by_source_files_keeps_only_requested_paths(self):
         filtered = main_workflow.filter_docs_by_source_files(
             "guide.md, TOC-test.md",

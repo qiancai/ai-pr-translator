@@ -29,10 +29,10 @@ SKIP_GIT_ADD = True
 
 
 def _parse_github_pr_url(pr_url):
-    parts = pr_url.rstrip("/").split("/")
-    if len(parts) < 7 or parts[-2] != "pull":
-        raise ValueError(f"Invalid GitHub PR URL: {pr_url}")
-    return parts[-4], parts[-3], parts[-1]
+    from diff_analyzer import parse_pr_url
+
+    owner, repo, pr_number = parse_pr_url(pr_url)
+    return owner, repo, str(pr_number)
 
 
 def _target_for_source_pr(source_pr_url):

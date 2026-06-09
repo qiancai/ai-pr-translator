@@ -84,6 +84,8 @@ Set the variables for the mode you want to run.
 ```bash
 # Required
 export SOURCE_PR_URL="https://github.com/owner/repo/pull/123"
+# Or limit PR mode to a new source commit range after a previous translation:
+# export SOURCE_PR_URL="https://github.com/owner/repo/pull/123/files/<base>..<head>"
 export TARGET_PR_URL="https://github.com/owner/repo-cn/pull/456"
 export GITHUB_TOKEN="your_github_token"
 export TARGET_REPO_PATH="/path/to/target/repo"
@@ -110,7 +112,7 @@ export DIFF_PARALLEL_FILE_THRESHOLD=6  # parallelize when changed file count is 
 export DIFF_PARALLEL_WORKERS=4
 ```
 
-When `SOURCE_FILES` is set in PR mode, the workflow narrows analysis to those files before diff inspection, then keeps the downstream file filter as a second guard.
+When `SOURCE_FILES` is set in PR mode, the workflow narrows analysis to those files before diff inspection, then keeps the downstream file filter as a second guard. When `SOURCE_PR_URL` is a PR files commit-range URL, PR mode still uses the PR translation flow and prompts, but analyzes only the `<base>..<head>` source diff.
 
 #### Commit-based mode (`commit_sync_workflow.py`)
 

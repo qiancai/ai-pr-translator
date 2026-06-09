@@ -13,6 +13,7 @@ import re
 import subprocess
 import threading
 from typing import Optional
+from urllib.parse import urlparse
 from github import Github
 from log_sanitizer import sanitize_exception_message
 from special_file_utils import is_toc_file_name
@@ -34,10 +35,59 @@ def is_markdown_heading(line):
     return re.match(r'^#{1,10}\s+\S', line) is not None
 
 
+def _github_url_path(value):
+    """Return the path portion of a GitHub URL-like value without query/fragment."""
+    parsed = urlparse(str(value).strip())
+    if parsed.scheme or parsed.netloc:
+        return parsed.path.strip("/")
+    return str(value).split("?", 1)[0].split("#", 1)[0].strip("/")
+
+
 def parse_pr_url(pr_url):
-    """Parse PR URL to get repo info"""
-    parts = pr_url.split('/')
-    return parts[-4], parts[-3], int(parts[-1])  # owner, repo, pr_number
+    """Parse a GitHub PR URL to get repo info."""
+    path = _github_url_path(pr_url)
+    match = re.match(
+        r"^(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<pr_number>\d+)(?:/.*)?$",
+        path,
+    )
+    if not match:
+        raise ValueError(f"Invalid GitHub PR URL: {pr_url}")
+    return match.group("owner"), match.group("repo"), int(match.group("pr_number"))
+
+
+def parse_pr_commit_range_url(pr_url):
+    """Parse a PR files commit-range URL, returning None for a plain PR URL.
+
+    GitHub's PR files URLs normally use the `..` form. The `...` branch is
+    accepted as a compatibility fallback for compare-style links that point to
+    the same PR files surface.
+    """
+    path = _github_url_path(pr_url)
+    match = re.match(
+        r"^(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<pr_number>\d+)/files/(?P<commit_range>[^/]+)$",
+        path,
+    )
+    if not match:
+        return None
+
+    commit_range = match.group("commit_range")
+    if "..." in commit_range:
+        base_ref, head_ref = commit_range.split("...", 1)
+    elif ".." in commit_range:
+        base_ref, head_ref = commit_range.split("..", 1)
+    else:
+        raise ValueError(f"Invalid PR files commit range URL: {pr_url}")
+
+    if not base_ref or not head_ref:
+        raise ValueError(f"Invalid PR files commit range URL: {pr_url}")
+
+    return (
+        match.group("owner"),
+        match.group("repo"),
+        int(match.group("pr_number")),
+        base_ref,
+        head_ref,
+    )
 
 
 @dataclass
@@ -166,21 +216,38 @@ def build_pr_diff_context(pr_url, github_client, repo_configs):
     repository = github_client.get_repo(source_repo)
     pr = repository.get_pull(pr_number)
     repo_config = get_repo_config(pr_url, repo_configs)
+    range_info = parse_pr_commit_range_url(pr_url)
+
+    source_description = f"PR #{pr_number}: {pr.title}"
+    extra_context = {}
+    if range_info:
+        _, _, _, base_ref, head_ref = range_info
+        # In range mode, base_ref/head_ref describe the incremental source diff,
+        # not the PR's original base/head branch refs.
+        comparison = repository.compare(base_ref, head_ref)
+        changed_files = [normalize_changed_file(file) for file in comparison.files]
+        source_description = f"PR #{pr_number} commit range {base_ref}..{head_ref}: {pr.title}"
+        extra_context["source_range_url"] = pr_url
+    else:
+        base_ref = getattr(pr.base, "sha", None) or getattr(pr.base, "ref", None) or repository.default_branch
+        head_ref = getattr(pr.head, "sha", None) or getattr(pr.head, "ref", None) or repository.default_branch
+        changed_files = [normalize_changed_file(file) for file in pr.get_files()]
 
     context = {
         "mode": "pr",
         "source_repo": source_repo,
         "target_repo": repo_config["target_repo"],
-        "base_ref": getattr(pr.base, "sha", None) or getattr(pr.base, "ref", None) or repository.default_branch,
-        "head_ref": getattr(pr.head, "sha", None) or getattr(pr.head, "ref", None) or repository.default_branch,
-        "changed_files": [normalize_changed_file(file) for file in pr.get_files()],
+        "base_ref": base_ref,
+        "head_ref": head_ref,
+        "changed_files": changed_files,
         "repo_config": repo_config,
-        "source_pr_url": pr_url,
+        "source_pr_url": f"https://github.com/{source_repo}/pull/{pr_number}",
         "source_url": pr_url,
-        "source_description": f"PR #{pr_number}: {pr.title}",
+        "source_description": source_description,
         "pr_number": pr_number,
         "title": pr.title,
     }
+    context.update(extra_context)
     return context
 
 
@@ -298,8 +365,14 @@ def get_pr_diff(pr_url, github_client):
         owner, repo, pr_number = parse_pr_url(pr_url)
         source_repo = f"{owner}/{repo}"
         repository = github_client.get_repo(source_repo)
-        pr = repository.get_pull(pr_number)
-        files = [normalize_changed_file(file) for file in pr.get_files()]
+        range_info = parse_pr_commit_range_url(pr_url)
+        if range_info:
+            _, _, _, base_ref, head_ref = range_info
+            comparison = repository.compare(base_ref, head_ref)
+            files = [normalize_changed_file(file) for file in comparison.files]
+        else:
+            pr = repository.get_pull(pr_number)
+            files = [normalize_changed_file(file) for file in pr.get_files()]
         return build_diff_text(files)
     except Exception as e:
         print(f"   ❌ Error getting PR diff: {sanitize_exception_message(e)}")
@@ -2355,30 +2428,24 @@ def analyze_source_changes(
         source_description = source_context.get("source_description") or f"compare {base_ref}...{head_ref}"
         print(f"📋 Processing diff: {source_description}")
     else:
-        pr_url = source_context_or_pr_url
-        owner, repo, pr_number = parse_pr_url(pr_url)
-        source_repo = f"{owner}/{repo}"
+        source_context = build_pr_diff_context(
+            source_context_or_pr_url,
+            github_client,
+            repo_configs,
+        )
+        source_repo = source_context["source_repo"]
         repository = github_client.get_repo(source_repo)
-        pr = repository.get_pull(pr_number)
-        base_ref = getattr(pr.base, "sha", None) or getattr(pr.base, "ref", None) or repository.default_branch
-        head_ref = getattr(pr.head, "sha", None) or getattr(pr.head, "ref", None) or repository.default_branch
-        repo_config = get_repo_config(pr_url, repo_configs)
-        files = [normalize_changed_file(file) for file in pr.get_files()]
-        source_context = {
-            "mode": "pr",
-            "source_repo": source_repo,
-            "target_repo": repo_config["target_repo"],
-            "base_ref": base_ref,
-            "head_ref": head_ref,
-            "changed_files": files,
-            "repo_config": repo_config,
-            "source_pr_url": pr_url,
-            "source_url": pr_url,
-            "source_description": f"PR #{pr_number}: {pr.title}",
-            "pr_number": pr_number,
-            "title": pr.title,
-        }
-        print(f"📋 Processing PR #{pr_number}: {pr.title}")
+        base_ref = source_context["base_ref"]
+        head_ref = source_context["head_ref"]
+        repo_config = source_context["repo_config"]
+        files = [
+            file if isinstance(file, DiffFile) else normalize_changed_file(file)
+            for file in source_context["changed_files"]
+        ]
+        if source_context.get("source_range_url"):
+            print(f"📋 Processing diff: {source_context['source_description']}")
+        else:
+            print(f"📋 Processing PR #{source_context['pr_number']}: {source_context['title']}")
     
     # Separate markdown files and image files
     markdown_files = [f for f in files if f.filename.endswith('.md')]

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       source_pr_url:
-        description: 'Source PR URL (Chinese docs repository)'
+        description: 'Source PR URL, or PR files commit range URL (Chinese docs repository)'
         required: true
         type: string
         default: ''

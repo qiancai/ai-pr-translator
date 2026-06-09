@@ -32,7 +32,15 @@ os.environ.setdefault(
 
 # Import all modules
 from ai_client import UnifiedAIClient, thread_safe_print, print_lock, PROVIDER_MAX_TOKENS
-from diff_analyzer import analyze_source_changes, get_repo_config, get_target_hierarchy_and_content, get_source_file_hierarchy, parse_pr_url
+from diff_analyzer import (
+    analyze_source_changes,
+    build_diff_text,
+    build_pr_diff_context,
+    get_repo_config,
+    get_target_hierarchy_and_content,
+    get_source_file_hierarchy,
+    parse_pr_url,
+)
 from image_processor import process_all_images
 from file_adder import process_added_files
 from file_deleter import process_deleted_files
@@ -73,11 +81,8 @@ def get_workflow_repo_configs():
         raise ValueError("SOURCE_PR_URL and TARGET_PR_URL must be set")
     
     # Parse source and target repo info
-    source_parts = SOURCE_PR_URL.split('/')
-    target_parts = TARGET_PR_URL.split('/')
-    
-    source_owner, source_repo = source_parts[-4], source_parts[-3]
-    target_owner, target_repo = target_parts[-4], target_parts[-3]
+    source_owner, source_repo, _ = parse_pr_url(SOURCE_PR_URL)
+    target_owner, target_repo, _ = parse_pr_url(TARGET_PR_URL)
     
     source_repo_key = f"{source_owner}/{source_repo}"
     target_repo_key = f"{target_owner}/{target_repo}"
@@ -283,23 +288,8 @@ def format_unmatched_modified_sections_failure(file_path, missing_sections):
 def get_pr_diff(pr_url, github_client):
     """Get the diff content from a GitHub PR (from auto-sync-pr-changes.py)"""
     try:
-        from diff_analyzer import parse_pr_url
-        owner, repo, pr_number = parse_pr_url(pr_url)
-        repository = github_client.get_repo(f"{owner}/{repo}")
-        pr = repository.get_pull(pr_number)
-        
-        # Get files and their patches
-        files = pr.get_files()
-        diff_content = []
-        
-        for file in files:
-            if file.filename.endswith('.md') and file.patch:
-                diff_content.append(f"File: {file.filename}")
-                diff_content.append(file.patch)
-                diff_content.append("-" * 80)
-        
-        return "\n".join(diff_content)
-        
+        from diff_analyzer import get_pr_diff as get_diff
+        return get_diff(pr_url, github_client)
     except Exception as e:
         thread_safe_print(f"   ❌ Error getting PR diff: {sanitize_exception_message(e)}")
         return None
@@ -844,10 +834,16 @@ def main():
     # Get repository configuration using workflow config
     try:
         repo_configs = get_workflow_repo_configs()
-        repo_config = get_workflow_repo_config(SOURCE_PR_URL, repo_configs)
-        thread_safe_print(f"📁 Source Repo: {repo_config['source_repo']} ({repo_config['source_language']})")
-        thread_safe_print(f"📁 Target Repo: {repo_config['target_repo']} ({repo_config['target_language']})")
-        thread_safe_print(f"📁 Target Path: {repo_config['target_local_path']}")
+        workflow_repo_config = get_workflow_repo_config(SOURCE_PR_URL, repo_configs)
+        thread_safe_print(
+            f"📁 Source Repo: {workflow_repo_config['source_repo']} "
+            f"({workflow_repo_config['source_language']})"
+        )
+        thread_safe_print(
+            f"📁 Target Repo: {workflow_repo_config['target_repo']} "
+            f"({workflow_repo_config['target_language']})"
+        )
+        thread_safe_print(f"📁 Target Path: {workflow_repo_config['target_local_path']}")
     except ValueError as e:
         thread_safe_print(f"❌ {sanitize_exception_message(e)}")
         return
@@ -878,10 +874,14 @@ def main():
     
     # Step 1: Get PR diff
     thread_safe_print(f"\n📋 Step 1: Getting PR diff...")
-    pr_diff = get_pr_diff(SOURCE_PR_URL, github_client)
-    if pr_diff is None:
-        thread_safe_print("❌ Could not get PR diff")
+    try:
+        source_context = build_pr_diff_context(SOURCE_PR_URL, github_client, repo_configs)
+    except Exception as e:
+        thread_safe_print(f"❌ Could not build source diff context: {sanitize_exception_message(e)}")
         return
+    repo_config = source_context["repo_config"]
+    pr_diff = build_diff_text(source_context["changed_files"])
+    thread_safe_print(f"📋 Source diff: {source_context['source_description']}")
     if pr_diff:
         thread_safe_print(f"✅ Got PR diff: {len(pr_diff)} characters")
     else:
@@ -895,7 +895,7 @@ def main():
     # Step 2: Analyze source changes with operation categorization
     thread_safe_print(f"\n📊 Step 2: Analyzing source changes...")
     added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images = analyze_source_changes(
-        SOURCE_PR_URL, github_client, 
+        source_context, github_client,
         special_files=SPECIAL_FILES, 
         ignore_files=PR_MODE_IGNORE_FILES,
         repo_configs=repo_configs,
@@ -953,7 +953,7 @@ def main():
             def run_added_file(path=file_path, content=file_content):
                 success = process_added_files(
                     {path: content},
-                    SOURCE_PR_URL,
+                    source_context,
                     github_client,
                     ai_client,
                     repo_config,
@@ -989,7 +989,7 @@ def main():
                 success = process_toc_file(
                     path,
                     data,
-                    SOURCE_PR_URL,
+                    source_context,
                     github_client,
                     ai_client,
                     repo_config,
@@ -1021,7 +1021,7 @@ def main():
             def run_keyword_file(path=file_path, data=keyword_data):
                 if data.get("type") != "keyword":
                     return make_task_result("failure", f"Unknown keyword data type: {data.get('type')}")
-                success = process_keyword_file(path, data, SOURCE_PR_URL, github_client, ai_client, repo_config)
+                success = process_keyword_file(path, data, source_context, github_client, ai_client, repo_config)
                 if success:
                     return make_task_result("success")
                 return make_task_result("failure", "Keyword processor returned failure")
@@ -1055,7 +1055,7 @@ def main():
                     path,
                     sections,
                     pr_diff,
-                    SOURCE_PR_URL,
+                    source_context,
                     github_client,
                     ai_client,
                     repo_config,
@@ -1092,7 +1092,7 @@ def main():
     # Step 3.5: Process images (added, modified, deleted)
     if added_images or modified_images or deleted_images:
         thread_safe_print(f"\n🖼️  Step 3.5: Processing images...")
-        process_all_images(added_images, modified_images, deleted_images, SOURCE_PR_URL, github_client, repo_config)
+        process_all_images(added_images, modified_images, deleted_images, source_context, github_client, repo_config)
         thread_safe_print(f"   ✅ Images processed")
         git_add_changes(TARGET_REPO_PATH)
     

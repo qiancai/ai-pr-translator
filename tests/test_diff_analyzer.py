@@ -25,6 +25,8 @@ from diff_analyzer import (
     get_target_file_content,
     get_target_hierarchy_and_content,
     maybe_use_normalized_snapshot_operations,
+    parse_pr_commit_range_url,
+    parse_pr_url,
 )
 
 
@@ -42,6 +44,11 @@ class FakePR:
 
     def get_files(self):
         return self._files
+
+
+class ExplodingFilesPR(FakePR):
+    def get_files(self):
+        raise AssertionError("range PR context should not fetch full PR files")
 
 
 class FakeComparison:
@@ -171,6 +178,53 @@ class DiffAnalyzerContextTest(unittest.TestCase):
         source_diff = self.generated_file.read_text(encoding="utf-8")
         self.assertIn('"operation": "modified"', source_diff)
         self.assertIn("New text", source_diff)
+
+    def test_parse_pr_url_accepts_plain_and_files_range_urls(self):
+        plain_url = "https://github.com/acme/docs/pull/123/"
+        range_url = "https://github.com/acme/docs/pull/123/files/base123..head123?plain=1"
+
+        self.assertEqual(parse_pr_url(plain_url), ("acme", "docs", 123))
+        self.assertEqual(parse_pr_url(range_url), ("acme", "docs", 123))
+        self.assertIsNone(parse_pr_commit_range_url(plain_url))
+        self.assertEqual(
+            parse_pr_commit_range_url(range_url),
+            ("acme", "docs", 123, "base123", "head123"),
+        )
+
+    def test_pr_files_range_context_uses_compare_diff_but_stays_pr_mode(self):
+        full_pr_file = SimpleNamespace(
+            filename="full-pr.md",
+            status="modified",
+            patch="@@ -1 +1 @@\n-full\n+full pr",
+            previous_filename=None,
+        )
+        range_file = SimpleNamespace(
+            filename="range.md",
+            status="modified",
+            patch="@@ -1 +1 @@\n-old\n+range only",
+            previous_filename=None,
+        )
+        repository = FakeRepository(
+            {},
+            ExplodingFilesPR([full_pr_file], "Update range", "prbase", "prhead"),
+            {("base456", "head456"): [range_file]},
+        )
+        github = FakeGithub({"acme/docs": repository})
+
+        context = build_pr_diff_context(
+            "https://github.com/acme/docs/pull/123/files/base456..head456/",
+            github,
+            self.repo_configs,
+        )
+
+        self.assertEqual(context["mode"], "pr")
+        self.assertEqual(context["base_ref"], "base456")
+        self.assertEqual(context["head_ref"], "head456")
+        self.assertEqual([file.filename for file in context["changed_files"]], ["range.md"])
+        self.assertIn("commit range base456..head456", context["source_description"])
+        rendered_diff = build_diff_text(context["changed_files"])
+        self.assertIn("+range only", rendered_diff)
+        self.assertNotIn("full pr", rendered_diff)
 
     def test_commit_related_resources_added_section_is_filtered(self):
         file_path = "guide.md"
