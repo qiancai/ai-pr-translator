@@ -19,12 +19,14 @@ SOURCE_HEAD_REF = os.getenv("SOURCE_HEAD_REF", "")
 SOURCE_FOLDER = os.getenv("SOURCE_FOLDER", "")
 SOURCE_FILES = os.getenv("SOURCE_FILES", "")
 SOURCE_FILES_TRANSLATION_MODE = os.getenv("SOURCE_FILES_TRANSLATION_MODE", "incremental")
+SOURCE_LANGUAGE_OVERRIDE = os.getenv("SOURCE_LANGUAGE", "")
+TARGET_LANGUAGE_OVERRIDE = os.getenv("TARGET_LANGUAGE", "")
 IGNORE_RESOURCE_CARD_SECTION = (
     os.getenv("IGNORE_RESOURCE_CARD_SECTION")
     or os.getenv("ignore-resource-card-section")
     or "Yes"
 )
-CLOUD_TOC_FILES = os.getenv("CLOUD_TOC_FILES", "")
+CLOUD_TOC_FILES = os.getenv("TOC_FILES") or os.getenv("CLOUD_TOC_FILES", "")
 SOURCE_REPO_PATH = os.getenv("SOURCE_REPO_PATH", "")
 TARGET_REF = os.getenv("TARGET_REF", "")
 PREFER_LOCAL_TARGET_FOR_READ = os.getenv("PREFER_LOCAL_TARGET_FOR_READ", "false").lower() == "true"
@@ -379,7 +381,11 @@ def _process_commit_modified_file(
 
 def get_commit_repo_config():
     """Build a minimal repo config for commit-driven sync."""
-    source_language, target_language = infer_language_direction(SOURCE_REPO, TARGET_REPO)
+    if SOURCE_LANGUAGE_OVERRIDE and TARGET_LANGUAGE_OVERRIDE:
+        source_language = SOURCE_LANGUAGE_OVERRIDE
+        target_language = TARGET_LANGUAGE_OVERRIDE
+    else:
+        source_language, target_language = infer_language_direction(SOURCE_REPO, TARGET_REPO)
     return {
         "source_repo": SOURCE_REPO,
         "target_repo": TARGET_REPO,

@@ -227,8 +227,8 @@ def append_github_output(output_path, values):
 
 def main():
     docs_source_path = os.environ["DOCS_SOURCE_PATH"]
-    toc_files = parse_list(os.environ["CLOUD_TOC_FILES"])
-    cloud_index_files = parse_list(os.getenv("CLOUD_INDEX_FILES", ""))
+    toc_files = parse_list(os.getenv("TOC_FILES") or os.environ.get("CLOUD_TOC_FILES", ""))
+    cloud_index_files = parse_list(os.getenv("INDEX_FILES") or os.getenv("CLOUD_INDEX_FILES", ""))
     input_file_names = os.getenv("INPUT_FILE_NAMES", "")
     base_ref = os.environ["BASE_REF"]
     head_ref = os.environ["HEAD_REF"]
