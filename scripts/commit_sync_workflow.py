@@ -21,6 +21,7 @@ SOURCE_FILES = os.getenv("SOURCE_FILES", "")
 SOURCE_FILES_TRANSLATION_MODE = os.getenv("SOURCE_FILES_TRANSLATION_MODE", "incremental")
 SOURCE_LANGUAGE_OVERRIDE = os.getenv("SOURCE_LANGUAGE", "")
 TARGET_LANGUAGE_OVERRIDE = os.getenv("TARGET_LANGUAGE", "")
+COMMIT_IGNORE_FOLDERS_OVERRIDE = os.getenv("COMMIT_IGNORE_FOLDERS", "")
 IGNORE_RESOURCE_CARD_SECTION = (
     os.getenv("IGNORE_RESOURCE_CARD_SECTION")
     or os.getenv("ignore-resource-card-section")
@@ -1157,7 +1158,9 @@ def get_commit_ignore_files():
 
 
 def get_commit_ignore_folders():
-    """Return commit-mode ignore folders."""
+    """Return commit-mode ignore folders from env override or config file."""
+    if COMMIT_IGNORE_FOLDERS_OVERRIDE:
+        return [f.strip().strip("/").strip() for f in COMMIT_IGNORE_FOLDERS_OVERRIDE.split(",") if f.strip()]
     return list(COMMIT_BASED_MODE_IGNORE_FOLDERS)
 
 
