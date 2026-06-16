@@ -1185,7 +1185,9 @@ def should_process_modified_file_as_added(source_file_path, repo_config, github_
 def build_exclude_folders(repo_config):
     """Build the early-exclusion folder list for commit sync."""
     exclude_folders = []
-    if repo_config.get("target_language") != "Chinese":
+    target_lang = (repo_config.get("target_language") or "").lower()
+    source_lang = (repo_config.get("source_language") or "").lower()
+    if not target_lang or target_lang == source_lang:
         return exclude_folders
 
     for folder_name in get_commit_ignore_folders():

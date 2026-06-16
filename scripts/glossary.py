@@ -69,10 +69,10 @@ def load_glossary(terms_path):
             if len(columns) >= 2:
                 entry = {
                     'en': columns[0],
-                    'zh': columns[1],
+                    'target': columns[1],
                     'comment': columns[2] if len(columns) >= 3 else ''
                 }
-                if entry['en'] and entry['zh']:
+                if entry['en'] and entry['target']:
                     glossary.append(entry)
 
         print(f"   📚 Loaded {len(glossary)} glossary terms from {terms_path}")
@@ -91,33 +91,33 @@ def create_glossary_matcher(glossary):
             matcher(text, source_language=None) -> list of matched term dicts
 
         source_language controls which glossary column is searched:
-          - "Chinese"  -> match the zh column against the text
-          - "English"  -> match the en column against the text
+          - "English"  -> match the en (source) column against the text
+          - Other      -> match the target column against the text
           - None       -> match both columns (fallback)
     """
     if not glossary:
         return None
 
     MIN_EN_LEN = 2
-    MIN_ZH_LEN = 2
+    MIN_TARGET_LEN = 2
 
     valid_terms = []
     for entry in glossary:
         en = entry['en']
-        zh = entry['zh']
-        if len(en) < MIN_EN_LEN and len(zh) < MIN_ZH_LEN:
+        target = entry['target']
+        if len(en) < MIN_EN_LEN and len(target) < MIN_TARGET_LEN:
             continue
         valid_terms.append({
             'en': en,
             'en_lower': en.lower(),
             'en_regex': _build_term_matcher(en),
-            'zh': zh,
-            'zh_regex': _build_term_matcher(zh),
+            'target': target,
+            'target_regex': _build_term_matcher(target),
             'comment': entry.get('comment', ''),
         })
 
     # Longer terms first so more specific matches take priority
-    valid_terms.sort(key=lambda x: max(len(x['en']), len(x['zh'])), reverse=True)
+    valid_terms.sort(key=lambda x: max(len(x['en']), len(x['target'])), reverse=True)
 
     def matcher(text, source_language=None):
         if not text:
@@ -133,11 +133,10 @@ def create_glossary_matcher(glossary):
 
             hit = False
 
-            # Determine which columns to check based on source_language
             check_en = source_language in (None, "English")
-            check_zh = source_language in (None, "Chinese")
+            check_target = source_language is None or source_language != "English"
 
-            # --- English column ---
+            # --- English (source) column ---
             if not hit and check_en and len(term['en']) >= MIN_EN_LEN:
                 if term['en_regex']:
                     if term['en_regex'].search(text):
@@ -145,19 +144,19 @@ def create_glossary_matcher(glossary):
                 elif term['en_lower'] in text_lower:
                     hit = True
 
-            # --- Chinese column ---
-            if not hit and check_zh and len(term['zh']) >= MIN_ZH_LEN:
-                if term['zh_regex']:
-                    if term['zh_regex'].search(text):
+            # --- Target language column ---
+            if not hit and check_target and len(term['target']) >= MIN_TARGET_LEN:
+                if term['target_regex']:
+                    if term['target_regex'].search(text):
                         hit = True
-                elif term['zh'] in text:
+                elif term['target'] in text:
                     hit = True
 
             if hit:
                 seen_en.add(term['en_lower'])
                 matched.append({
                     'en': term['en'],
-                    'zh': term['zh'],
+                    'target': term['target'],
                     'comment': term['comment']
                 })
 
@@ -192,7 +191,7 @@ def filter_terms_for_content(glossary_matcher, *content_parts, source_language=N
     return glossary_matcher(combined, source_language=source_language)
 
 
-def format_terms_for_prompt(matched_terms):
+def format_terms_for_prompt(matched_terms, source_language="English", target_language="Chinese"):
     """Format matched terms as a markdown table for inclusion in AI prompt.
 
     Returns:
@@ -201,13 +200,16 @@ def format_terms_for_prompt(matched_terms):
     if not matched_terms:
         return ""
 
+    source_label = source_language or "English"
+    target_label = target_language or "Chinese"
     lines = [
         "Glossary - Use the following term translations for consistency:",
-        "| English | Chinese | Comment |",
+        f"| {source_label} | {target_label} | Comment |",
         "|:---|:---|:---|",
     ]
     for term in matched_terms:
         comment = term.get('comment', '')
-        lines.append(f"| {term['en']} | {term['zh']} | {comment} |")
+        target_value = term.get('target') or term.get('zh', '')
+        lines.append(f"| {term['en']} | {target_value} | {comment} |")
 
     return '\n'.join(lines)

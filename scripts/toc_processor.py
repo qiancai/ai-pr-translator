@@ -786,7 +786,11 @@ def build_toc_glossary_prompt(glossary_matcher, repo_config, *content_parts):
     if not matched_terms:
         return "", ""
 
-    glossary_text = format_terms_for_prompt(matched_terms)
+    glossary_text = format_terms_for_prompt(
+        matched_terms,
+        source_language=repo_config["source_language"],
+        target_language=repo_config["target_language"],
+    )
     thread_safe_print(f"   📚 Matched {len(matched_terms)} glossary terms for TOC translation")
     glossary_prompt_section = f"\nGlossary for terms in {repo_config['source_language']} and {repo_config['target_language']}:\n{glossary_text}\n"
     glossary_instruction = "\n5. When translating terms listed in the glossary above, use the provided translations for consistency."

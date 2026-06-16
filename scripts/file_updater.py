@@ -211,8 +211,22 @@ def get_tidb_cloud_absolute_link_prefix():
     return os.getenv("TIDB_CLOUD_ABSOLUTE_LINK_PREFIX", TIDB_CLOUD_ABSOLUTE_LINK_PREFIX)
 
 
-def normalize_aliases_value_for_zh(value):
-    """Add /zh to alias paths that do not already carry the zh prefix."""
+LANGUAGE_ALIAS_PREFIX = {
+    "chinese": "/zh",
+    "japanese": "/ja",
+}
+
+
+def get_language_alias_prefix(target_language):
+    """Return the URL alias prefix for a target language, e.g. '/zh' or '/ja'."""
+    return LANGUAGE_ALIAS_PREFIX.get((target_language or "").lower(), "")
+
+
+def normalize_aliases_value(value, lang_prefix):
+    """Add a language prefix (e.g. /zh, /ja) to alias paths that do not already carry it."""
+    if not lang_prefix:
+        return value
+
     try:
         aliases = ast.literal_eval(value)
     except (SyntaxError, ValueError):
@@ -228,8 +242,8 @@ def normalize_aliases_value_for_zh(value):
             return value
 
         updated = alias
-        if alias.startswith("/") and alias != "/zh" and not alias.startswith("/zh/"):
-            updated = f"/zh{alias}"
+        if alias.startswith("/") and alias != lang_prefix and not alias.startswith(lang_prefix + "/"):
+            updated = f"{lang_prefix}{alias}"
         normalized.append(updated)
         if updated != alias:
             changed = True
@@ -240,16 +254,19 @@ def normalize_aliases_value_for_zh(value):
     return "[" + ",".join(repr(alias) for alias in normalized) + "]"
 
 
-def preprocess_aliases_line_for_zh(line, diff_added_only=False):
-    """Normalize aliases lines for English->Chinese translation prompts."""
+def preprocess_aliases_line(line, lang_prefix, diff_added_only=False):
+    """Normalize aliases lines by adding the target-language prefix."""
     if diff_added_only and not line.startswith("+"):
+        return line
+
+    if not lang_prefix:
         return line
 
     match = ALIASES_LINE_RE.match(line)
     if not match:
         return line
 
-    normalized_value = normalize_aliases_value_for_zh(match.group("value"))
+    normalized_value = normalize_aliases_value(match.group("value"), lang_prefix)
     if normalized_value == match.group("value"):
         return line
 
@@ -257,6 +274,11 @@ def preprocess_aliases_line_for_zh(line, diff_added_only=False):
         f"{match.group('prefix')}{match.group('indent')}aliases:"
         f"{match.group('spacing')}{normalized_value}"
     )
+
+
+def preprocess_aliases_line_for_zh(line, diff_added_only=False):
+    """Backward-compatible wrapper: normalize aliases for /zh prefix."""
+    return preprocess_aliases_line(line, "/zh", diff_added_only=diff_added_only)
 
 
 def build_tidb_cloud_absolute_url(relative_url):
@@ -295,11 +317,15 @@ def preprocess_tidb_cloud_links_in_line(line, diff_added_only=False):
 
 
 def preprocess_diff_for_heading_anchor_stability(pr_diff, source_language, target_language, source_mode=""):
-    """Add prompt-only stability tweaks for commit-based English -> Chinese translation."""
+    """Add prompt-only stability tweaks for commit-based English -> non-English translation."""
     if not pr_diff:
         return pr_diff
 
-    if (source_language or "").lower() != "english" or (target_language or "").lower() != "chinese":
+    if (source_language or "").lower() != "english":
+        return pr_diff
+
+    normalized_target = (target_language or "").lower()
+    if normalized_target == "english":
         return pr_diff
 
     enable_commit_only_preprocessing = (source_mode or "").lower() == "commit"
@@ -311,6 +337,8 @@ def preprocess_diff_for_heading_anchor_stability(pr_diff, source_language, targe
 
     if not enable_commit_only_preprocessing and not enable_tidb_cloud_link_rewrite:
         return pr_diff
+
+    lang_prefix = get_language_alias_prefix(target_language)
 
     lines = pr_diff.splitlines()
     processed_lines = []
@@ -342,7 +370,7 @@ def preprocess_diff_for_heading_anchor_stability(pr_diff, source_language, targe
                 continue
 
         if enable_commit_only_preprocessing:
-            line = preprocess_aliases_line_for_zh(line, diff_added_only=True)
+            line = preprocess_aliases_line(line, lang_prefix, diff_added_only=True)
         if enable_tidb_cloud_link_rewrite:
             line = preprocess_tidb_cloud_links_in_line(line, diff_added_only=True)
         processed_lines.append(line)
@@ -761,7 +789,11 @@ def _prepare_translation_prompt(
             source_language=source_language,
         )
         if matched_terms:
-            glossary_text = format_terms_for_prompt(matched_terms)
+            glossary_text = format_terms_for_prompt(
+                matched_terms,
+                source_language=source_language,
+                target_language=target_language,
+            )
             glossary_prompt_section = f"\n4. {glossary_text}\n"
             glossary_instruction = "\nWhen translating the target content, use the translations of the terms provided below to maintain consistency."
             thread_safe_print(f"   📚 Matched {len(matched_terms)} glossary terms for prompt")
