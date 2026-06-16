@@ -104,7 +104,7 @@ def create_glossary_matcher(glossary):
     valid_terms = []
     for entry in glossary:
         en = entry['en']
-        target = entry['target']
+        target = entry.get('target') or entry.get('zh', '')
         if len(en) < MIN_EN_LEN and len(target) < MIN_TARGET_LEN:
             continue
         valid_terms.append({
@@ -133,8 +133,9 @@ def create_glossary_matcher(glossary):
 
             hit = False
 
-            check_en = source_language in (None, "English")
-            check_target = source_language is None or source_language != "English"
+            normalized_src = (source_language or "").lower()
+            check_en = source_language is None or normalized_src == "english"
+            check_target = source_language is None or normalized_src != "english"
 
             # --- English (source) column ---
             if not hit and check_en and len(term['en']) >= MIN_EN_LEN:

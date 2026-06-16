@@ -382,7 +382,12 @@ def _process_commit_modified_file(
 
 def get_commit_repo_config():
     """Build a minimal repo config for commit-driven sync."""
-    if SOURCE_LANGUAGE_OVERRIDE and TARGET_LANGUAGE_OVERRIDE:
+    if SOURCE_LANGUAGE_OVERRIDE or TARGET_LANGUAGE_OVERRIDE:
+        if not (SOURCE_LANGUAGE_OVERRIDE and TARGET_LANGUAGE_OVERRIDE):
+            raise ValueError(
+                "SOURCE_LANGUAGE and TARGET_LANGUAGE must both be set or both be empty. "
+                f"Got SOURCE_LANGUAGE={SOURCE_LANGUAGE_OVERRIDE!r}, TARGET_LANGUAGE={TARGET_LANGUAGE_OVERRIDE!r}"
+            )
         source_language = SOURCE_LANGUAGE_OVERRIDE
         target_language = TARGET_LANGUAGE_OVERRIDE
     else:
