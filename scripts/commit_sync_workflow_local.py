@@ -10,7 +10,7 @@ import os
 import sys
 
 
-TEST_OPTION = "cloud"  # Options: "ai", "cloud"
+TEST_OPTION = "ja"  # Options: "ai", "cloud", "ja"
 
 # Options: "incremental" for commit diff translation, or "full" for complete
 # SOURCE_FILES translation from SOURCE_HEAD_REF using the file-added flow.
@@ -63,7 +63,7 @@ TEST_CONFIGS = {
         # Keep SOURCE_FOLDER empty. Put resolved Cloud TOC-scoped files here.
         "SOURCE_FOLDER": "", ## Leave this field empty when translating cloud docs.
         "SOURCE_FILES": "tidb-cloud/premium/tidb-cloud-auditing-premium.md",
-        "AUTO_RESOLVE_CLOUD_SOURCE_FILES": True,
+        "AUTO_RESOLVE_TOC_SOURCE_FILES": True,
         "CLOUD_TOC_FILES": (
             "TOC-tidb-cloud.md,"
             "TOC-tidb-cloud-starter.md,"
@@ -86,11 +86,44 @@ TEST_CONFIGS = {
         "PREFER_LOCAL_TARGET_FOR_READ": True,
         "TERMS_PATH": "/Users/grcai/Documents/GitHub/terms.md",
     },
+    "ja": {
+        "SOURCE_REPO": "pingcap/docs",
+        "TARGET_REPO": "pingcap/docs",
+        "SOURCE_LANGUAGE": "English",
+        "TARGET_LANGUAGE": "Japanese",
+        # Set SOURCE_BASE_REF from latest_translation_commit.json on i18n-ja-release-8.5
+        # and SOURCE_HEAD_REF from release-8.5 HEAD.
+        "SOURCE_BASE_REF": "2eaf0b7cd9c870d6f25c0dea7c7e1bb64ba2572b",
+        "SOURCE_HEAD_REF": "bcae45d9807623ddff853a8f33e3e2943592cbac",
+        "SOURCE_FOLDER": "",
+        "SOURCE_FILES": "tidb-cloud/built-in-monitoring.md",
+        "AUTO_RESOLVE_TOC_SOURCE_FILES": True,
+        "TOC_FILES": (
+            "TOC.md,"
+            "TOC-ai.md,"
+            "TOC-api.md,"
+            "TOC-best-practices.md,"
+            "TOC-develop.md,"
+            "TOC-tidb-releases.md,"
+            "TOC-tidb-cloud.md,"
+            "TOC-tidb-cloud-starter.md,"
+            "TOC-tidb-cloud-essential.md,"
+            "TOC-tidb-cloud-releases.md,"
+            "TOC-tidb-cloud-premium.md"
+        ),
+        # SOURCE_REPO_PATH should be a local checkout/worktree of pingcap/docs release-8.5.
+        "SOURCE_REPO_PATH": "/Users/grcai/Documents/GitHub/docs",
+        # TARGET_REPO_PATH should be a local checkout/worktree of pingcap/docs i18n-ja-release-8.5.
+        "TARGET_REPO_PATH": "/Users/grcai/Documents/GitHub/docs",
+        "TARGET_REF": "i18n-ja-release-8.5",
+        "PREFER_LOCAL_TARGET_FOR_READ": True,
+        "TERMS_PATH": "/Users/grcai/Documents/GitHub/docs/resources/terms-en-ja.md",
+    },
 }
 
 
 LOCAL_ONLY_CONFIG_KEYS = {
-    "AUTO_RESOLVE_CLOUD_SOURCE_FILES",
+    "AUTO_RESOLVE_TOC_SOURCE_FILES",
     "CLOUD_INDEX_FILES",
 }
 
@@ -103,8 +136,8 @@ def build_config(test_option):
     return {**COMMON_CONFIG, **TEST_CONFIGS[test_option]}
 
 
-def resolve_cloud_source_files_for_local(config):
-    if TEST_OPTION != "cloud" or not config.get("AUTO_RESOLVE_CLOUD_SOURCE_FILES"):
+def resolve_toc_source_files_for_local(config):
+    if not config.get("AUTO_RESOLVE_TOC_SOURCE_FILES"):
         return config, True
 
     from resolve_cloud_source_files import (
@@ -115,13 +148,13 @@ def resolve_cloud_source_files_for_local(config):
         resolve_source_files,
     )
 
-    toc_files = parse_list(config.get("CLOUD_TOC_FILES", ""))
+    toc_files = parse_list(config.get("TOC_FILES") or config.get("CLOUD_TOC_FILES", ""))
     if not toc_files:
-        print("❌ CLOUD_TOC_FILES is empty.")
+        print("❌ TOC_FILES / CLOUD_TOC_FILES is empty.")
         return config, None
 
     input_file_names = config.get("SOURCE_FILES", "")
-    cloud_index_files = parse_list(config.get("CLOUD_INDEX_FILES", ""))
+    cloud_index_files = parse_list(config.get("INDEX_FILES") or config.get("CLOUD_INDEX_FILES", ""))
     source_repo_path = config.get("SOURCE_REPO_PATH", "")
     base_ref = config.get("SOURCE_BASE_REF", "")
     head_ref = config.get("SOURCE_HEAD_REF", "")
@@ -146,16 +179,16 @@ def resolve_cloud_source_files_for_local(config):
             toc_scope_added_files=toc_scope_added_files,
         )
     except Exception as e:
-        print(f"❌ Failed to resolve Cloud source files: {e}")
+        print(f"❌ Failed to resolve TOC-scoped source files: {e}")
         return config, None
 
     if not resolved:
-        print("ℹ️  No Cloud TOC-scoped source changes detected. Nothing to translate.")
+        print("ℹ️  No TOC-scoped source changes detected. Nothing to translate.")
         return config, False
 
     updated = dict(config)
     updated["SOURCE_FILES"] = ",".join(resolved)
-    print(f"📄 Resolved Cloud source files: {updated['SOURCE_FILES']}")
+    print(f"📄 Resolved TOC-scoped source files: {updated['SOURCE_FILES']}")
     return updated, True
 
 
@@ -181,7 +214,7 @@ def main():
             print(f"   {name} is empty")
         return 1
 
-    config, should_run = resolve_cloud_source_files_for_local(config)
+    config, should_run = resolve_toc_source_files_for_local(config)
     if should_run is None:
         return 1
     if not should_run:

@@ -36,7 +36,7 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
         ), mock.patch.object(
             commit_sync_workflow_local, "build_config", return_value=config
         ), mock.patch.object(
-            commit_sync_workflow_local, "resolve_cloud_source_files_for_local", return_value=(config, True)
+            commit_sync_workflow_local, "resolve_toc_source_files_for_local", return_value=(config, True)
         ), mock.patch.object(
             workflow, "main", return_value=0
         ):
