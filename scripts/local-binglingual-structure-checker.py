@@ -92,6 +92,16 @@ def discover_all_tocs(source_root: Path) -> list[str]:
     return sorted(p.name for p in source_root.glob("TOC*.md"))
 
 
+def format_problematic_file_list(issues: list[StructureValidationIssue]) -> str:
+    seen = set()
+    files = []
+    for issue in issues:
+        if issue.file_path not in seen:
+            seen.add(issue.file_path)
+            files.append(issue.file_path)
+    return ",".join(files)
+
+
 def read_text(path: Path) -> str | None:
     if not path.exists():
         return None
@@ -523,14 +533,33 @@ def main() -> int:
         return 2
 
     issues = []
+    files_with_issues = set()
+    source_missing = 0
+    target_missing = 0
     for rel_path in file_paths:
-        issues.extend(check_file(source_root, target_root, rel_path))
+        file_issues = check_file(source_root, target_root, rel_path)
+        if file_issues:
+            files_with_issues.add(rel_path)
+            for fi in file_issues:
+                if fi.reason == "source file missing":
+                    source_missing += 1
+                elif fi.reason == "target file missing":
+                    target_missing += 1
+        issues.extend(file_issues)
+
+    files_passed = len(file_paths) - len(files_with_issues)
 
     print(f"Source root ({source_label}): {source_root}")
     print(f"Target root ({target_label}): {target_root}")
     print(f"TOC scope: {TOC_SCOPE} ({len(toc_files)} TOC files: {', '.join(toc_files)})")
     print(f"Markdown files in scope: {len(file_paths)}")
-    print(f"Document structure issues: {len(issues)}")
+    print(f"  Passed (structure match): {files_passed}")
+    print(f"  With issues: {len(files_with_issues)}")
+    if source_missing:
+        print(f"    Source missing: {source_missing}")
+    if target_missing:
+        print(f"    Target missing: {target_missing}")
+    print(f"Total structure issues: {len(issues)}")
 
     if issues:
         print()
@@ -563,6 +592,9 @@ def main() -> int:
     write_excel_report(issues, excel_path, source_root, target_root, source_label, target_label)
     print()
     print(f"Excel report written to: {excel_path}")
+    print()
+    print("Problematic files (comma-separated):")
+    print(format_problematic_file_list(issues))
 
     return 1 if issues else 0
 

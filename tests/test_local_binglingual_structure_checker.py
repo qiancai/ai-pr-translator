@@ -164,6 +164,17 @@ class LocalBinglingualStructureCheckerTest(unittest.TestCase):
 
         self.assertEqual(["TOC-cloud.md", "TOC.md"], tocs)
 
+    def test_format_problematic_file_list_deduplicates_in_order(self):
+        issues = [
+            checker.StructureValidationIssue("a.md", "heading level sequence differs"),
+            checker.StructureValidationIssue("b.md", "target file missing"),
+            checker.StructureValidationIssue("a.md", "CustomContent tag sequence differs"),
+        ]
+
+        file_list = checker.format_problematic_file_list(issues)
+
+        self.assertEqual("a.md,b.md", file_list)
+
 
 if __name__ == "__main__":
     unittest.main()
