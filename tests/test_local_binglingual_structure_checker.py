@@ -22,22 +22,22 @@ class LocalBinglingualStructureCheckerTest(unittest.TestCase):
     def test_check_file_reports_heading_and_custom_content_issues(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            en_root = root / "en"
-            zh_root = root / "zh"
-            en_root.mkdir()
-            zh_root.mkdir()
+            source_root = root / "source"
+            target_root = root / "target"
+            source_root.mkdir()
+            target_root.mkdir()
 
             rel_path = "guide.md"
-            (en_root / rel_path).write_text(
+            (source_root / rel_path).write_text(
                 '<CustomContent plan="essential">\n\n# Guide\n\n## Section\n\n</CustomContent>\n',
                 encoding="utf-8",
             )
-            (zh_root / rel_path).write_text(
+            (target_root / rel_path).write_text(
                 "# 指南\n\n### Section\n",
                 encoding="utf-8",
             )
 
-            issues = checker.check_file(en_root, zh_root, rel_path)
+            issues = checker.check_file(source_root, target_root, rel_path)
 
         self.assertEqual(
             ["heading level sequence differs", "CustomContent tag sequence differs"],
@@ -47,13 +47,13 @@ class LocalBinglingualStructureCheckerTest(unittest.TestCase):
     def test_check_file_reports_missing_target(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            en_root = root / "en"
-            zh_root = root / "zh"
-            en_root.mkdir()
-            zh_root.mkdir()
-            (en_root / "guide.md").write_text("# Guide\n", encoding="utf-8")
+            source_root = root / "source"
+            target_root = root / "target"
+            source_root.mkdir()
+            target_root.mkdir()
+            (source_root / "guide.md").write_text("# Guide\n", encoding="utf-8")
 
-            issues = checker.check_file(en_root, zh_root, "guide.md")
+            issues = checker.check_file(source_root, target_root, "guide.md")
 
         self.assertEqual(["target file missing"], [issue.reason for issue in issues])
 
@@ -83,29 +83,32 @@ class LocalBinglingualStructureCheckerTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            en_root = root / "en"
-            zh_root = root / "zh"
-            en_root.mkdir()
-            zh_root.mkdir()
-            (en_root / "heading.md").write_text(
+            source_root = root / "source"
+            target_root = root / "target"
+            source_root.mkdir()
+            target_root.mkdir()
+            (source_root / "heading.md").write_text(
                 "# Title\n\n## Step\n",
                 encoding="utf-8",
             )
-            (zh_root / "heading.md").write_text(
-                "# 标题\n\n### 步骤\n",
+            (target_root / "heading.md").write_text(
+                "# タイトル\n\n### ステップ\n",
                 encoding="utf-8",
             )
-            (en_root / "custom.md").write_text(
+            (source_root / "custom.md").write_text(
                 '<CustomContent plan="essential">\n\n# Guide\n\n</CustomContent>\n',
                 encoding="utf-8",
             )
-            (zh_root / "custom.md").write_text(
-                "# 指南\n",
+            (target_root / "custom.md").write_text(
+                "# ガイド\n",
                 encoding="utf-8",
             )
 
             output = root / "issues.xlsx"
-            checker.write_excel_report(issues, output, en_root, zh_root)
+            checker.write_excel_report(
+                issues, output, source_root, target_root,
+                source_label="English", target_label="Japanese",
+            )
             workbook = load_workbook(output)
             heading_rows = list(workbook["Heading"].iter_rows(values_only=True))
             custom_rows = list(workbook["CustomContent"].iter_rows(values_only=True))
@@ -117,9 +120,9 @@ class LocalBinglingualStructureCheckerTest(unittest.TestCase):
                 "English Line",
                 "English Level",
                 "English Heading",
-                "Chinese Line",
-                "Chinese Level",
-                "Chinese Heading",
+                "Japanese Line",
+                "Japanese Level",
+                "Japanese Heading",
                 "Level Match",
             ),
             heading_rows[1],
@@ -129,16 +132,16 @@ class LocalBinglingualStructureCheckerTest(unittest.TestCase):
                 "#",
                 "English Line",
                 "English Tag",
-                "Chinese Line",
-                "Chinese Tag",
+                "Japanese Line",
+                "Japanese Tag",
                 "Tag Match",
             ),
             custom_rows[1],
         )
         self.assertEqual("heading.md", heading_rows[0][0])
         self.assertEqual("heading level sequence differs", heading_rows[0][1])
-        self.assertEqual((1, 1, "#", "Title", 1, "#", "标题", "Match"), heading_rows[2])
-        self.assertEqual((2, 3, "##", "Step", 3, "###", "步骤", "Mismatch"), heading_rows[3])
+        self.assertEqual((1, 1, "#", "Title", 1, "#", "タイトル", "Match"), heading_rows[2])
+        self.assertEqual((2, 3, "##", "Step", 3, "###", "ステップ", "Mismatch"), heading_rows[3])
         self.assertEqual("custom.md", custom_rows[0][0])
         self.assertEqual("CustomContent tag sequence differs", custom_rows[0][1])
         self.assertEqual(
@@ -149,6 +152,17 @@ class LocalBinglingualStructureCheckerTest(unittest.TestCase):
             (2, 5, "</CustomContent>", None, "(missing)", "Mismatch"),
             custom_rows[3],
         )
+
+    def test_discover_all_tocs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "TOC.md").write_text("- [Guide](/guide.md)\n", encoding="utf-8")
+            (root / "TOC-cloud.md").write_text("- [Cloud](/cloud.md)\n", encoding="utf-8")
+            (root / "README.md").write_text("# Docs\n", encoding="utf-8")
+
+            tocs = checker.discover_all_tocs(root)
+
+        self.assertEqual(["TOC-cloud.md", "TOC.md"], tocs)
 
 
 if __name__ == "__main__":

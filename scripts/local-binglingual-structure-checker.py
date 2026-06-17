@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Check local English/Chinese Markdown document structures for Cloud docs."""
+"""
+Check local bilingual Markdown document structures.
+
+Edit the configuration variables below, then run:
+
+    python local-binglingual-structure-checker.py
+"""
 
 from __future__ import annotations
 
-import argparse
 from datetime import datetime
 import json
 from pathlib import Path
@@ -23,9 +28,19 @@ from translation_structure_validator import (
 )
 
 
-DEFAULT_EN_ROOT = Path("/Users/grcai/Documents/GitHub/docs-en-release-8.5")
-DEFAULT_ZH_ROOT = Path("/Users/grcai/Documents/GitHub/docs")
-DEFAULT_CLOUD_TOCS = [
+# ---------------------------------------------------------------------------
+# Configuration — edit these variables before running
+# ---------------------------------------------------------------------------
+
+SOURCE_LANGUAGE = "English"
+TARGET_LANGUAGE = "Japanese" ## Options: "Chinese", "Japanese"
+
+SOURCE_ROOT = "/Users/grcai/Documents/GitHub/docs-en-release-8.5"
+TARGET_ROOT = "/Users/grcai/Documents/GitHub/docs"
+
+TOC_SCOPE = "all"  # Options: "all", "partial". "all" means all TOC*.md files in SOURCE_ROOT will be scanned, while "partial" means only the files listed in TOC_LIST will be scanned.
+
+TOC_LIST = [
     "TOC-tidb-cloud.md",
     "TOC-tidb-cloud-starter.md",
     "TOC-tidb-cloud-essential.md",
@@ -33,6 +48,17 @@ DEFAULT_CLOUD_TOCS = [
     "TOC-tidb-cloud-releases.md",
 ]
 
+# Maximum issues to print in the terminal; 0 means print all.
+PRINT_LIMIT = 0
+
+# Optional output paths; leave empty to skip JSON or use a default Excel path.
+JSON_OUT = ""
+EXCEL_OUT = ""  # defaults to local_structure_check_<timestamp>.xlsx next to this script
+
+
+# ---------------------------------------------------------------------------
+# Implementation — no need to edit below
+# ---------------------------------------------------------------------------
 
 def normalize_doc_path(value: str) -> str:
     rel = (value or "").strip().replace("\\", "/")
@@ -45,13 +71,13 @@ def normalize_doc_path(value: str) -> str:
     return rel
 
 
-def collect_cloud_markdown_files(en_root: Path, toc_files: list[str]) -> list[str]:
+def collect_toc_markdown_files(source_root: Path, toc_files: list[str]) -> list[str]:
     files = set()
 
     for toc_file in toc_files:
-        toc_path = en_root / toc_file
+        toc_path = source_root / toc_file
         if not toc_path.exists():
-            raise FileNotFoundError(f"Cloud TOC file not found: {toc_path}")
+            raise FileNotFoundError(f"TOC file not found: {toc_path}")
 
         for link in extract_markdown_doc_links(toc_path.read_text(encoding="utf-8")):
             rel = normalize_doc_path(link)
@@ -61,25 +87,30 @@ def collect_cloud_markdown_files(en_root: Path, toc_files: list[str]) -> list[st
     return sorted(files)
 
 
+def discover_all_tocs(source_root: Path) -> list[str]:
+    """Return sorted list of TOC*.md filenames found in source_root."""
+    return sorted(p.name for p in source_root.glob("TOC*.md"))
+
+
 def read_text(path: Path) -> str | None:
     if not path.exists():
         return None
     return path.read_text(encoding="utf-8")
 
 
-def check_file(en_root: Path, zh_root: Path, rel_path: str) -> list[StructureValidationIssue]:
-    en_content = read_text(en_root / rel_path)
-    zh_content = read_text(zh_root / rel_path)
+def check_file(source_root: Path, target_root: Path, rel_path: str) -> list[StructureValidationIssue]:
+    source_content = read_text(source_root / rel_path)
+    target_content = read_text(target_root / rel_path)
 
-    if en_content is None:
+    if source_content is None:
         return [StructureValidationIssue(rel_path, "source file missing")]
-    if zh_content is None:
+    if target_content is None:
         return [StructureValidationIssue(rel_path, "target file missing")]
 
     return validate_markdown_heading_structures(
         [rel_path],
-        source_content_loader=lambda _: en_content,
-        target_content_loader=lambda _: zh_content,
+        source_content_loader=lambda _: source_content,
+        target_content_loader=lambda _: target_content,
     )
 
 
@@ -241,15 +272,18 @@ def _tag_signature(tag):
     return (tag.kind, tag.text) if tag else None
 
 
-def _write_heading_issue_table(worksheet, row_num: int, issue, en_content, zh_content) -> int:
+def _write_heading_issue_table(
+    worksheet, row_num: int, issue, source_content, target_content,
+    source_label: str = "English", target_label: str = "Chinese",
+) -> int:
     headers = [
         "#",
-        "English Line",
-        "English Level",
-        "English Heading",
-        "Chinese Line",
-        "Chinese Level",
-        "Chinese Heading",
+        f"{source_label} Line",
+        f"{source_label} Level",
+        f"{source_label} Heading",
+        f"{target_label} Line",
+        f"{target_label} Level",
+        f"{target_label} Heading",
         "Level Match",
     ]
     _write_file_summary_row(worksheet, row_num, issue, len(headers))
@@ -257,28 +291,28 @@ def _write_heading_issue_table(worksheet, row_num: int, issue, en_content, zh_co
     _style_header_row(worksheet, row_num, headers)
     row_num += 1
 
-    en_headings = _extract_heading_details(en_content)
-    zh_headings = _extract_heading_details(zh_content)
-    max_len = max(len(en_headings), len(zh_headings))
+    source_headings = _extract_heading_details(source_content)
+    target_headings = _extract_heading_details(target_content)
+    max_len = max(len(source_headings), len(target_headings))
     for index in range(max_len):
-        en_heading = en_headings[index] if index < len(en_headings) else None
-        zh_heading = zh_headings[index] if index < len(zh_headings) else None
+        src_heading = source_headings[index] if index < len(source_headings) else None
+        tgt_heading = target_headings[index] if index < len(target_headings) else None
         levels_match = (
-            en_heading is not None
-            and zh_heading is not None
-            and en_heading["level"] == zh_heading["level"]
+            src_heading is not None
+            and tgt_heading is not None
+            and src_heading["level"] == tgt_heading["level"]
         )
         values = [
             index + 1,
-            _cell_value(en_heading, "line"),
-            _heading_level(en_heading),
-            _heading_text(en_heading),
-            _cell_value(zh_heading, "line"),
-            _heading_level(zh_heading),
-            _heading_text(zh_heading),
+            _cell_value(src_heading, "line"),
+            _heading_level(src_heading),
+            _heading_text(src_heading),
+            _cell_value(tgt_heading, "line"),
+            _heading_level(tgt_heading),
+            _heading_text(tgt_heading),
         ]
         fill = _MATCH_FILL if levels_match else _ISSUE_FILL
-        if en_heading is None or zh_heading is None:
+        if src_heading is None or tgt_heading is None:
             fill = _MISSING_FILL
         for col, value in enumerate(values, 1):
             cell = worksheet.cell(row=row_num, column=col, value=value)
@@ -304,13 +338,16 @@ def _write_heading_issue_table(worksheet, row_num: int, issue, en_content, zh_co
     return row_num + 1
 
 
-def _write_custom_content_issue_table(worksheet, row_num: int, issue, en_content, zh_content) -> int:
+def _write_custom_content_issue_table(
+    worksheet, row_num: int, issue, source_content, target_content,
+    source_label: str = "English", target_label: str = "Chinese",
+) -> int:
     headers = [
         "#",
-        "English Line",
-        "English Tag",
-        "Chinese Line",
-        "Chinese Tag",
+        f"{source_label} Line",
+        f"{source_label} Tag",
+        f"{target_label} Line",
+        f"{target_label} Tag",
         "Tag Match",
     ]
     _write_file_summary_row(worksheet, row_num, issue, len(headers))
@@ -318,22 +355,22 @@ def _write_custom_content_issue_table(worksheet, row_num: int, issue, en_content
     _style_header_row(worksheet, row_num, headers)
     row_num += 1
 
-    en_tags = extract_custom_content_tags(en_content)
-    zh_tags = extract_custom_content_tags(zh_content)
-    max_len = max(len(en_tags), len(zh_tags))
+    source_tags = extract_custom_content_tags(source_content)
+    target_tags = extract_custom_content_tags(target_content)
+    max_len = max(len(source_tags), len(target_tags))
     for index in range(max_len):
-        en_tag = en_tags[index] if index < len(en_tags) else None
-        zh_tag = zh_tags[index] if index < len(zh_tags) else None
-        tags_match = _tag_signature(en_tag) == _tag_signature(zh_tag)
+        src_tag = source_tags[index] if index < len(source_tags) else None
+        tgt_tag = target_tags[index] if index < len(target_tags) else None
+        tags_match = _tag_signature(src_tag) == _tag_signature(tgt_tag)
         values = [
             index + 1,
-            _tag_line(en_tag),
-            _tag_text(en_tag),
-            _tag_line(zh_tag),
-            _tag_text(zh_tag),
+            _tag_line(src_tag),
+            _tag_text(src_tag),
+            _tag_line(tgt_tag),
+            _tag_text(tgt_tag),
         ]
         fill = _MATCH_FILL if tags_match else _ISSUE_FILL
-        if en_tag is None or zh_tag is None:
+        if src_tag is None or tgt_tag is None:
             fill = _MISSING_FILL
         for col, value in enumerate(values, 1):
             cell = worksheet.cell(row=row_num, column=col, value=value)
@@ -359,8 +396,11 @@ def _write_custom_content_issue_table(worksheet, row_num: int, issue, en_content
     return row_num + 1
 
 
-def _write_generic_issue_table(worksheet, row_num: int, issue, en_content, zh_content) -> int:
-    headers = ["Field", "English", "Chinese"]
+def _write_generic_issue_table(
+    worksheet, row_num: int, issue, source_content, target_content,
+    source_label: str = "English", target_label: str = "Chinese",
+) -> int:
+    headers = ["Field", source_label, target_label]
     _write_file_summary_row(worksheet, row_num, issue, len(headers))
     row_num += 1
     _style_header_row(worksheet, row_num, headers)
@@ -370,20 +410,20 @@ def _write_generic_issue_table(worksheet, row_num: int, issue, en_content, zh_co
         ("Reason", issue.reason, issue.reason),
         ("First Difference", issue.first_difference, issue.first_difference),
         ("Structure", issue.source_compact, issue.target_compact),
-        ("Headings", _format_heading_details(en_content), _format_heading_details(zh_content)),
+        ("Headings", _format_heading_details(source_content), _format_heading_details(target_content)),
         (
             "CustomContent",
-            _format_custom_content_details(en_content),
-            _format_custom_content_details(zh_content),
+            _format_custom_content_details(source_content),
+            _format_custom_content_details(target_content),
         ),
     ]
-    for field, en_value, zh_value in rows:
-        for col, value in enumerate([field, en_value, zh_value], 1):
+    for field, src_value, tgt_value in rows:
+        for col, value in enumerate([field, src_value, tgt_value], 1):
             cell = worksheet.cell(row=row_num, column=col, value=value)
             cell.fill = _ISSUE_FILL
             cell.border = _THIN_BORDER
             cell.alignment = Alignment(vertical="top", wrap_text=True)
-        max_lines = max(str(value).count("\n") + 1 for value in (field, en_value, zh_value) if value)
+        max_lines = max(str(value).count("\n") + 1 for value in (field, src_value, tgt_value) if value)
         worksheet.row_dimensions[row_num].height = min(220, max(36, max_lines * 15))
         row_num += 1
 
@@ -394,25 +434,30 @@ def _write_issue_sheet(
     worksheet,
     issue_type: str,
     issues: list[StructureValidationIssue],
-    en_root: Path | None,
-    zh_root: Path | None,
+    source_root: Path | None,
+    target_root: Path | None,
     content_cache: dict[tuple[Path, str], str | None],
+    source_label: str = "English",
+    target_label: str = "Chinese",
 ) -> None:
     row_num = 1
     for issue in issues:
-        en_content = _read_issue_content(en_root, issue.file_path, content_cache)
-        zh_content = _read_issue_content(zh_root, issue.file_path, content_cache)
+        source_content = _read_issue_content(source_root, issue.file_path, content_cache)
+        target_content = _read_issue_content(target_root, issue.file_path, content_cache)
         if issue_type == "Heading":
             row_num = _write_heading_issue_table(
-                worksheet, row_num, issue, en_content, zh_content
+                worksheet, row_num, issue, source_content, target_content,
+                source_label, target_label,
             )
         elif issue_type == "CustomContent":
             row_num = _write_custom_content_issue_table(
-                worksheet, row_num, issue, en_content, zh_content
+                worksheet, row_num, issue, source_content, target_content,
+                source_label, target_label,
             )
         else:
             row_num = _write_generic_issue_table(
-                worksheet, row_num, issue, en_content, zh_content
+                worksheet, row_num, issue, source_content, target_content,
+                source_label, target_label,
             )
 
     widths_by_type = {
@@ -427,8 +472,10 @@ def _write_issue_sheet(
 def write_excel_report(
     issues: list[StructureValidationIssue],
     output_path: Path,
-    en_root: Path | None = None,
-    zh_root: Path | None = None,
+    source_root: Path | None = None,
+    target_root: Path | None = None,
+    source_label: str = "English",
+    target_label: str = "Chinese",
 ) -> None:
     """Write a local structure report that contains only problematic rows."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -446,83 +493,63 @@ def write_excel_report(
     for index, (issue_type, issue_list) in enumerate(grouped_issues):
         worksheet = workbook.active if index == 0 else workbook.create_sheet()
         worksheet.title = issue_type
-        _write_issue_sheet(worksheet, issue_type, issue_list, en_root, zh_root, content_cache)
+        _write_issue_sheet(
+            worksheet, issue_type, issue_list,
+            source_root, target_root, content_cache,
+            source_label, target_label,
+        )
 
     workbook.save(output_path)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Compare local English and Chinese Markdown heading and CustomContent structures "
-            "for all Markdown files linked from the five TiDB Cloud TOCs."
-        )
-    )
-    parser.add_argument("--en-root", default=str(DEFAULT_EN_ROOT), help="local English docs root")
-    parser.add_argument("--zh-root", default=str(DEFAULT_ZH_ROOT), help="local Chinese docs root")
-    parser.add_argument(
-        "--toc",
-        action="append",
-        dest="toc_files",
-        help="Cloud TOC file to scan; can be provided multiple times",
-    )
-    parser.add_argument("--json-out", help="optional path to write machine-readable issues")
-    parser.add_argument(
-        "--excel-out",
-        help=(
-            "optional path to write an Excel report; defaults to a timestamped "
-            "local_structure_check_*.xlsx file next to this script"
-        ),
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=0,
-        help="maximum issues to print; 0 means print all",
-    )
-    return parser.parse_args()
-
-
 def main() -> int:
-    args = parse_args()
-    en_root = Path(args.en_root).expanduser()
-    zh_root = Path(args.zh_root).expanduser()
-    toc_files = args.toc_files or DEFAULT_CLOUD_TOCS
+    source_root = Path(SOURCE_ROOT).expanduser()
+    target_root = Path(TARGET_ROOT).expanduser()
+    source_label = SOURCE_LANGUAGE
+    target_label = TARGET_LANGUAGE
+
+    if TOC_SCOPE == "all":
+        toc_files = discover_all_tocs(source_root)
+        if not toc_files:
+            print(f"ERROR: no TOC*.md files found in {source_root}", file=sys.stderr)
+            return 2
+    else:
+        toc_files = list(TOC_LIST)
 
     try:
-        file_paths = collect_cloud_markdown_files(en_root, toc_files)
+        file_paths = collect_toc_markdown_files(source_root, toc_files)
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
     issues = []
     for rel_path in file_paths:
-        issues.extend(check_file(en_root, zh_root, rel_path))
+        issues.extend(check_file(source_root, target_root, rel_path))
 
-    print(f"English root: {en_root}")
-    print(f"Chinese root: {zh_root}")
-    print(f"Cloud TOCs: {', '.join(toc_files)}")
-    print(f"Markdown files in Cloud scope: {len(file_paths)}")
+    print(f"Source root ({source_label}): {source_root}")
+    print(f"Target root ({target_label}): {target_root}")
+    print(f"TOC scope: {TOC_SCOPE} ({len(toc_files)} TOC files: {', '.join(toc_files)})")
+    print(f"Markdown files in scope: {len(file_paths)}")
     print(f"Document structure issues: {len(issues)}")
 
     if issues:
         print()
         print("Structure issues:")
-        printable = issues if args.limit <= 0 else issues[: args.limit]
+        printable = issues if PRINT_LIMIT <= 0 else issues[:PRINT_LIMIT]
         for issue in printable:
             print(f"- {issue.file_path}: {issue.reason}")
             if issue.first_difference:
                 print(f"  first difference: {issue.first_difference}")
             if issue.source_compact:
-                print(f"  English: {issue.source_compact}")
+                print(f"  {source_label}: {issue.source_compact}")
             if issue.target_compact:
-                print(f"  Chinese: {issue.target_compact}")
+                print(f"  {target_label}: {issue.target_compact}")
 
-        if args.limit > 0 and len(issues) > args.limit:
-            print(f"... {len(issues) - args.limit} more issue(s) omitted by --limit")
+        if PRINT_LIMIT > 0 and len(issues) > PRINT_LIMIT:
+            print(f"... {len(issues) - PRINT_LIMIT} more issue(s) omitted by PRINT_LIMIT")
 
-    if args.json_out:
-        out_path = Path(args.json_out).expanduser()
+    if JSON_OUT:
+        out_path = Path(JSON_OUT).expanduser()
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(
             json.dumps([issue.to_dict() for issue in issues], ensure_ascii=False, indent=2)
@@ -532,12 +559,8 @@ def main() -> int:
         print()
         print(f"JSON report written to: {out_path}")
 
-    excel_path = (
-        Path(args.excel_out).expanduser()
-        if args.excel_out
-        else default_excel_path()
-    )
-    write_excel_report(issues, excel_path, en_root, zh_root)
+    excel_path = Path(EXCEL_OUT).expanduser() if EXCEL_OUT else default_excel_path()
+    write_excel_report(issues, excel_path, source_root, target_root, source_label, target_label)
     print()
     print(f"Excel report written to: {excel_path}")
 
