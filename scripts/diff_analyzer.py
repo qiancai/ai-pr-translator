@@ -1785,9 +1785,11 @@ def find_sections_by_operation_type(lines, operations, all_headers, base_hierarc
     # Process modified lines  
     for modified_line in operations['modified_lines']:
         line_num = modified_line['line_number']
-        if modified_line['is_header']:
+        if modified_line['is_header'] and line_num in all_headers:
             sections['modified'].add(line_num)
         else:
+            # Either a non-header line, or a false-positive "header" (e.g. a
+            # code comment starting with # inside a fenced code block).
             section = find_containing_section(line_num, all_headers)
             if section:
                 sections['modified'].add(section)
@@ -3087,21 +3089,22 @@ def analyze_source_changes(
             ignored_added_lines=structural_added_prefix_lines,
         )
         
-        # Added lines (new content, excluding headers)
+        # Added lines (new content, excluding real headings)
         for added_line in operations['added_lines']:
-            if not added_line['is_header'] and added_line['line_number'] not in structural_added_prefix_lines:
+            is_real_heading = added_line['is_header'] and added_line['line_number'] in all_headers
+            if not is_real_heading and added_line['line_number'] not in structural_added_prefix_lines:
                 real_content_changes.add(added_line['line_number'])
         
-        # Deleted lines (removed content, excluding headers)
+        # Deleted lines (removed content, excluding real headings)
         for deleted_line in operations['deleted_lines']:
-            if not deleted_line['is_header']:
+            if not deleted_line['is_header'] or deleted_line.get('head_line_number') not in all_headers:
                 head_line_number = get_head_line_number(deleted_line)
                 if head_line_number is not None:
                     real_content_changes.add(head_line_number)
         
-        # Modified lines (changed content, excluding headers)
+        # Modified lines (changed content, excluding real headings)
         for modified_line in operations['modified_lines']:
-            if not modified_line['is_header']:
+            if not modified_line['is_header'] or modified_line['line_number'] not in all_headers:
                 real_content_changes.add(modified_line['line_number'])
         
         print(f"   📝 Real content changes (non-header): {sorted(real_content_changes)}")
