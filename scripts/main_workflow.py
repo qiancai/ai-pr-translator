@@ -894,7 +894,7 @@ def main():
     
     # Step 2: Analyze source changes with operation categorization
     thread_safe_print(f"\n📊 Step 2: Analyzing source changes...")
-    added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images, _restructured_files = analyze_source_changes(
+    added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images, restructured_files = analyze_source_changes(
         source_context, github_client,
         special_files=SPECIAL_FILES, 
         ignore_files=PR_MODE_IGNORE_FILES,
@@ -918,6 +918,16 @@ def main():
             modified_images,
             deleted_images,
         )
+    # Restructured files were rerouted to added_files by detect_restructured_file()
+    # in analyze_source_changes(). They need overwrite_existing=True because the
+    # target file already exists.
+    if restructured_files:
+        thread_safe_print(
+            f"\n🔄 Restructured files detected ({len(restructured_files)}), "
+            "will use full translation with overwrite:"
+        )
+        for path in sorted(restructured_files):
+            thread_safe_print(f"   - {path}")
     diff_file_count = count_unique_file_paths(
         added_sections,
         modified_sections,
@@ -958,6 +968,7 @@ def main():
                     ai_client,
                     repo_config,
                     glossary_matcher=glossary_matcher,
+                    overwrite_existing=path in restructured_files,
                 )
                 if success:
                     return make_task_result("success")

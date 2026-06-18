@@ -2024,8 +2024,8 @@ class DetectRestructuredFileTest(unittest.TestCase):
         self.assertNotIn(file_path, deleted_sections)
         self.assertIn(file_path, restructured_files)
 
-    def test_pr_mode_does_not_route_restructured_to_added_files(self):
-        """In PR mode, restructured files are NOT rerouted (commit-only feature)."""
+    def test_pr_mode_routes_restructured_to_added_files(self):
+        """In PR mode, restructured files are rerouted to added_files for full translation."""
         file_path = "overview.md"
         base_content = "# Overview\n\n## A\n\nText A\n\n## B\n\nText B\n"
         head_content = "# Overview\n\n## X\n\nText X\n\n## Y\n\nText Y\n\n## Z\n\nText Z\n"
@@ -2063,8 +2063,9 @@ class DetectRestructuredFileTest(unittest.TestCase):
         added_files = result[3]
         restructured_files = result[10]
 
-        self.assertNotIn(file_path, added_files)
-        self.assertEqual(restructured_files, set())
+        self.assertIn(file_path, added_files)
+        self.assertEqual(added_files[file_path], head_content)
+        self.assertIn(file_path, restructured_files)
 
 
 if __name__ == "__main__":

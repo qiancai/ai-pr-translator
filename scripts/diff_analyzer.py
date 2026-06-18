@@ -3032,11 +3032,11 @@ def analyze_source_changes(
         )
         print(f"   📝 Effective diff analysis: {len(operations['added_lines'])} added, {len(operations['modified_lines'])} modified, {len(operations['deleted_lines'])} deleted lines")
 
-        # Detect restructured documents in commit mode: if ALL sub-section
-        # headings are in the diff, route the file to full translation instead
-        # of incremental section-level processing.
+        # Detect restructured documents (both commit and PR mode): if ALL
+        # sub-section headings are in the diff, route the file to full
+        # translation instead of incremental section-level processing.
         if (
-            source_context.get("mode") == "commit"
+            source_context.get("mode") in ("commit", "pr")
             and detect_restructured_file(file_content, base_file_content, operations)
         ):
             print(f"   🔄 Detected restructured document: all sub-section headings are in the diff")
