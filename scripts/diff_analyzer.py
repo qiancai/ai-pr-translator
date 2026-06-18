@@ -16,6 +16,7 @@ from typing import Optional
 from urllib.parse import urlparse
 from github import Github
 from log_sanitizer import sanitize_exception_message
+from section_matcher import clean_title_for_matching
 from special_file_utils import is_toc_file_name
 
 # Thread-safe printing
@@ -1906,25 +1907,6 @@ def get_source_file_hierarchy(file_path, pr_url, github_client, get_base_version
         thread_safe_print(f"   ❌ Error getting source file hierarchy: {sanitize_exception_message(e)}")
         return {}
 
-# Helper function needed for find_sections_by_operation_type
-def clean_title_for_matching(title):
-    """Clean title for matching by removing markdown formatting and span elements"""
-    if not title:
-        return ""
-    
-    # Remove span elements like <span class="version-mark">New in v5.0</span>
-    title = re.sub(r'<span[^>]*>.*?</span>', '', title)
-    
-    # Remove markdown header prefix (# ## ### etc.)
-    title = re.sub(r'^#{1,6}\s*', '', title.strip())
-    
-    # Remove backticks
-    title = title.replace('`', '')
-    
-    # Strip whitespace
-    title = title.strip()
-    
-    return title
 
 
 def trim_content_before_tabs_panel(content):
@@ -2151,7 +2133,6 @@ def find_previous_section_for_added(added_sections, hierarchy_dict):
 
 def build_source_diff_dict(modified_sections, added_sections, deleted_sections, all_hierarchy_dict, base_hierarchy_dict, operations, file_content, base_file_content):
     """Build source diff dictionary with correct structure for matching"""
-    from section_matcher import clean_title_for_matching
     source_diff_dict = {}
     
     # Check if intro section has changes

@@ -1731,7 +1731,7 @@ def process_single_file_deletion(file_path, source_sections, source_context_or_p
         is_system_variable_or_config,
         clean_title_for_matching,
         parse_ai_response,
-        find_matching_line_numbers
+        find_matching_line_numbers,
     )
     
     # Get target file hierarchy and content
@@ -1803,7 +1803,7 @@ def process_single_file_deletion(file_path, source_sections, source_context_or_p
                 ai_client,
                 repo_config['source_language'], 
                 repo_config['target_language'],
-                max_tokens=20000  # Use default value for now, can be made configurable later
+                max_tokens=20000
             )
             
             if ai_mapping:
@@ -2113,10 +2113,10 @@ def process_single_file(file_path, source_sections, pr_diff, source_context_or_p
                 thread_safe_print(f"   [{thread_id}] ✅ Proceeding with {len(target_affected)} system variable/config sections only")
             else:
                 # Proceed with AI mapping using filtered hierarchy
+                from section_matcher import get_corresponding_sections
                 source_list = list(regular_sections.values())
                 target_list = list(filtered_target_hierarchy.values())
                 
-                from section_matcher import get_corresponding_sections
                 ai_response = get_corresponding_sections(source_list, target_list, ai_client, repo_config['source_language'], repo_config['target_language'], max_tokens=20000)
                 if ai_response:
                     # Parse AI response and find matching line numbers in the original (unfiltered) hierarchy

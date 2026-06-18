@@ -54,6 +54,26 @@ def trim_content_by_end_marker(content, end_marker):
             return "\n".join(lines[:idx]).rstrip()
     return content
 
+_HEADING_ANCHOR_RE = re.compile(r'\s*\{#[^}]+\}\s*$')
+
+
+def strip_heading_anchor(text):
+    """Strip trailing {#anchor-slug} from a heading or hierarchy string.
+    
+    In commit-based mode, documents often contain explicit anchors like:
+      #### 2.2 データファイル用のTiDB Lightning構成ファイルを作成する {#2-2-create-the-...}
+    
+    For hierarchy strings (containing ' > '), anchors are stripped from every
+    segment, not just the leaf.
+    """
+    if not text:
+        return text
+    if ' > ' in text:
+        parts = text.split(' > ')
+        return ' > '.join(_HEADING_ANCHOR_RE.sub('', p) for p in parts)
+    return _HEADING_ANCHOR_RE.sub('', text)
+
+
 def clean_title_for_matching(title):
     """Clean title for matching by removing markdown formatting and span elements"""
     if not title:
@@ -61,6 +81,9 @@ def clean_title_for_matching(title):
     
     # Remove span elements like <span class="version-mark">New in v5.0</span>
     title = re.sub(r'<span[^>]*>.*?</span>', '', title)
+    
+    # Remove explicit heading anchors like {#some-anchor-slug}
+    title = re.sub(r'\s*\{#[^}]+\}\s*$', '', title)
     
     # Remove markdown header prefix (# ## ### etc.)
     title = re.sub(r'^#{1,6}\s*', '', title.strip())
@@ -382,7 +405,7 @@ def format_hierarchy_list_for_prompt(hierarchy):
 def build_changed_sections_context(source_sections, source_diff_dict=None):
     """Render changed source sections with operation and old/new hierarchy hints."""
     if not isinstance(source_sections, dict):
-        return "\n".join(str(section) for section in source_sections)
+        return "\n".join(strip_heading_anchor(str(section)) for section in source_sections)
 
     rows = []
     source_diff_dict = source_diff_dict or {}
@@ -397,13 +420,13 @@ def build_changed_sections_context(source_sections, source_diff_dict=None):
         details = [
             f"- key: {key}",
             f"  operation: {operation}",
-            f"  matching source hierarchy: {hierarchy}",
-            f"  original source hierarchy: {original_hierarchy}",
+            f"  matching source hierarchy: {strip_heading_anchor(hierarchy)}",
+            f"  original source hierarchy: {strip_heading_anchor(original_hierarchy)}",
         ]
         if old_heading:
-            details.append(f"  old heading: {old_heading}")
+            details.append(f"  old heading: {strip_heading_anchor(old_heading)}")
         if new_heading:
-            details.append(f"  new heading: {new_heading}")
+            details.append(f"  new heading: {strip_heading_anchor(new_heading)}")
         rows.append("\n".join(details))
 
     return "\n".join(rows)
@@ -423,18 +446,24 @@ def get_corresponding_sections(
 ):
     """Use AI to find corresponding sections between different languages"""
     
-    # Format source sections
+    # Strip heading anchors from all sections for cleaner AI prompt
     if isinstance(source_sections, dict):
-        source_text = "\n".join(source_sections.values())
+        source_text = "\n".join(strip_heading_anchor(v) for v in source_sections.values())
         changed_sections_text = build_changed_sections_context(source_sections, source_diff_dict)
         number_of_sections = len(source_sections)
     else:
-        source_text = "\n".join(source_sections)
+        source_text = "\n".join(strip_heading_anchor(s) for s in source_sections)
         changed_sections_text = source_text
         number_of_sections = len(source_sections)
-    target_text = "\n".join(target_sections)
-    source_base_text = format_hierarchy_list_for_prompt(source_base_hierarchy)
-    source_head_text = format_hierarchy_list_for_prompt(source_head_hierarchy)
+    target_text = "\n".join(strip_heading_anchor(s) for s in target_sections)
+    source_base_hierarchy_for_prompt = {
+        k: strip_heading_anchor(v) for k, v in source_base_hierarchy.items()
+    } if source_base_hierarchy else source_base_hierarchy
+    source_head_hierarchy_for_prompt = {
+        k: strip_heading_anchor(v) for k, v in source_head_hierarchy.items()
+    } if source_head_hierarchy else source_head_hierarchy
+    source_base_text = format_hierarchy_list_for_prompt(source_base_hierarchy_for_prompt)
+    source_head_text = format_hierarchy_list_for_prompt(source_head_hierarchy_for_prompt)
     normalized_source_mode = (source_mode or "").lower()
 
     if source_base_text or source_head_text:
@@ -561,9 +590,18 @@ def get_corresponding_sections_json(
     source_language = repo_config['source_language']
     target_language = repo_config['target_language']
     changed_sections_text = build_changed_sections_context(source_sections, source_diff_dict)
-    source_base_text = format_hierarchy_list_for_prompt(source_base_hierarchy)
-    source_head_text = format_hierarchy_list_for_prompt(source_head_hierarchy)
-    target_text = format_hierarchy_list_for_prompt(target_hierarchy)
+    source_base_hierarchy_for_prompt = {
+        k: strip_heading_anchor(v) for k, v in source_base_hierarchy.items()
+    } if source_base_hierarchy else source_base_hierarchy
+    source_head_hierarchy_for_prompt = {
+        k: strip_heading_anchor(v) for k, v in source_head_hierarchy.items()
+    } if source_head_hierarchy else source_head_hierarchy
+    source_base_text = format_hierarchy_list_for_prompt(source_base_hierarchy_for_prompt)
+    source_head_text = format_hierarchy_list_for_prompt(source_head_hierarchy_for_prompt)
+    target_hierarchy_for_prompt = {
+        k: strip_heading_anchor(v) for k, v in target_hierarchy.items()
+    } if target_hierarchy else target_hierarchy
+    target_text = format_hierarchy_list_for_prompt(target_hierarchy_for_prompt)
     expected_keys = list(source_sections.keys())
     expected_keys_json = json.dumps(expected_keys, ensure_ascii=False)
     normalized_source_mode = (source_mode or "").lower()
@@ -709,10 +747,12 @@ def find_matching_line_numbers(ai_sections, target_hierarchy_dict):
     matched_dict = {}
     
     for ai_section in ai_sections:
-        # Look for exact matches first
+        ai_section_stripped = strip_heading_anchor(ai_section)
+        # Look for exact matches first (with and without anchor)
         found = False
         for line_num, hierarchy in target_hierarchy_dict.items():
-            if hierarchy == ai_section:
+            hierarchy_stripped = strip_heading_anchor(hierarchy)
+            if hierarchy == ai_section or hierarchy_stripped == ai_section_stripped:
                 matched_dict[str(line_num)] = hierarchy
                 found = True
                 break
@@ -721,9 +761,8 @@ def find_matching_line_numbers(ai_sections, target_hierarchy_dict):
             # Look for partial matches (in case of slight differences)
             partial_candidates = {}
             for line_num, hierarchy in target_hierarchy_dict.items():
-                # Remove common variations and compare
-                ai_clean = ai_section.replace('### ', '').replace('## ', '').strip()
-                hierarchy_clean = hierarchy.replace('### ', '').replace('## ', '').strip()
+                ai_clean = ai_section_stripped.replace('### ', '').replace('## ', '').strip()
+                hierarchy_clean = strip_heading_anchor(hierarchy).replace('### ', '').replace('## ', '').strip()
                 
                 if ai_clean in hierarchy_clean or hierarchy_clean in ai_clean:
                     partial_candidates[str(line_num)] = hierarchy
@@ -743,18 +782,21 @@ def find_candidate_line_numbers_for_ai_section(ai_section, target_hierarchy_dict
     used_lines = used_lines or set()
     matched_dict = {}
 
+    ai_section_stripped = strip_heading_anchor(ai_section)
+
     for line_num, hierarchy in target_hierarchy_dict.items():
         line_num = str(line_num)
         if line_num in used_lines:
             continue
-        if hierarchy == ai_section:
+        hierarchy_stripped = strip_heading_anchor(hierarchy)
+        if hierarchy == ai_section or hierarchy_stripped == ai_section_stripped:
             matched_dict[line_num] = hierarchy
 
     if matched_dict:
         return matched_dict
 
     ai_clean = (
-        ai_section.replace('### ', '')
+        ai_section_stripped.replace('### ', '')
         .replace('## ', '')
         .replace('# ', '')
         .strip()
@@ -764,7 +806,8 @@ def find_candidate_line_numbers_for_ai_section(ai_section, target_hierarchy_dict
         if line_num in used_lines:
             continue
         hierarchy_clean = (
-            hierarchy.replace('### ', '')
+            strip_heading_anchor(hierarchy)
+            .replace('### ', '')
             .replace('## ', '')
             .replace('# ', '')
             .strip()
@@ -1248,14 +1291,13 @@ def map_insertion_points_to_target(insertion_points, target_hierarchy, target_li
         # Prepare source for AI mapping
         temp_source = {str(point_info['previous_section_line']): previous_section_hierarchy}
         
-        # Get AI mapping
         ai_response = get_corresponding_sections(
             list(temp_source.values()), 
             list(filtered_target_hierarchy.values()), 
             ai_client, 
             repo_config['source_language'], 
             repo_config['target_language'],
-            max_tokens=20000  # Use default value since this function doesn't accept max_tokens yet
+            max_tokens=20000
         )
         
         if ai_response:
