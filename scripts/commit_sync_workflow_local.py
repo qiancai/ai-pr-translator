@@ -94,9 +94,9 @@ TEST_CONFIGS = {
         # Set SOURCE_BASE_REF from latest_translation_commit.json on i18n-ja-release-8.5
         # and SOURCE_HEAD_REF from release-8.5 HEAD.
         "SOURCE_BASE_REF": "2eaf0b7cd9c870d6f25c0dea7c7e1bb64ba2572b",
-        "SOURCE_HEAD_REF": "bcae45d9807623ddff853a8f33e3e2943592cbac",
+        "SOURCE_HEAD_REF": "6376b9086871957f4809711c83e021a01b0a8f5d",
         "SOURCE_FOLDER": "",
-        "SOURCE_FILES": "tidb-cloud/built-in-monitoring.md",
+        "SOURCE_FILES": "tidb-cloud/tidb-cloud-events.md,tidb-cloud/tune-performance.md,tidb-cloud/tidbx-starter-essential-project-api-migration-guide.md",
         "AUTO_RESOLVE_TOC_SOURCE_FILES": True,
         "TOC_FILES": (
             "TOC.md,"
@@ -117,7 +117,7 @@ TEST_CONFIGS = {
         "TARGET_REPO_PATH": "/Users/grcai/Documents/GitHub/docs",
         "TARGET_REF": "i18n-ja-release-8.5",
         "PREFER_LOCAL_TARGET_FOR_READ": True,
-        "TERMS_PATH": "/Users/grcai/Documents/GitHub/docs/resources/terms-en-ja.md",
+        "TERMS_PATH": "/Users/grcai/Documents/GitHub/terms-en-ja.md",
     },
 }
 
