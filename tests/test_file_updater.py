@@ -424,6 +424,165 @@ class FileUpdaterRegressionTest(unittest.TestCase):
 
         self.assertEqual(processed, pr_diff)
 
+    def test_preprocess_diff_adds_anchor_to_newly_added_heading(self):
+        pr_diff = "\n".join(
+            [
+                "File: tidb-cloud/releases/tidb-cloud-release-notes.md",
+                "@@ -5,0 +5,3 @@",
+                "+## June 16, 2026",
+                "+",
+                "+Some new release content.",
+                "-" * 80,
+            ]
+        )
+
+        processed = preprocess_diff_for_heading_anchor_stability(
+            pr_diff,
+            source_language="English",
+            target_language="Japanese",
+            source_mode="commit",
+        )
+
+        self.assertIn("+## June 16, 2026 {#june-16-2026}", processed)
+
+    def test_preprocess_diff_adds_anchor_to_added_heading_after_non_heading_removal(self):
+        pr_diff = "\n".join(
+            [
+                "File: ai/example.md",
+                "@@ -10,1 +10,2 @@",
+                "-Some old text",
+                "+## New Section",
+                "+New content here.",
+                "-" * 80,
+            ]
+        )
+
+        processed = preprocess_diff_for_heading_anchor_stability(
+            pr_diff,
+            source_language="English",
+            target_language="Chinese",
+            source_mode="commit",
+        )
+
+        self.assertIn("+## New Section {#new-section}", processed)
+
+    def test_preprocess_diff_does_not_add_anchor_to_added_top_level_heading(self):
+        pr_diff = "\n".join(
+            [
+                "File: ai/example.md",
+                "@@ -1,0 +1,2 @@",
+                "+# Top Level Title",
+                "+Some content.",
+                "-" * 80,
+            ]
+        )
+
+        processed = preprocess_diff_for_heading_anchor_stability(
+            pr_diff,
+            source_language="English",
+            target_language="Chinese",
+            source_mode="commit",
+        )
+
+        self.assertNotIn("{#", processed)
+
+    def test_preprocess_diff_skips_heading_inside_fenced_code_block(self):
+        pr_diff = "\n".join(
+            [
+                "File: ai/example.md",
+                "@@ -5,0 +5,5 @@",
+                "+```markdown",
+                "+## This is a code example",
+                "+",
+                "+Some content inside code block.",
+                "+```",
+                "-" * 80,
+            ]
+        )
+
+        processed = preprocess_diff_for_heading_anchor_stability(
+            pr_diff,
+            source_language="English",
+            target_language="Japanese",
+            source_mode="commit",
+        )
+
+        self.assertNotIn("{#", processed)
+        self.assertIn("+## This is a code example", processed)
+
+    def test_preprocess_diff_adds_anchor_after_code_block_ends(self):
+        pr_diff = "\n".join(
+            [
+                "File: ai/example.md",
+                "@@ -5,0 +5,6 @@",
+                "+```",
+                "+## Inside code block",
+                "+```",
+                "+## Real heading outside",
+                "+",
+                "+Content here.",
+                "-" * 80,
+            ]
+        )
+
+        processed = preprocess_diff_for_heading_anchor_stability(
+            pr_diff,
+            source_language="English",
+            target_language="Japanese",
+            source_mode="commit",
+        )
+
+        self.assertNotIn("+## Inside code block {#", processed)
+        self.assertIn("+## Real heading outside {#real-heading-outside}", processed)
+
+    def test_preprocess_diff_skips_heading_inside_context_code_block(self):
+        """Context lines (no +/-) can open a code block that spans added lines."""
+        pr_diff = "\n".join(
+            [
+                "File: ai/example.md",
+                "@@ -5,3 +5,4 @@",
+                " ```",
+                "+## Heading inside existing code block",
+                " some code",
+                " ```",
+                "-" * 80,
+            ]
+        )
+
+        processed = preprocess_diff_for_heading_anchor_stability(
+            pr_diff,
+            source_language="English",
+            target_language="Chinese",
+            source_mode="commit",
+        )
+
+        self.assertNotIn("{#", processed)
+
+    def test_preprocess_diff_skips_heading_inside_buffered_code_block(self):
+        """A - line followed by + lines that open a code block should not anchor headings inside."""
+        pr_diff = "\n".join(
+            [
+                "File: ai/example.md",
+                "@@ -10,1 +10,4 @@",
+                "-old paragraph text",
+                "+```markdown",
+                "+## Example heading in code",
+                "+```",
+                "+## Real heading after code",
+                "-" * 80,
+            ]
+        )
+
+        processed = preprocess_diff_for_heading_anchor_stability(
+            pr_diff,
+            source_language="English",
+            target_language="Japanese",
+            source_mode="commit",
+        )
+
+        self.assertNotIn("+## Example heading in code {#", processed)
+        self.assertIn("+## Real heading after code {#real-heading-after-code}", processed)
+
     def test_preprocess_diff_adds_zh_prefix_to_added_aliases(self):
         pr_diff = "\n".join(
             [

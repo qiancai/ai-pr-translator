@@ -342,27 +342,72 @@ def preprocess_diff_for_heading_anchor_stability(pr_diff, source_language, targe
 
     lines = pr_diff.splitlines()
     processed_lines = []
+    in_code_block = False
+    code_block_delimiter = None
     i = 0
     while i < len(lines):
         line = lines[i]
-        if enable_commit_only_preprocessing and line.startswith('-') and not line.startswith('---'):
+
+        # Track fenced code block state (strip diff +/- prefix for detection).
+        content_for_fence = line
+        if line.startswith('+') or line.startswith('-'):
+            if not line.startswith('+++') and not line.startswith('---'):
+                content_for_fence = line[1:]
+        fence_marker = _get_fence_marker(content_for_fence)
+        if fence_marker:
+            if not in_code_block:
+                in_code_block = True
+                code_block_delimiter = fence_marker
+            elif content_for_fence.strip().startswith(code_block_delimiter):
+                in_code_block = False
+                code_block_delimiter = None
+
+        if enable_commit_only_preprocessing and not in_code_block and line.startswith('-') and not line.startswith('---'):
             removed_heading = line[1:]
             removed_slug = extract_heading_anchor_slug(removed_heading)
             buffered = [line]
             j = i + 1
             consumed_replacement = False
+            buf_in_code_block = False
+            buf_code_block_delimiter = None
 
             while j < len(lines) and lines[j].startswith('+') and not lines[j].startswith('+++'):
                 added_line = lines[j]
                 added_heading = added_line[1:]
-                added_slug = extract_heading_anchor_slug(added_heading)
 
-                if removed_slug and added_slug and removed_slug != added_slug:
-                    added_line = f"+{add_heading_anchor_if_needed(added_heading)}"
-                    consumed_replacement = True
+                # Track fence state within the buffered + lines.
+                buf_fence = _get_fence_marker(added_heading)
+                if buf_fence:
+                    if not buf_in_code_block:
+                        buf_in_code_block = True
+                        buf_code_block_delimiter = buf_fence
+                    elif added_heading.strip().startswith(buf_code_block_delimiter):
+                        buf_in_code_block = False
+                        buf_code_block_delimiter = None
+
+                if not buf_in_code_block:
+                    added_slug = extract_heading_anchor_slug(added_heading)
+
+                    if removed_slug and added_slug and removed_slug != added_slug:
+                        added_line = f"+{add_heading_anchor_if_needed(added_heading)}"
+                        consumed_replacement = True
+                    elif added_slug and not removed_slug:
+                        added_line = f"+{add_heading_anchor_if_needed(added_heading)}"
+
+                # Apply aliases/links preprocessing to buffered + lines.
+                buffered_content = added_line[1:]
+                if lang_prefix:
+                    added_line = "+" + preprocess_aliases_line(buffered_content, lang_prefix, diff_added_only=False)
+                if enable_tidb_cloud_link_rewrite:
+                    added_line = "+" + preprocess_tidb_cloud_links_in_line(added_line[1:], diff_added_only=False)
 
                 buffered.append(added_line)
                 j += 1
+
+            # Propagate fence state from buffered lines to the outer tracker.
+            if buf_in_code_block:
+                in_code_block = True
+                code_block_delimiter = buf_code_block_delimiter
 
             if consumed_replacement or len(buffered) > 1:
                 processed_lines.extend(buffered)
@@ -370,6 +415,11 @@ def preprocess_diff_for_heading_anchor_stability(pr_diff, source_language, targe
                 continue
 
         if enable_commit_only_preprocessing:
+            if not in_code_block and line.startswith('+') and not line.startswith('+++'):
+                content = line[1:]
+                processed_content = add_heading_anchor_if_needed(content)
+                if processed_content != content:
+                    line = f"+{processed_content}"
             line = preprocess_aliases_line(line, lang_prefix, diff_added_only=True)
         if enable_tidb_cloud_link_rewrite:
             line = preprocess_tidb_cloud_links_in_line(line, diff_added_only=True)
@@ -377,6 +427,12 @@ def preprocess_diff_for_heading_anchor_stability(pr_diff, source_language, targe
         i += 1
 
     return '\n'.join(processed_lines)
+
+
+def _get_fence_marker(line):
+    """Return a markdown fence marker (``` or ~~~) if the line opens/closes a code block."""
+    match = re.match(r'^(`{3,}|~{3,})', (line or "").strip())
+    return match.group(1) if match else None
 
 def resolve_section_start_line(target_lines, target_line_num, target_hierarchy):
     """Resolve a robust 0-based section start line for replace/delete."""
