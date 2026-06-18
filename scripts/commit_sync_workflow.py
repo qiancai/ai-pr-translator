@@ -1307,6 +1307,7 @@ def process_translation_group(
         added_images = []
         modified_images = []
         deleted_images = []
+        restructured_files = set()
     else:
         if not filtered_changed_files:
             thread_safe_print("ℹ️  No matching source changes found for this translation group.")
@@ -1334,7 +1335,7 @@ def process_translation_group(
         exclude_folders = build_exclude_folders(repo_config)
 
         try:
-            added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images = analyze_source_changes(
+            added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images, restructured_files = analyze_source_changes(
                 diff_context,
                 github_client,
                 special_files=SPECIAL_FILES,
@@ -1396,6 +1397,18 @@ def process_translation_group(
                 translation_stats,
             )
         )
+
+    # Restructured files were rerouted to added_files by
+    # detect_restructured_file() in analyze_source_changes().  They need
+    # overwrite_existing=True because the target file already exists.
+    if restructured_files:
+        thread_safe_print(
+            f"\n🔄 Restructured files detected ({len(restructured_files)}), "
+            "will use full translation with overwrite:"
+        )
+        for path in sorted(restructured_files):
+            thread_safe_print(f"   - {path}")
+        full_translation_file_paths.update(restructured_files)
 
     changed_file_paths = {
         file.filename for file in filtered_changed_files if getattr(file, "filename", None)

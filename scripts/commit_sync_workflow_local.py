@@ -14,7 +14,7 @@ TEST_OPTION = "ja"  # Options: "ai", "cloud", "ja"
 
 # Options: "incremental" for commit diff translation, or "full" for complete
 # SOURCE_FILES translation from SOURCE_HEAD_REF using the file-added flow.
-SOURCE_FILES_TRANSLATION_MODE = "incremental"
+SOURCE_FILES_TRANSLATION_MODE = "full"
 # Options: "manual" to add/update per-file Corresponding EN commit markers,
 # or "scheduled" to remove existing markers after successful translation.
 COMMIT_SYNC_RUN_TYPE = "scheduled"
@@ -42,17 +42,17 @@ TEST_CONFIGS = {
         "SOURCE_REPO": "pingcap/docs",
         "TARGET_REPO": "pingcap/docs-cn",
         # Set these two refs explicitly for local verification.
-        "SOURCE_BASE_REF": "b7469123c65aa8409bf754e4a7909e16d8ed3082",
-        "SOURCE_HEAD_REF": "9c3dec15e4e65344c0e60ec3e6752f11e8036d34",
+        "SOURCE_BASE_REF": "2eaf0b7cd9c870d6f25c0dea7c7e1bb64ba2572b",
+        "SOURCE_HEAD_REF": "6376b9086871957f4809711c83e021a01b0a8f5d",
         # Optional scope filters.
         "SOURCE_FOLDER": "ai",
         # Specify this field if you only want to translate specific files. Separate multiple files with commas.
-        "SOURCE_FILES": "ai/integrations/vector-search-integrate-with-django-orm.md",
+        "SOURCE_FILES": "ai/integrations/vector-search-integration-overview.md",
         "TARGET_REPO_PATH": "/Users/grcai/Documents/GitHub/docs-cn",
         "SOURCE_REPO_PATH": "",
         "TARGET_REF": "",
         "PREFER_LOCAL_TARGET_FOR_READ": False,
-        "TERMS_PATH": "/Users/grcai/Documents/GitHub/docs/resources/terms.md",
+        "TERMS_PATH": "/Users/grcai/Documents/GitHub/terms.md",
     },
     "cloud": {
         "SOURCE_REPO": "pingcap/docs",
@@ -96,7 +96,7 @@ TEST_CONFIGS = {
         "SOURCE_BASE_REF": "2eaf0b7cd9c870d6f25c0dea7c7e1bb64ba2572b",
         "SOURCE_HEAD_REF": "6376b9086871957f4809711c83e021a01b0a8f5d",
         "SOURCE_FOLDER": "",
-        "SOURCE_FILES": "tidb-cloud/tidb-cloud-events.md,tidb-cloud/tune-performance.md,tidb-cloud/tidbx-starter-essential-project-api-migration-guide.md",
+        "SOURCE_FILES": "ai/integrations/vector-search-integration-overview.md",
         "AUTO_RESOLVE_TOC_SOURCE_FILES": True,
         "TOC_FILES": (
             "TOC.md,"

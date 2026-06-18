@@ -819,7 +819,7 @@ def analyze_diff_operations(file):
         if old_keywords and new_keywords:
             overlap = len(old_keywords & new_keywords)
             smaller_keyword_count = min(len(old_keywords), len(new_keywords))
-            if overlap >= 2 and overlap / smaller_keyword_count >= 0.6:
+            if overlap >= 2 and overlap / smaller_keyword_count >= 0.5:
                 return True
 
         old_keyword_list = heading_keyword_list(old)
@@ -903,6 +903,135 @@ def analyze_diff_operations(file):
         operations['modified_lines'].append(modified_entry)
     
     return operations
+
+def _is_sub_heading_content(content):
+    """Return True if content is a sub-section heading (## or deeper)."""
+    stripped = (content or "").strip()
+    return bool(re.match(r'^#{2,}\s+\S', stripped))
+
+
+def _collect_sub_heading_line_numbers(file_content):
+    """Return a set of 1-based line numbers for sub-section headings (## or deeper).
+
+    Headings inside fenced code blocks are excluded.
+    """
+    lines = split_normalized_lines(file_content or "")
+    sub_headings = set()
+    in_code_block = False
+    code_block_delimiter = None
+
+    for line_num, line in enumerate(lines, 1):
+        stripped = line.strip()
+        if stripped.startswith('```') or stripped.startswith('~~~'):
+            if not in_code_block:
+                in_code_block = True
+                code_block_delimiter = stripped[:3]
+                continue
+            elif stripped.startswith(code_block_delimiter):
+                in_code_block = False
+                code_block_delimiter = None
+                continue
+        if in_code_block:
+            continue
+        if is_markdown_heading(line) and _is_sub_heading_content(line):
+            sub_headings.add(line_num)
+
+    return sub_headings
+
+
+RESTRUCTURE_CHANGED_LINES_RATIO = float(
+    os.environ.get("RESTRUCTURE_CHANGED_LINES_RATIO", "0.5")
+)
+
+
+def detect_restructured_file(file_content, base_file_content, operations):
+    """Detect if a modified document has been structurally restructured.
+
+    A document is considered restructured when BOTH conditions are met:
+      1. ALL sub-section headings (## or deeper) are in the diff's changed
+         lines — every heading was either added, deleted, or genuinely modified
+         (renamed) and no heading was left unchanged.
+      2. The number of changed lines in the diff accounts for at least 50% of
+         the document's total lines, preventing small heading-only edits from
+         triggering a costly full retranslation.
+
+    Headings that appear as "modified" but have identical old/new content are
+    treated as unchanged (this happens with full-rewrite patches).
+    """
+    from collections import Counter
+
+    head_sub_headings = _collect_sub_heading_line_numbers(file_content)
+    base_sub_headings = _collect_sub_heading_line_numbers(base_file_content)
+
+    if len(head_sub_headings) < 2 and len(base_sub_headings) < 2:
+        return False
+
+    # Collect genuinely modified sub-heading lines (content actually changed).
+    # Headings paired as "modified" but with identical content are unchanged.
+    genuinely_modified_head_lines = set()
+    genuinely_modified_base_counter = Counter()
+
+    for line in operations['modified_lines']:
+        if not line['is_header']:
+            continue
+        new_content = line['content'].strip()
+        old_content = line.get('original_content', '').strip()
+        is_new_sub = _is_sub_heading_content(new_content)
+        is_old_sub = _is_sub_heading_content(old_content)
+
+        if new_content == old_content:
+            continue
+        if is_new_sub:
+            genuinely_modified_head_lines.add(line['line_number'])
+        if is_old_sub:
+            genuinely_modified_base_counter[old_content] += 1
+
+    # --- HEAD side: every sub-heading must be truly added or genuinely modified ---
+    diff_head_changed_lines = set()
+    for line in operations['added_lines']:
+        if line['is_header'] and _is_sub_heading_content(line['content']):
+            diff_head_changed_lines.add(line['line_number'])
+    diff_head_changed_lines |= genuinely_modified_head_lines
+
+    if head_sub_headings and not head_sub_headings.issubset(diff_head_changed_lines):
+        return False
+
+    # --- BASE side: every sub-heading must be truly deleted or genuinely modified.
+    # Use Counter (multiset) to handle duplicate heading contents correctly:
+    # e.g. two "## Examples" sections where only one is deleted.
+    base_lines = split_normalized_lines(base_file_content or "")
+    base_sub_heading_counter = Counter()
+    for line_num in base_sub_headings:
+        if 1 <= line_num <= len(base_lines):
+            base_sub_heading_counter[base_lines[line_num - 1].strip()] += 1
+
+    diff_base_changed_counter = Counter()
+    for line in operations['deleted_lines']:
+        if line['is_header'] and _is_sub_heading_content(line['content']):
+            diff_base_changed_counter[line['content'].strip()] += 1
+    diff_base_changed_counter += genuinely_modified_base_counter
+
+    if base_sub_heading_counter:
+        for content, count in base_sub_heading_counter.items():
+            if diff_base_changed_counter.get(content, 0) < count:
+                return False
+
+    # --- Changed-lines ratio check: the diff must touch a substantial portion
+    # of the document to qualify as a restructure, not just rename headings.
+    changed_line_count = (
+        len(operations['added_lines'])
+        + len(operations['deleted_lines'])
+        + len(operations['modified_lines'])
+    )
+    head_line_count = len(split_normalized_lines(file_content or ""))
+    base_line_count = len(base_lines)
+    doc_line_count = max(head_line_count, base_line_count, 1)
+
+    if changed_line_count / doc_line_count < RESTRUCTURE_CHANGED_LINES_RATIO:
+        return False
+
+    return True
+
 
 def build_hierarchy_dict(file_content):
     """Build hierarchy dictionary from file content, excluding content inside code blocks"""
@@ -2539,6 +2668,7 @@ def analyze_source_changes(
     added_images = []        # New image files that were added
     modified_images = []     # Image files that were modified
     deleted_images = []      # Image files that were deleted
+    restructured_files = set()  # Modified files rerouted to full translation
     
     for file in markdown_files:
         print(f"\n🔍 Analyzing {file.filename}")
@@ -2918,7 +3048,39 @@ def analyze_source_changes(
             file_content,
         )
         print(f"   📝 Effective diff analysis: {len(operations['added_lines'])} added, {len(operations['modified_lines'])} modified, {len(operations['deleted_lines'])} deleted lines")
-        
+
+        # Detect restructured documents in commit mode: if ALL sub-section
+        # headings are in the diff, route the file to full translation instead
+        # of incremental section-level processing.
+        if (
+            source_context.get("mode") == "commit"
+            and detect_restructured_file(file_content, base_file_content, operations)
+        ):
+            print(f"   🔄 Detected restructured document: all sub-section headings are in the diff")
+            print(f"   🔄 Routing {file.filename} to full translation instead of incremental processing")
+            restructured_content = file_content
+            if should_ignore_related_resources_resource_card_sections(source_context):
+                restructured_content, skipped_sections = remove_related_resources_resource_card_sections(
+                    restructured_content
+                )
+                if skipped_sections:
+                    print(
+                        f"   🧹 Skipped {len(skipped_sections)} RelatedResources section(s) "
+                        "from restructured file"
+                    )
+                    for section in skipped_sections:
+                        print(f"      - {section['hierarchy']}")
+                if not restructured_content.strip():
+                    print(
+                        "   ⏭️  Skipping restructured file because no translatable "
+                        "content remains after RelatedResources filtering"
+                    )
+                    continue
+            added_files[file.filename] = restructured_content
+            restructured_files.add(file.filename)
+            print(f"   ✅ Queued restructured file for full translation")
+            continue
+
         # Find sections by operation type with corrected logic
         sections_by_type = find_sections_by_operation_type(lines, operations, all_headers, base_hierarchy_dict)
         
@@ -3325,4 +3487,4 @@ def analyze_source_changes(
         for ignored_file in ignored_files:
             print(f"      - {ignored_file}")
     
-    return added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images
+    return added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images, restructured_files

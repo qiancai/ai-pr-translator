@@ -21,6 +21,7 @@ from diff_analyzer import (
     build_hierarchy_dict,
     build_source_diff_dict,
     collect_added_heading_prefix_lines,
+    detect_restructured_file,
     filter_changed_files_to_pr_scope,
     filter_related_resources_resource_card_diff,
     get_pr_diff,
@@ -413,7 +414,7 @@ class DiffAnalyzerContextTest(unittest.TestCase):
             repo_configs=self.repo_configs,
         )
 
-        self.assertEqual(result, ({}, {}, {}, {}, [], {}, {}, [], [], []))
+        self.assertEqual(result, ({}, {}, {}, {}, [], {}, {}, [], [], [], set()))
         self.assertFalse(self.generated_file.exists())
 
     def test_commit_related_resources_modified_section_is_filtered(self):
@@ -486,7 +487,7 @@ class DiffAnalyzerContextTest(unittest.TestCase):
             repo_configs=self.repo_configs,
         )
 
-        self.assertEqual(result, ({}, {}, {}, {}, [], {}, {}, [], [], []))
+        self.assertEqual(result, ({}, {}, {}, {}, [], {}, {}, [], [], [], set()))
         self.assertFalse(self.generated_file.exists())
 
     def test_commit_related_resources_deleted_section_is_filtered(self):
@@ -562,7 +563,7 @@ class DiffAnalyzerContextTest(unittest.TestCase):
             repo_configs=self.repo_configs,
         )
 
-        self.assertEqual(result, ({}, {}, {}, {}, [], {}, {}, [], [], []))
+        self.assertEqual(result, ({}, {}, {}, {}, [], {}, {}, [], [], [], set()))
         self.assertFalse(self.generated_file.exists())
 
     def test_pr_related_resources_section_is_not_filtered(self):
@@ -951,6 +952,7 @@ class DiffAnalyzerContextTest(unittest.TestCase):
             added_images,
             modified_images,
             deleted_images,
+            _restructured,
         ) = analyze_source_changes(
             context,
             github,
@@ -1025,6 +1027,7 @@ class DiffAnalyzerContextTest(unittest.TestCase):
             added_images,
             modified_images,
             deleted_images,
+            _restructured,
         ) = analyze_source_changes(
             context,
             github,
@@ -1582,6 +1585,7 @@ class DiffAnalyzerContextTest(unittest.TestCase):
             added_images,
             modified_images,
             deleted_images,
+            _restructured,
         ) = analyze_source_changes(
             commit_context,
             github,
@@ -1857,6 +1861,210 @@ class DiffAnalyzerContextTest(unittest.TestCase):
         self.assertIn("+New", files["guide.md"].patch)
         self.assertEqual(files["new-name.md"].status, "renamed")
         self.assertEqual(files["new-name.md"].previous_filename, "old-name.md")
+
+
+class DetectRestructuredFileTest(unittest.TestCase):
+    """Tests for detect_restructured_file()."""
+
+    def _make_operations(self, base_content, head_content):
+        patch = make_full_rewrite_patch(base_content, head_content)
+        file = SimpleNamespace(
+            filename="doc.md", status="modified", patch=patch, previous_filename=None,
+        )
+        return analyze_diff_operations(file)
+
+    def _make_operations_from_patch(self, patch):
+        file = SimpleNamespace(
+            filename="doc.md", status="modified", patch=patch, previous_filename=None,
+        )
+        return analyze_diff_operations(file)
+
+    def test_all_headings_changed_is_restructured(self):
+        base = "# Doc\n\n## Old A\n\nText A\n\n## Old B\n\nText B\n"
+        head = "# Doc\n\n## New X\n\nText X\n\n## New Y\n\nText Y\n\n## New Z\n\nText Z\n"
+        ops = self._make_operations(base, head)
+        self.assertTrue(detect_restructured_file(head, base, ops))
+
+    def test_one_heading_unchanged_is_not_restructured(self):
+        base = "# Doc\n\n## Same\n\nOld text\n\n## Old B\n\nText B\n"
+        head = "# Doc\n\n## Same\n\nNew text\n\n## New Y\n\nText Y\n"
+        ops = self._make_operations(base, head)
+        self.assertFalse(detect_restructured_file(head, base, ops))
+
+    def test_too_few_headings_is_not_restructured(self):
+        base = "# Doc\n\n## Only One\n\nText\n"
+        head = "# Doc\n\n## Changed\n\nText\n"
+        ops = self._make_operations(base, head)
+        self.assertFalse(detect_restructured_file(head, base, ops))
+
+    def test_no_sub_headings_is_not_restructured(self):
+        base = "# Doc\n\nBody\n"
+        head = "# Doc\n\nNew body\n"
+        ops = self._make_operations(base, head)
+        self.assertFalse(detect_restructured_file(head, base, ops))
+
+    def test_added_section_with_existing_unchanged_is_not_restructured(self):
+        base = "# Doc\n\n## Existing\n\nOld\n"
+        head = "# Doc\n\n## Existing\n\nOld\n\n## New Section\n\nBody\n"
+        ops = self._make_operations(base, head)
+        self.assertFalse(detect_restructured_file(head, base, ops))
+
+    def test_all_headings_renamed_is_restructured(self):
+        base = "# Guide\n\n## Step 1 old\n\nA\n\n## Step 2 old\n\nB\n\n## Step 3 old\n\nC\n"
+        head = "# Guide\n\n## Step 1 new\n\nA\n\n## Step 2 new\n\nB\n\n## Step 3 new\n\nC\n"
+        ops = self._make_operations(base, head)
+        self.assertTrue(detect_restructured_file(head, base, ops))
+
+    def test_headings_inside_code_blocks_are_ignored(self):
+        base = "# Doc\n\n## Real\n\nText\n\n```\n## Not Real\n```\n"
+        head = "# Doc\n\n## Real\n\nText\n\n```\n## Not Real\n```\n"
+        ops = self._make_operations(base, head)
+        self.assertFalse(detect_restructured_file(head, base, ops))
+
+    def test_heading_only_renames_below_ratio_is_not_restructured(self):
+        """All headings renamed in a long doc but changed lines < 50%."""
+        body = "\n".join(f"Line {i}" for i in range(1, 16))
+        base = f"# Doc\n\n## Alpha\n\n{body}\n\n## Beta\n\n{body}\n"
+        head = f"# Doc\n\n## Gamma\n\n{body}\n\n## Delta\n\n{body}\n"
+        patch = "\n".join([
+            "@@ -1,5 +1,5 @@",
+            " # Doc",
+            " ",
+            "-## Alpha",
+            "+## Gamma",
+            " ",
+            " Line 1",
+            "@@ -19,5 +19,5 @@",
+            " Line 15",
+            " ",
+            "-## Beta",
+            "+## Delta",
+            " ",
+            " Line 1",
+        ])
+        ops = self._make_operations_from_patch(patch)
+        self.assertFalse(detect_restructured_file(head, base, ops))
+
+    def test_partial_diff_with_unchanged_context_heading(self):
+        """Heading appears as context line in a realistic partial diff."""
+        base = "# Doc\n\n## Unchanged\n\nBody A\n\n## Old\n\nBody B\n"
+        head = "# Doc\n\n## Unchanged\n\nBody A\n\n## New\n\nBody B\n"
+        patch = "\n".join([
+            "@@ -5,5 +5,5 @@",
+            " Body A",
+            " ",
+            "-## Old",
+            "+## New",
+            " ",
+            " Body B",
+        ])
+        ops = self._make_operations_from_patch(patch)
+        self.assertFalse(detect_restructured_file(head, base, ops))
+
+    def test_duplicate_base_headings_one_unchanged_is_not_restructured(self):
+        """Base has two identical headings; only one deleted → not restructured."""
+        base = (
+            "# Doc\n\n## Examples\n\nFirst block\n\n"
+            "## Other\n\nMiddle block\n\n"
+            "## Examples\n\nSecond block\n"
+        )
+        head = (
+            "# Doc\n\n## New A\n\nFirst block\n\n"
+            "## New B\n\nMiddle block\n\n"
+            "## Examples\n\nSecond block\n"
+        )
+        ops = self._make_operations(base, head)
+        self.assertFalse(detect_restructured_file(head, base, ops))
+
+    def test_commit_mode_routes_restructured_to_added_files(self):
+        """Integration: restructured file in commit mode goes to added_files."""
+        file_path = "overview.md"
+        base_content = "# Overview\n\n## A\n\nText A\n\n## B\n\nText B\n"
+        head_content = "# Overview\n\n## X\n\nText X\n\n## Y\n\nText Y\n\n## Z\n\nText Z\n"
+        changed_file = SimpleNamespace(
+            filename=file_path,
+            status="modified",
+            patch=make_full_rewrite_patch(base_content, head_content),
+            previous_filename=None,
+        )
+        repository = FakeRepository(
+            {
+                (file_path, "base1"): base_content,
+                (file_path, "head1"): head_content,
+            },
+            FakePR([changed_file], "Restructure overview", "base1", "head1"),
+            {("base1", "head1"): [changed_file]},
+        )
+        github = FakeGithub({"acme/docs": repository})
+        repo_configs = {
+            "acme/docs": {
+                "source_repo": "acme/docs",
+                "target_repo": "acme/docs-cn",
+                "source_language": "English",
+                "target_language": "Chinese",
+            },
+        }
+        context = build_commit_diff_context(
+            "acme/docs", "acme/docs-cn", "base1", "head1", github, repo_configs,
+        )
+
+        result = analyze_source_changes(
+            context, github,
+            special_files=["TOC.md", "keywords.md"],
+            ignore_files=[],
+            repo_configs=repo_configs,
+        )
+        added_sections, modified_sections, deleted_sections, added_files = result[:4]
+        restructured_files = result[10]
+
+        self.assertIn(file_path, added_files)
+        self.assertEqual(added_files[file_path], head_content)
+        self.assertNotIn(file_path, modified_sections)
+        self.assertNotIn(file_path, added_sections)
+        self.assertNotIn(file_path, deleted_sections)
+        self.assertIn(file_path, restructured_files)
+
+    def test_pr_mode_does_not_route_restructured_to_added_files(self):
+        """In PR mode, restructured files are NOT rerouted (commit-only feature)."""
+        file_path = "overview.md"
+        base_content = "# Overview\n\n## A\n\nText A\n\n## B\n\nText B\n"
+        head_content = "# Overview\n\n## X\n\nText X\n\n## Y\n\nText Y\n\n## Z\n\nText Z\n"
+        changed_file = SimpleNamespace(
+            filename=file_path,
+            status="modified",
+            patch=make_full_rewrite_patch(base_content, head_content),
+            previous_filename=None,
+        )
+        repository = FakeRepository(
+            {
+                (file_path, "base1"): base_content,
+                (file_path, "head1"): head_content,
+            },
+            FakePR([changed_file], "Restructure overview", "base1", "head1"),
+            {("base1", "head1"): [changed_file]},
+        )
+        github = FakeGithub({"acme/docs": repository})
+        repo_configs = {
+            "acme/docs": {
+                "source_repo": "acme/docs",
+                "target_repo": "acme/docs-cn",
+                "source_language": "English",
+                "target_language": "Chinese",
+            }
+        }
+
+        result = analyze_source_changes(
+            f"https://github.com/acme/docs/pull/1",
+            github,
+            special_files=["TOC.md", "keywords.md"],
+            ignore_files=[],
+            repo_configs=repo_configs,
+        )
+        added_files = result[3]
+        restructured_files = result[10]
+
+        self.assertNotIn(file_path, added_files)
+        self.assertEqual(restructured_files, set())
 
 
 if __name__ == "__main__":

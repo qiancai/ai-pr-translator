@@ -894,7 +894,7 @@ def main():
     
     # Step 2: Analyze source changes with operation categorization
     thread_safe_print(f"\n📊 Step 2: Analyzing source changes...")
-    added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images = analyze_source_changes(
+    added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images, _restructured_files = analyze_source_changes(
         source_context, github_client,
         special_files=SPECIAL_FILES, 
         ignore_files=PR_MODE_IGNORE_FILES,
