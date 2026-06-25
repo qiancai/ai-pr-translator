@@ -3,6 +3,34 @@
 import os
 
 
+def find_heading_line_indices(lines, is_heading):
+    """Return the indices of markdown heading lines, skipping fenced code blocks.
+
+    ``lines`` is a pre-split list of lines and ``is_heading`` is the predicate
+    used to recognize a heading line, injected so callers can supply their own
+    heading detection.  Centralizes the code-fence tracking that would otherwise
+    be duplicated wherever headings are scanned.
+    """
+    indices = []
+    in_code_block = False
+    code_block_delimiter = None
+    for index, raw_line in enumerate(lines):
+        stripped = raw_line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            if not in_code_block:
+                in_code_block = True
+                code_block_delimiter = stripped[:3]
+            elif stripped.startswith(code_block_delimiter):
+                in_code_block = False
+                code_block_delimiter = None
+            continue
+        if in_code_block:
+            continue
+        if is_heading(raw_line):
+            indices.append(index)
+    return indices
+
+
 def _normalize_rel_path(path):
     return (path or "").strip().lstrip("/")
 

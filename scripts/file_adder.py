@@ -118,11 +118,22 @@ def preprocess_added_file_batch_for_heading_anchor_stability(batch_content, sour
     return "\n".join(processed_lines)
 
 
-def translate_file_batch(batch_content, ai_client, source_language="English", target_language="Chinese", glossary_matcher=None, source_mode=""):
-    """Translate a single batch of file content using AI"""
+def translate_file_batch(batch_content, ai_client, source_language="English", target_language="Chinese", glossary_matcher=None, source_mode="", context_reference=None, prior_translation_reference=None):
+    """Translate a single batch of file content using AI.
+
+    ``context_reference`` is optional surrounding source text included in the
+    prompt as read-only context (not translated, not returned). It lets callers
+    translate a small fragment while still giving the model the full section for
+    accurate terminology and tone.
+
+    ``prior_translation_reference`` is the existing target-language translation of
+    the surrounding section. When provided, the model is told to keep its wording
+    for anything that did not change and only re-render what the source actually
+    changed -- i.e. a minimal edit rather than a fresh translation.
+    """
     if not batch_content.strip():
         return batch_content
-    
+
     thread_safe_print(f"   🤖 Translating batch ({len(batch_content.split())} words)...")
     prompt_batch_content = preprocess_added_file_batch_for_heading_anchor_stability(
         batch_content,
@@ -153,6 +164,24 @@ def translate_file_batch(batch_content, ai_client, source_language="English", ta
 
     doc_variable_example = "{{{ .starter }}}"
 
+    context_block = ""
+    if context_reference and context_reference.strip():
+        context_block = (
+            "Surrounding section, for context only. Do NOT translate it and do NOT "
+            "include it in your output; use it only to keep terminology, tone, and "
+            f"meaning consistent:\n{context_reference}\n\n"
+        )
+
+    prior_block = ""
+    if prior_translation_reference and prior_translation_reference.strip():
+        prior_block = (
+            f"Existing {target_language} translation of this section. For any text "
+            "whose meaning did not change, reuse its exact wording, terminology, and "
+            "phrasing; only re-render the parts whose source meaning actually "
+            "changed. Do NOT output this reference itself:\n"
+            f"{prior_translation_reference}\n\n"
+        )
+
     prompt = f"""You are an expert technical writer in the database domain, proficient in writing clear, concise, and easy-to-understand user documentation.
 
 Your task is to translate the following TiDB document content from {source_language} to {target_language}.
@@ -179,7 +208,7 @@ Input:
 Glossary for terms in {source_language} and {target_language}:
 {glossary_prompt_section}
 
-Content to translate:
+{context_block}{prior_block}Content to translate:
 {prompt_batch_content}
 """
 

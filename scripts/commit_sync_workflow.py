@@ -59,6 +59,7 @@ from diff_analyzer import (
     remove_related_resources_resource_card_sections,
 )
 from file_adder import process_added_files
+from structural_reconciler import reconcile_restructured_file
 from file_deleter import process_deleted_files
 from glossary import create_glossary_matcher, load_glossary
 from image_processor import process_all_images
@@ -1270,6 +1271,117 @@ def add_counts(total_counts, counts):
         total_counts[key] = total_counts.get(key, 0) + value
 
 
+def reconcile_restructured_files(
+    restructured_files,
+    added_files,
+    full_translation_file_paths,
+    diff_context,
+    github_client,
+    ai_client,
+    repo_config,
+    glossary_matcher,
+    translation_stats,
+    successful_file_paths,
+):
+    """Reconcile restructured files in place, reusing existing translations.
+
+    Each successfully reconciled file is written to the target, recorded as a
+    success, and removed from the full-translation queue.  Files that cannot be
+    reconciled (no existing target, structural drift, or self-check failure)
+    are left in ``added_files`` to fall back to full translation.
+    """
+    reconciled_paths = set()
+    source_mode = (
+        diff_context.get("mode", "commit") if isinstance(diff_context, dict) else "commit"
+    )
+    # Mirror analyze_source_changes: RelatedResources ResourceCard sections are
+    # only stripped in commit mode, so the reconciled base/head stay aligned
+    # with how the existing target translation was originally generated.
+    rr_strip = source_mode == "commit" and should_ignore_resource_card_section(repo_config)
+
+    for file_path in sorted(restructured_files):
+        try:
+            head_source = get_source_ref_content(file_path, diff_context, github_client, "head_ref")
+            base_source = get_source_ref_content(file_path, diff_context, github_client, "base_ref")
+        except Exception as e:
+            thread_safe_print(
+                f"   ⚠️  Reconciler: could not load source for {file_path}: "
+                f"{sanitize_exception_message(e)}; using full translation"
+            )
+            continue
+
+        existing_target = read_target_file_content(TARGET_REPO_PATH, file_path)
+        if not existing_target:
+            thread_safe_print(
+                f"   ℹ️  Reconciler: no existing target for {file_path}; using full translation"
+            )
+            continue
+
+        if rr_strip:
+            if head_source:
+                head_source, _ = remove_related_resources_resource_card_sections(head_source)
+            if base_source:
+                base_source, _ = remove_related_resources_resource_card_sections(base_source)
+
+        try:
+            reconciled = reconcile_restructured_file(
+                file_path,
+                head_source,
+                base_source,
+                existing_target,
+                ai_client,
+                repo_config,
+                glossary_matcher=glossary_matcher,
+                source_mode=source_mode,
+            )
+        except Exception as e:
+            # Isolate per-file failures (e.g. AI/network errors surfacing from
+            # translate_file_batch) so one file cannot abort the whole group;
+            # the file stays queued for full-translation fallback.
+            thread_safe_print(
+                f"   ❌ Reconciler raised for {file_path}: "
+                f"{sanitize_exception_message(e)}; using full translation"
+            )
+            continue
+
+        if reconciled is None:
+            thread_safe_print(
+                f"   ↩️  Reconciler declined {file_path}; using full translation"
+            )
+            continue
+
+        target_file_path = get_safe_target_file_path(TARGET_REPO_PATH, file_path)
+        if not target_file_path:
+            thread_safe_print(
+                f"   ⚠️  Reconciler: unsafe target path for {file_path}; using full translation"
+            )
+            continue
+
+        try:
+            with open(target_file_path, "w", encoding="utf-8") as f:
+                f.write(reconciled)
+        except Exception as e:
+            thread_safe_print(
+                f"   ❌ Reconciler: failed to write {target_file_path}: "
+                f"{sanitize_exception_message(e)}; using full translation"
+            )
+            continue
+
+        thread_safe_print(f"   ✅ Reconciled (structure-preserving): {file_path}")
+        translation_stats.mark_success(file_path)
+        successful_file_paths.add(file_path)
+        reconciled_paths.add(file_path)
+
+    for file_path in reconciled_paths:
+        added_files.pop(file_path, None)
+        full_translation_file_paths.discard(file_path)
+
+    if reconciled_paths:
+        git_add_changes(TARGET_REPO_PATH)
+
+    return reconciled_paths
+
+
 def process_translation_group(
     group_label,
     *,
@@ -1409,6 +1521,23 @@ def process_translation_group(
         for path in sorted(restructured_files):
             thread_safe_print(f"   - {path}")
         full_translation_file_paths.update(restructured_files)
+
+        # Try structure-preserving reconciliation first: rebuild each file in
+        # HEAD order while reusing the existing translation for unchanged /
+        # moved sections.  Files that reconcile successfully are removed from
+        # the full-translation queue; the rest fall back to full translation.
+        reconcile_restructured_files(
+            restructured_files,
+            added_files,
+            full_translation_file_paths,
+            diff_context,
+            github_client,
+            ai_client,
+            repo_config,
+            glossary_matcher,
+            translation_stats,
+            successful_file_paths,
+        )
 
     changed_file_paths = {
         file.filename for file in filtered_changed_files if getattr(file, "filename", None)

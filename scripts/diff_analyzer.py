@@ -5,6 +5,7 @@ Handles diff analysis, content retrieval, hierarchy building, and section extrac
 for both PR-based and commit-compare-based workflows.
 """
 
+from collections import Counter
 from dataclasses import dataclass
 import difflib
 import json
@@ -17,7 +18,11 @@ from urllib.parse import urlparse
 from github import Github
 from log_sanitizer import sanitize_exception_message
 from section_matcher import clean_title_for_matching
-from special_file_utils import is_toc_file_name
+from special_file_utils import find_heading_line_indices, is_toc_file_name
+from translation_structure_validator import (
+    custom_content_tag_signature,
+    extract_custom_content_tags,
+)
 
 # Thread-safe printing
 print_lock = threading.Lock()
@@ -959,8 +964,6 @@ def detect_restructured_file(file_content, base_file_content, operations):
     Headings that appear as "modified" but have identical old/new content are
     treated as unchanged (this happens with full-rewrite patches).
     """
-    from collections import Counter
-
     head_sub_headings = _collect_sub_heading_line_numbers(file_content)
     base_sub_headings = _collect_sub_heading_line_numbers(base_file_content)
 
@@ -1032,6 +1035,48 @@ def detect_restructured_file(file_content, base_file_content, operations):
         return False
 
     return True
+
+
+def _collect_heading_lines(content):
+    """Return ordered, code-block-aware heading lines (stripped) of a document."""
+    lines = split_normalized_lines(content or "")
+    return [
+        lines[index].strip()
+        for index in find_heading_line_indices(lines, is_markdown_heading)
+    ]
+
+
+def detect_structural_change(base_content, head_content):
+    """Detect partial restructures the incremental section path mishandles.
+
+    Returns True when either:
+      (a) the CustomContent tag sequence differs between base and head — i.e.
+          existing content was newly wrapped/unwrapped or tags were reordered
+          (the unbalanced-tag failure mode); or
+      (b) the document's heading sequence is a pure reorder (same heading
+          multiset, different order) — i.e. one or more sections were moved
+          (the duplicated/dropped-section failure mode).
+
+    Both cases are routed to structural reconciliation, which rebuilds the file
+    in HEAD order while reusing existing translations for unchanged sections.
+    """
+    if not base_content or not head_content:
+        return False
+
+    base_tags = custom_content_tag_signature(extract_custom_content_tags(base_content))
+    head_tags = custom_content_tag_signature(extract_custom_content_tags(head_content))
+    if base_tags != head_tags:
+        return True
+
+    base_headings = _collect_heading_lines(base_content)
+    head_headings = _collect_heading_lines(head_content)
+    if (
+        base_headings != head_headings
+        and Counter(base_headings) == Counter(head_headings)
+    ):
+        return True
+
+    return False
 
 
 def build_hierarchy_dict(file_content):
@@ -3037,10 +3082,13 @@ def analyze_source_changes(
         # translation instead of incremental section-level processing.
         if (
             source_context.get("mode") in ("commit", "pr")
-            and detect_restructured_file(file_content, base_file_content, operations)
+            and (
+                detect_restructured_file(file_content, base_file_content, operations)
+                or detect_structural_change(base_file_content, file_content)
+            )
         ):
-            print(f"   🔄 Detected restructured document: all sub-section headings are in the diff")
-            print(f"   🔄 Routing {file.filename} to full translation instead of incremental processing")
+            print(f"   🔄 Detected restructured document (full restructure or moved/rewrapped sections)")
+            print(f"   🔄 Routing {file.filename} to structural reconciliation (with full-translation fallback)")
             restructured_content = file_content
             if should_ignore_related_resources_resource_card_sections(source_context):
                 restructured_content, skipped_sections = remove_related_resources_resource_card_sections(

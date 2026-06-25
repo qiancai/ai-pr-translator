@@ -1,0 +1,350 @@
+import sys
+import unittest
+from pathlib import Path
+
+
+SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
+sys.path.insert(0, str(SCRIPTS_DIR))
+
+from structural_reconciler import reconcile_restructured_file, split_into_blocks
+from diff_analyzer import detect_structural_change
+from translation_structure_validator import (
+    custom_content_tag_signature,
+    extract_custom_content_tags,
+)
+
+
+REPO_CONFIG = {
+    "source_language": "English",
+    "target_language": "Chinese",
+    "target_local_path": "/tmp",
+}
+
+
+class MockAI:
+    """Identity 'translator': echoes back the content portion of the prompt.
+
+    This keeps CustomContent tags and heading levels intact so the reconciler's
+    structure self-check passes, while letting tests assert which blocks were
+    actually sent to the AI.
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    @staticmethod
+    def _content_portion(prompt):
+        marker = "Content to translate:\n"
+        index = prompt.rfind(marker)
+        return prompt[index + len(marker):] if index != -1 else prompt
+
+    def chat_completion(self, messages, temperature=0.1):
+        self.calls.append(messages)
+        return self._content_portion(messages[0]["content"])
+
+    def contents(self):
+        """The block content actually sent for translation (excludes the fixed
+        instruction boilerplate, which mentions things like 'Some text ...')."""
+        return [self._content_portion(call[0]["content"]) for call in self.calls]
+
+    def prompts(self):
+        return [call[0]["content"] for call in self.calls]
+
+
+def _tags(content):
+    return custom_content_tag_signature(extract_custom_content_tags(content))
+
+
+class SplitBlocksTest(unittest.TestCase):
+    def test_join_reproduces_content(self):
+        content = "# A\n\nintro\n\n## B\n\nbody\n"
+        self.assertEqual("".join(split_into_blocks(content)), content)
+
+    def test_blank_lines_separate_paragraphs(self):
+        content = "para one\n\npara two\n"
+        blocks = split_into_blocks(content)
+        self.assertEqual(len(blocks), 2)
+
+    def test_code_fence_is_atomic_even_with_internal_blank_line(self):
+        content = "intro\n\n```sql\nA\n\nB\n```\n\noutro\n"
+        blocks = split_into_blocks(content)
+        # intro / the whole fence / outro -> 3 blocks; the blank line inside the
+        # fence must NOT split it.
+        self.assertEqual(len(blocks), 3)
+        self.assertIn("```sql\nA\n\nB\n```", blocks[1])
+
+
+class ReconcilePureMoveTest(unittest.TestCase):
+    """A section moved verbatim must be reused, not duplicated or dropped."""
+
+    base = (
+        "# Title\n\nIntro paragraph.\n\n"
+        "## Execution process\n\nExec body.\n\n"
+        "## Restrictions\n\n<CustomContent platform=\"tidb\">\n\ntidb body.\n\n</CustomContent>\n\n"
+        "## Example\n\nExample body.\n"
+    )
+    head = (
+        "# Title\n\nIntro paragraph.\n\n"
+        "## Example\n\nExample body.\n\n"
+        "## Execution process\n\nExec body.\n\n"
+        "## Restrictions\n\n<CustomContent platform=\"tidb\">\n\ntidb body.\n\n</CustomContent>\n"
+    )
+    target = (
+        "# 标题\n\n简介段落。\n\n"
+        "## 执行流程 {#execution-process}\n\n执行正文。\n\n"
+        "## 限制 {#restrictions}\n\n<CustomContent platform=\"tidb\">\n\ntidb 正文。\n\n</CustomContent>\n\n"
+        "## 示例 {#example}\n\n示例正文。\n"
+    )
+
+    def test_pure_move_reuses_all_without_ai(self):
+        ai = MockAI()
+        out = reconcile_restructured_file(
+            "tiflash.md", self.head, self.base, self.target, ai, REPO_CONFIG, source_mode="commit"
+        )
+        self.assertIsNotNone(out)
+        self.assertEqual(len(ai.calls), 0, "pure move must not invoke the AI")
+        self.assertEqual(out.count("## 执行流程"), 1)
+        self.assertEqual(out.count("## 限制"), 1)
+        self.assertEqual(out.count("## 示例"), 1)
+        self.assertEqual(_tags(out), _tags(self.head))
+        self.assertLess(out.index("## 示例"), out.index("## 执行流程"))
+        self.assertIn("执行正文。", out)
+        self.assertIn("tidb 正文。", out)
+
+
+class ReconcileWrappingTest(unittest.TestCase):
+    """Existing content newly wrapped in CustomContent must stay balanced, and
+    the wrapped section's prose/heading must be reused rather than re-translated."""
+
+    base = (
+        "# Coprocessor Cache\n\nIntro.\n\n"
+        "## Monitoring\n\nSome text.\n\n"
+        "### View the Grafana monitoring panel\n\nPanel text.\n\n"
+        "## Faraway\n\nUntouched faraway section.\n"
+    )
+    head = (
+        "# Coprocessor Cache\n\nIntro.\n\n"
+        "## Monitoring\n\nSome text.\n\n"
+        "<CustomContent platform=\"tidb-cloud\" plan=\"dedicated\">\n\n"
+        "### View the Grafana monitoring panel\n\nPanel text.\n\n"
+        "</CustomContent>\n\n"
+        "<CustomContent platform=\"tidb\">\n\n"
+        "### View the Grafana panel\n\nPanel text 2.\n\n"
+        "</CustomContent>\n\n"
+        "## Faraway\n\nUntouched faraway section.\n"
+    )
+    target = (
+        "# Coprocessor 缓存\n\n简介。\n\n"
+        "## 监控\n\n一些文本。\n\n"
+        "### 查看 Grafana 监控面板 {#view-the-grafana-monitoring-panel}\n\n面板文本。\n\n"
+        "## 远方章节 {#faraway}\n\n未改动的远方章节。\n"
+    )
+
+    def test_wrapping_balances_tags_and_reuses_existing_translation(self):
+        ai = MockAI()
+        out = reconcile_restructured_file(
+            "coprocessor.md", self.head, self.base, self.target, ai, REPO_CONFIG, source_mode="commit"
+        )
+        self.assertIsNotNone(out)
+        # Core fix: tag sequence matches HEAD exactly (no duplicate opener).
+        self.assertEqual(_tags(out), _tags(self.head))
+        # Everything that did not change in English is reused verbatim, including
+        # the now-wrapped monitoring panel heading + body.
+        self.assertIn("简介。", out)
+        self.assertIn("一些文本。", out)
+        self.assertIn("### 查看 Grafana 监控面板 {#view-the-grafana-monitoring-panel}", out)
+        self.assertIn("面板文本。", out)
+        self.assertIn("## 远方章节 {#faraway}", out)
+        self.assertIn("未改动的远方章节。", out)
+        # The wrapped/unchanged blocks must not be re-translated.
+        for needle in ("Faraway", "Some text", "Grafana monitoring panel"):
+            self.assertFalse(
+                any(needle in prompt for prompt in ai.contents()),
+                f"unchanged block containing {needle!r} must be reused, not retranslated",
+            )
+        # CustomContent tag lines are emitted verbatim, never sent to the AI.
+        self.assertFalse(
+            any("CustomContent" in prompt for prompt in ai.contents()),
+            "CustomContent tag-only blocks must not be sent to the AI",
+        )
+        # The brand-new section is translated and carries a source-derived anchor.
+        self.assertIn("{#view-the-grafana-panel}", out)
+
+
+class ReconcileCodeBlockTest(unittest.TestCase):
+    """An unchanged code block adjacent to a changed paragraph must be reused
+    byte-for-byte and never sent to the AI (regression: AI mangled code fences)."""
+
+    base = (
+        "# T\n\nIntro.\n\n"
+        "## Syntax\n\n"
+        "```sql\nINSERT INTO t\n    [ON DUP KEY UPDATE x]\n\nvalue:\n    {expr}\n```\n\n"
+        "Done.\n"
+    )
+    head = (
+        "# T\n\nIntro changed.\n\n"
+        "## Syntax\n\n"
+        "```sql\nINSERT INTO t\n    [ON DUP KEY UPDATE x]\n\nvalue:\n    {expr}\n```\n\n"
+        "Done.\n"
+    )
+    target = (
+        "# T\n\n简介。\n\n"
+        "## 语法 {#syntax}\n\n"
+        "```sql\nINSERT INTO t\n    [ON DUP KEY UPDATE x]\n\nvalue:\n    {expr}\n```\n\n"
+        "完成。\n"
+    )
+
+    def test_unchanged_code_block_is_preserved_and_not_translated(self):
+        ai = MockAI()
+        out = reconcile_restructured_file(
+            "syntax.md", self.head, self.base, self.target, ai, REPO_CONFIG, source_mode="commit"
+        )
+        self.assertIsNotNone(out)
+        # The code block (with its internal blank line) survives byte-for-byte.
+        self.assertIn(
+            "```sql\nINSERT INTO t\n    [ON DUP KEY UPDATE x]\n\nvalue:\n    {expr}\n```",
+            out,
+        )
+        # Only the changed paragraph was sent to the AI.
+        self.assertEqual(len(ai.calls), 1)
+        self.assertIn("Intro changed.", ai.contents()[0])
+        # The code fence content was never sent to the AI.
+        self.assertFalse(
+            any("```sql" in prompt or "ON DUP KEY UPDATE" in prompt for prompt in ai.contents()),
+            "the code block must never be sent to the AI",
+        )
+        # Unchanged surrounding translations are reused.
+        self.assertIn("完成。", out)
+        self.assertIn("## 语法 {#syntax}", out)
+
+
+class ReconcileSectionContextTest(unittest.TestCase):
+    """A changed block is translated with its enclosing section as context, but
+    only the changed block itself is the content to translate."""
+
+    base = (
+        "# T\n\nIntro.\n\n"
+        "## Details\n\nFirst paragraph about widgets.\n\nSecond paragraph about gadgets.\n\nThird paragraph about gizmos.\n"
+    )
+    head = (
+        "# T\n\nIntro.\n\n"
+        "## Details\n\nFirst paragraph about widgets.\n\nSecond paragraph about gadgets, now revised.\n\nThird paragraph about gizmos.\n"
+    )
+    target = (
+        "# T\n\n简介。\n\n"
+        "## 详情 {#details}\n\n关于 widgets 的第一段。\n\n关于 gadgets 的第二段。\n\n关于 gizmos 的第三段。\n"
+    )
+
+    def test_changed_block_translated_with_section_context(self):
+        ai = MockAI()
+        out = reconcile_restructured_file(
+            "ctx.md", self.head, self.base, self.target, ai, REPO_CONFIG, source_mode="commit"
+        )
+        self.assertIsNotNone(out)
+        # Only the one changed paragraph is sent as the content to translate.
+        self.assertEqual(len(ai.calls), 1)
+        content = ai.contents()[0]
+        self.assertIn("Second paragraph about gadgets, now revised.", content)
+        self.assertNotIn("First paragraph", content)
+        self.assertNotIn("Third paragraph", content)
+        # ... but the full enclosing section IS provided as reference context.
+        prompt = ai.prompts()[0]
+        self.assertIn("for context only", prompt)
+        self.assertIn("First paragraph about widgets.", prompt)
+        self.assertIn("Third paragraph about gizmos.", prompt)
+        self.assertIn("## Details", prompt)
+        # Unchanged sibling paragraphs keep their existing translation verbatim.
+        self.assertIn("关于 widgets 的第一段。", out)
+        self.assertIn("关于 gizmos 的第三段。", out)
+
+    def test_modified_block_gets_existing_translation_for_minimal_edit(self):
+        ai = MockAI()
+        reconcile_restructured_file(
+            "ctx.md", self.head, self.base, self.target, ai, REPO_CONFIG, source_mode="commit"
+        )
+        prompt = ai.prompts()[0]
+        # The existing translation of the enclosing section is supplied so the
+        # model can minimally edit instead of re-translating from scratch.
+        self.assertIn("Existing Chinese translation of this section", prompt)
+        self.assertIn("关于 widgets 的第一段。", prompt)
+        self.assertIn("关于 gizmos 的第三段。", prompt)
+
+
+class ReconcileNewSectionTest(unittest.TestCase):
+    """A brand-new section has no prior translation, so it is translated fresh
+    (no existing-translation reference is supplied)."""
+
+    base = "# T\n\n## A\n\nBody A.\n"
+    head = "# T\n\n## A\n\nBody A.\n\n## B\n\nBody B brand new.\n"
+    target = "# T\n\n## A {#a}\n\n正文 A。\n"
+
+    def test_new_section_has_no_prior_translation_reference(self):
+        ai = MockAI()
+        out = reconcile_restructured_file(
+            "new.md", self.head, self.base, self.target, ai, REPO_CONFIG, source_mode="commit"
+        )
+        self.assertIsNotNone(out)
+        self.assertEqual(len(ai.calls), 1)
+        prompt = ai.prompts()[0]
+        self.assertIn("Body B brand new.", prompt)
+        self.assertNotIn("Existing Chinese translation of this section", prompt)
+        # The unchanged section A keeps its existing translation.
+        self.assertIn("正文 A。", out)
+
+
+class ReconcileWhitespaceTest(unittest.TestCase):
+    def test_trailing_whitespace_only_change_is_reused(self):
+        base = "# A\n\nIntro.\n\n## B\n\nLine with trailing space.   \n"
+        head = "# A\n\nIntro.\n\n## B\n\nLine with trailing space.\n"
+        target = "# A\n\n简介。\n\n## B {#b}\n\n带行尾空格的行。\n"
+        ai = MockAI()
+        out = reconcile_restructured_file("ws.md", head, base, target, ai, REPO_CONFIG, source_mode="commit")
+        self.assertIsNotNone(out)
+        self.assertEqual(len(ai.calls), 0, "whitespace-only change must be reused")
+        self.assertIn("带行尾空格的行。", out)
+
+
+class ReconcileFallbackTest(unittest.TestCase):
+    def test_block_count_mismatch_returns_none(self):
+        base = "# A\n\nx\n\n## B\n\ny\n"
+        head = "# A\n\nx\n\n## B\n\ny\n"
+        # Target merged two blocks into one -> structurally drifted.
+        target = "# A\n\nx\n"
+        ai = MockAI()
+        out = reconcile_restructured_file("drift.md", head, base, target, ai, REPO_CONFIG, source_mode="commit")
+        self.assertIsNone(out)
+
+    def test_missing_inputs_return_none(self):
+        ai = MockAI()
+        self.assertIsNone(
+            reconcile_restructured_file("x.md", "", "base", "target", ai, REPO_CONFIG)
+        )
+        self.assertIsNone(
+            reconcile_restructured_file("x.md", "head", "base", "", ai, REPO_CONFIG)
+        )
+
+
+class DetectStructuralChangeTest(unittest.TestCase):
+    def test_detects_section_move(self):
+        base = "# T\n\n## A\n\na\n\n## B\n\nb\n"
+        head = "# T\n\n## B\n\nb\n\n## A\n\na\n"
+        self.assertTrue(detect_structural_change(base, head))
+
+    def test_detects_customcontent_change(self):
+        base = "# T\n\n## A\n\na\n"
+        head = "# T\n\n<CustomContent platform=\"tidb\">\n\n## A\n\na\n\n</CustomContent>\n"
+        self.assertTrue(detect_structural_change(base, head))
+
+    def test_plain_content_edit_is_not_structural(self):
+        base = "# T\n\n## A\n\nold body\n\n## B\n\nb\n"
+        head = "# T\n\n## A\n\nnew body\n\n## B\n\nb\n"
+        self.assertFalse(detect_structural_change(base, head))
+
+    def test_code_block_hashes_do_not_trigger_move(self):
+        base = "# T\n\n## A\n\n```\n# comment\n```\n\n## B\n\nb\n"
+        head = "# T\n\n## A\n\n```\n# other comment\n```\n\n## B\n\nb\n"
+        self.assertFalse(detect_structural_change(base, head))
+
+
+if __name__ == "__main__":
+    unittest.main()
