@@ -10,11 +10,11 @@ import os
 import sys
 
 
-TEST_OPTION = "ja"  # Options: "ai", "cloud", "ja"
+TEST_OPTION = "cloud"  # Options: "ai", "cloud", "ja"
 
 # Options: "incremental" for commit diff translation, or "full" for complete
 # SOURCE_FILES translation from SOURCE_HEAD_REF using the file-added flow.
-SOURCE_FILES_TRANSLATION_MODE = "full"
+SOURCE_FILES_TRANSLATION_MODE = "incremental"
 # Options: "manual" to add/update per-file Corresponding EN commit markers,
 # or "scheduled" to remove existing markers after successful translation.
 COMMIT_SYNC_RUN_TYPE = "scheduled"
@@ -58,11 +58,11 @@ TEST_CONFIGS = {
         "SOURCE_REPO": "pingcap/docs",
         "TARGET_REPO": "pingcap/docs",
         # Set SOURCE_BASE_REF from latest_translation_commit.json and SOURCE_HEAD_REF from release-8.5 HEAD.
-        "SOURCE_BASE_REF": "1a75af9f55e1488abdfb9d4c6ab8b2a58849f9db",
-        "SOURCE_HEAD_REF": "6fd0a68165e85dd364c0ca853eb136d6dc58d837",#ecd31cc2c25ad6715af68d05794da89265cfe4d8
+        "SOURCE_BASE_REF": "6376b9086871957f4809711c83e021a01b0a8f5d",
+        "SOURCE_HEAD_REF": "6a3301ed41e2d6edcc5f6d76f06fffdfe029acd5",#ecd31cc2c25ad6715af68d05794da89265cfe4d8
         # Keep SOURCE_FOLDER empty. Put resolved Cloud TOC-scoped files here.
         "SOURCE_FOLDER": "", ## Leave this field empty when translating cloud docs.
-        "SOURCE_FILES": "tidb-cloud/premium/tidb-cloud-auditing-premium.md",
+        "SOURCE_FILES": "coprocessor-cache.md,tiflash/tiflash-results-materialization.md",
         "AUTO_RESOLVE_TOC_SOURCE_FILES": True,
         "CLOUD_TOC_FILES": (
             "TOC-tidb-cloud.md,"
