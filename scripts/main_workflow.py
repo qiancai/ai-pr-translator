@@ -541,80 +541,109 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, so
                 )
             return finish(False, failure_reason)
         
-        # Step 2: Get AI translation for the matched sections
-        thread_safe_print(f"   🤖 Getting AI translation for matched sections...")
-        
-        # Create file data structure with enhanced matching info
-        # Wrap enhanced_sections in the expected format for process_single_file
-        file_data = {
-            source_file_path: {
-                'type': 'enhanced_sections',
-                'sections': enhanced_sections
-            }
-        }
-        
-        # Call the existing process_modified_sections function to get AI translation
-        results = process_modified_sections(file_data, file_diff, source_context_or_pr_url, github_client, ai_client, repo_config, max_sections, glossary_matcher=glossary_matcher)
-        
-        # Step 3: Update match_source_diff_to_target.json with AI results
-        if results and len(results) > 0:
-            file_path, success, ai_updated_sections = results[0]  # Get first result
-            if success and isinstance(ai_updated_sections, dict):
-                thread_safe_print(f"   📝 Step 3: Updating {match_file} with AI results...")
-                
-                # Load current match_source_diff_to_target.json
-                with open(match_file, 'r', encoding='utf-8') as f:
-                    match_data = json.load(f)
-                
-                # Add target_new_content field to each section based on AI results
-                updated_count = 0
-                for key, section_data in match_data.items():
-                    operation = section_data.get('source_operation', '')
-                    
-                    if operation == 'deleted':
-                        # For deleted sections, set target_new_content to null
-                        section_data['target_new_content'] = None
-                    elif key in ai_updated_sections:
-                        # For modified/added sections with AI translation
-                        section_data['target_new_content'] = ai_updated_sections[key]
-                        updated_count += 1
-                    else:
-                        # For sections not translated, keep original content
-                        section_data['target_new_content'] = section_data.get('target_content', '')
-                
-                # Save updated match_source_diff_to_target.json
-                with open(match_file, 'w', encoding='utf-8') as f:
-                    json.dump(match_data, f, ensure_ascii=False, indent=2)
-                
-                thread_safe_print(f"   ✅ Updated {updated_count} sections with AI translations in {match_file}")
-                
-                # Abort before writing if any chunk translations failed
-                chunk_failures = getattr(ai_updated_sections, "failures", [])
-                if chunk_failures:
-                    thread_safe_print(f"   ⚠️  Skipping file update due to chunk translation failures")
-                    return finish(False, "; ".join(chunk_failures))
+        # Separate heading-level-only changes from sections needing AI translation
+        from file_updater import apply_heading_level_change_to_target
+        heading_level_only_results = {}
+        sections_for_ai = {}
 
-                # Step 4: Apply updates to target document using update_target_document_from_match_data
-                thread_safe_print(f"   📝 Step 4: Applying updates to target document...")
-                from file_updater import update_target_document_from_match_data
-                
-                success = update_target_document_from_match_data(match_file, repo_config['target_local_path'], source_file_path)
-                if success:
-                    thread_safe_print(f"   🎉 Target document successfully updated!")
-                    return finish(True)
-                else:
-                    thread_safe_print(f"   ❌ Failed to update target document")
-                    return finish(False, f"Failed to update target document for {source_file_path}")
-                    
+        for key, section_info in enhanced_sections.items():
+            source_entry = source_diff_dict.get(key, {})
+            if source_entry.get('heading_level_change_only'):
+                target_content = section_info.get('target_content', '')
+                old_level = source_entry['old_heading_level']
+                new_level = source_entry['new_heading_level']
+                new_target = apply_heading_level_change_to_target(
+                    target_content, old_level, new_level
+                )
+                heading_level_only_results[key] = new_target
+                thread_safe_print(
+                    f"   📐 Heading-level-only: {key} "
+                    f"({'#' * old_level} → {'#' * new_level}) — applied directly to target"
+                )
             else:
-                thread_safe_print(f"   ⚠️  AI translation failed or returned invalid results")
-                failure_reason = "AI translation failed or returned invalid results"
-                if hasattr(ai_updated_sections, "failures") and ai_updated_sections.failures:
-                    failure_reason = "; ".join(ai_updated_sections.failures)
-                return finish(False, failure_reason)
+                sections_for_ai[key] = section_info
+
+        if heading_level_only_results:
+            thread_safe_print(
+                f"   📐 {len(heading_level_only_results)} section(s) handled as heading-level-only "
+                f"(no AI needed), {len(sections_for_ai)} section(s) still need AI translation"
+            )
+
+        # Step 2: Get AI translation for the remaining matched sections
+        ai_updated_sections = {}
+        ai_success = True
+
+        if sections_for_ai:
+            thread_safe_print(f"   🤖 Getting AI translation for {len(sections_for_ai)} matched sections...")
+
+            file_data = {
+                source_file_path: {
+                    'type': 'enhanced_sections',
+                    'sections': sections_for_ai
+                }
+            }
+
+            results = process_modified_sections(file_data, file_diff, source_context_or_pr_url, github_client, ai_client, repo_config, max_sections, glossary_matcher=glossary_matcher)
+
+            if results and len(results) > 0:
+                file_path, ai_success, ai_updated_sections = results[0]
+                if not ai_success or not isinstance(ai_updated_sections, dict):
+                    failure_reason = "AI translation failed or returned invalid results"
+                    if hasattr(ai_updated_sections, "failures") and ai_updated_sections.failures:
+                        failure_reason = "; ".join(ai_updated_sections.failures)
+                    thread_safe_print(f"   ⚠️  AI translation failed or returned invalid results")
+                    return finish(False, failure_reason)
+            else:
+                if not heading_level_only_results:
+                    thread_safe_print(f"   ⚠️  No results from process_modified_sections")
+                    return finish(False, "No results from process_modified_sections")
+                ai_updated_sections = {}
         else:
-            thread_safe_print(f"   ⚠️  No results from process_modified_sections")
-            return finish(False, "No results from process_modified_sections")
+            thread_safe_print(f"   📐 All sections are heading-level-only — skipping AI translation entirely")
+
+        # Step 3: Update match_source_diff_to_target.json with results
+        thread_safe_print(f"   📝 Step 3: Updating {match_file} with results...")
+
+        with open(match_file, 'r', encoding='utf-8') as f:
+            match_data = json.load(f)
+
+        updated_count = 0
+        for key, section_data in match_data.items():
+            operation = section_data.get('source_operation', '')
+
+            if operation == 'deleted':
+                section_data['target_new_content'] = None
+            elif key in heading_level_only_results:
+                section_data['target_new_content'] = heading_level_only_results[key]
+                updated_count += 1
+            elif key in ai_updated_sections:
+                section_data['target_new_content'] = ai_updated_sections[key]
+                updated_count += 1
+            else:
+                section_data['target_new_content'] = section_data.get('target_content', '')
+
+        with open(match_file, 'w', encoding='utf-8') as f:
+            json.dump(match_data, f, ensure_ascii=False, indent=2)
+
+        thread_safe_print(f"   ✅ Updated {updated_count} sections in {match_file}")
+
+        # Abort before writing if any chunk translations failed
+        chunk_failures = getattr(ai_updated_sections, "failures", [])
+        if chunk_failures:
+            thread_safe_print(f"   ⚠️  Skipping file update due to chunk translation failures")
+            return finish(False, "; ".join(chunk_failures))
+
+        # Step 4: Apply updates to target document
+        thread_safe_print(f"   📝 Step 4: Applying updates to target document...")
+        from file_updater import update_target_document_from_match_data
+
+        success = update_target_document_from_match_data(match_file, repo_config['target_local_path'], source_file_path)
+        if success:
+            thread_safe_print(f"   🎉 Target document successfully updated!")
+            return finish(True)
+        else:
+            thread_safe_print(f"   ❌ Failed to update target document")
+            return finish(False, f"Failed to update target document for {source_file_path}")
         
     except Exception as e:
         thread_safe_print(

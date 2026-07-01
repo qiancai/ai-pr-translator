@@ -434,32 +434,67 @@ def _get_fence_marker(line):
     match = re.match(r'^(`{3,}|~{3,})', (line or "").strip())
     return match.group(1) if match else None
 
+def _heading_match_candidates(target_hierarchy):
+    """Return full-path and leaf heading candidates for section-start matching."""
+    if not target_hierarchy:
+        return []
+
+    candidates = []
+    for candidate in (
+        target_hierarchy.strip(),
+        target_hierarchy.split(' > ')[-1].strip(),
+    ):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+def _line_matches_heading_candidates(raw_line, heading_candidates):
+    """Return True when a file line matches one of the expected heading texts."""
+    if not is_markdown_heading(raw_line):
+        return False
+    if not heading_candidates:
+        return True
+    return raw_line.strip() in heading_candidates
+
 def resolve_section_start_line(target_lines, target_line_num, target_hierarchy):
     """Resolve a robust 0-based section start line for replace/delete."""
     if target_line_num <= 0:
         return 0
 
     candidate = target_line_num - 1
-    heading_text = (target_hierarchy or "").strip()
+    heading_candidates = _heading_match_candidates(target_hierarchy)
+    heading_text = heading_candidates[-1] if heading_candidates else (target_hierarchy or "").strip()
 
     # 1) Exact candidate
-    if 0 <= candidate < len(target_lines) and is_markdown_heading(target_lines[candidate]):
+    if 0 <= candidate < len(target_lines) and _line_matches_heading_candidates(
+        target_lines[candidate], heading_candidates
+    ):
         return candidate
 
     # 2) Off-by-one previous line
-    if candidate - 1 >= 0 and is_markdown_heading(target_lines[candidate - 1]):
-        if not heading_text or target_lines[candidate - 1].strip() == heading_text:
-            thread_safe_print(f"   🔧 Adjusted start line from {target_line_num} to {target_line_num - 1} (off-by-one heading)")
-            return candidate - 1
+    if candidate - 1 >= 0 and _line_matches_heading_candidates(
+        target_lines[candidate - 1], heading_candidates
+    ):
+        thread_safe_print(f"   🔧 Adjusted start line from {target_line_num} to {target_line_num - 1} (off-by-one heading)")
+        return candidate - 1
 
     # 3) Search exact heading text in file
-    if heading_text:
+    if heading_candidates:
         for idx, raw_line in enumerate(target_lines):
-            if raw_line.strip() == heading_text and is_markdown_heading(raw_line):
+            if _line_matches_heading_candidates(raw_line, heading_candidates):
                 thread_safe_print(f"   🔧 Resolved start line by heading text at line {idx + 1}")
                 return idx
 
-    # 4) Last resort: nearest heading around candidate
+    # 4) Search nearby matching heading around candidate
+    for delta in range(1, 6):
+        for idx in (candidate - delta, candidate + delta):
+            if 0 <= idx < len(target_lines) and _line_matches_heading_candidates(
+                target_lines[idx], heading_candidates
+            ):
+                thread_safe_print(f"   🔧 Resolved start line by nearby matching heading at line {idx + 1}")
+                return idx
+
+    # 5) Last resort: nearest heading around candidate
     for delta in range(1, 6):
         for idx in (candidate - delta, candidate + delta):
             if 0 <= idx < len(target_lines) and is_markdown_heading(target_lines[idx]):
@@ -2518,6 +2553,32 @@ def _detect_and_fix_cross_parent_moves(sections_with_line):
         result.append((key + '_insert', insert_data, p_target_line))
 
     return result
+
+
+def apply_heading_level_change_to_target(target_content, old_level, new_level):
+    """Apply a heading level change to target content.
+
+    Sets the target heading directly to new_level. This is correct because
+    source and target documents should have matching heading levels, so the
+    target heading should always end up at the same level as the source.
+
+    Only the first heading line is changed; body content is preserved as-is.
+    """
+    if not target_content:
+        return target_content
+
+    lines = target_content.split('\n')
+    first_line = lines[0]
+    match = re.match(r'^(#{1,6})\s+(.*)', first_line)
+    if not match:
+        return target_content
+
+    title_text = match.group(2)
+
+    target_new_level = max(1, min(6, new_level))
+
+    lines[0] = '#' * target_new_level + ' ' + title_text
+    return '\n'.join(lines)
 
 
 def update_target_document_from_match_data(match_file_path, target_local_path, target_file_name=None):

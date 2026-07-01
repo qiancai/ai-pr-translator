@@ -271,6 +271,76 @@ class MainWorkflowRegressionTest(unittest.TestCase):
         self.assertIn("missing_source_section", reason)
         process_modified_sections.assert_not_called()
 
+    def test_regular_modified_file_applies_heading_level_only_without_ai_on_target_line_offset(self):
+        source_diff_dict = {
+            "modified_20": {
+                "operation": "modified",
+                "new_line_number": 20,
+                "new_content": "### SQL statement\n\nNew content\n",
+                "old_content": "## SQL statement\n\nNew content\n",
+                "original_hierarchy": "## SQL statement",
+                "heading_level_change_only": True,
+                "old_heading_level": 2,
+                "new_heading_level": 3,
+            },
+        }
+        matched_sections = {
+            "modified_20": {
+                "target_line": "5",
+                "target_hierarchy": "## Statements > ### SQL 语句",
+                "target_content": "### SQL 语句\n\n旧内容\n",
+                "source_operation": "modified",
+                "source_old_content": "## SQL statement\n\nNew content\n",
+                "source_new_content": "### SQL statement\n\nNew content\n",
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_dir = Path(tmpdir)
+            source_diff_file = temp_dir / "example-source-diff-dict.json"
+            source_diff_file.write_text(
+                json.dumps(source_diff_dict),
+                encoding="utf-8",
+            )
+
+            def assert_match_file(match_file, target_local_path, target_file_name=None):
+                self.assertEqual(target_file_name, "example.md")
+                match_data = json.loads(Path(match_file).read_text(encoding="utf-8"))
+                self.assertEqual(
+                    match_data["modified_20"]["target_new_content"],
+                    "### SQL 语句\n\n旧内容\n",
+                )
+                self.assertEqual(match_data["modified_20"]["target_line"], "5")
+                return True
+
+            with mock.patch.object(main_workflow, "ensure_temp_output_dir", return_value=tmpdir), \
+                mock.patch.object(main_workflow, "check_source_token_limit", return_value=(True, 10, 50000)), \
+                mock.patch("diff_analyzer.get_target_hierarchy_and_content", return_value=({"5": "## Statements > ### SQL 语句"}, ["# SQL", "", "## Statements", "", "### SQL 语句"])), \
+                mock.patch("section_matcher.match_source_diff_to_target", return_value=matched_sections), \
+                mock.patch.object(main_workflow, "process_modified_sections") as process_modified_sections, \
+                mock.patch("file_updater.update_target_document_from_match_data", side_effect=assert_match_file):
+                success, reason = main_workflow.process_regular_modified_file(
+                    "example.md",
+                    {"sections": {"20": "### SQL statement"}},
+                    "File: example.md\n@@ -20,1 +20,1 @@\n-## SQL statement\n+### SQL statement",
+                    {"mode": "commit"},
+                    object(),
+                    object(),
+                    {
+                        "target_repo": "pingcap/docs",
+                        "target_local_path": tmpdir,
+                        "prefer_local_target_for_read": True,
+                        "source_language": "English",
+                        "target_language": "Chinese",
+                    },
+                    120,
+                    return_details=True,
+                )
+
+        self.assertTrue(success)
+        self.assertFalse(reason)
+        process_modified_sections.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

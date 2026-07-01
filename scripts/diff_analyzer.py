@@ -802,12 +802,15 @@ def analyze_diff_operations(file):
 
     # Helper function for semantic similarity
     def are_headers_similar(old, new):
-        if heading_level(old) != heading_level(new):
-            return False
-
-        # Remove markdown markers
         old_clean = normalize_heading_title(old)
         new_clean = normalize_heading_title(new)
+
+        # Heading-level-only change: same title text, different # count.
+        # This must be recognized as a modification (not separate add+delete).
+        if heading_level(old) != heading_level(new):
+            return old_clean == new_clean
+
+        # Remove markdown markers (already computed above)
         
         # Check if one is a substring/extension of the other
         if old_clean in new_clean or new_clean in old_clean:
@@ -948,6 +951,124 @@ def _collect_sub_heading_line_numbers(file_content):
 RESTRUCTURE_CHANGED_LINES_RATIO = float(
     os.environ.get("RESTRUCTURE_CHANGED_LINES_RATIO", "0.5")
 )
+
+
+def is_heading_level_only_change(new_content, old_content):
+    """Check if the only difference between new and old content is the heading level.
+
+    Returns (True, old_level, new_level) if the change is purely a heading level
+    adjustment (same title text, same body content), or (False, None, None) otherwise.
+    """
+    if not new_content or not old_content:
+        return False, None, None
+
+    new_lines = new_content.split('\n')
+    old_lines = old_content.split('\n')
+
+    if not new_lines or not old_lines:
+        return False, None, None
+
+    new_first = new_lines[0].strip()
+    old_first = old_lines[0].strip()
+
+    new_match = re.match(r'^(#{1,6})\s+(.+)', new_first)
+    old_match = re.match(r'^(#{1,6})\s+(.+)', old_first)
+
+    if not new_match or not old_match:
+        return False, None, None
+
+    new_level = len(new_match.group(1))
+    old_level = len(old_match.group(1))
+
+    if new_level == old_level:
+        return False, None, None
+
+    new_title = new_match.group(2).strip()
+    old_title = old_match.group(2).strip()
+
+    if new_title != old_title:
+        return False, None, None
+
+    new_body = '\n'.join(new_lines[1:])
+    old_body = '\n'.join(old_lines[1:])
+
+    if new_body != old_body:
+        return False, None, None
+
+    return True, old_level, new_level
+
+
+def _are_add_delete_heading_level_pairs(added_lines, deleted_lines):
+    """Check if added+deleted header lines form valid heading-level-only pairs."""
+    if len(added_lines) != len(deleted_lines):
+        return False
+    for added, deleted in zip(
+        sorted(added_lines, key=lambda x: x['line_number']),
+        sorted(deleted_lines, key=lambda x: x['line_number']),
+    ):
+        if not added.get('is_header') or not deleted.get('is_header'):
+            return False
+        new_match = re.match(r'^(#{1,6})\s+(.+)', added['content'].strip())
+        old_match = re.match(r'^(#{1,6})\s+(.+)', deleted['content'].strip())
+        if not new_match or not old_match:
+            return False
+        if new_match.group(2).strip() != old_match.group(2).strip():
+            return False
+        if len(new_match.group(1)) == len(old_match.group(1)):
+            return False
+    return True
+
+
+def detect_heading_level_only_file(file_content, base_file_content, operations):
+    """Detect if ALL changes in a file are heading-level-only changes.
+
+    Returns True when every change is a heading whose only modification is
+    the number of '#' characters. Handles both the 'modified_lines' representation
+    and the 'added + deleted pairs' representation from the diff parser.
+    """
+    added_lines = operations.get('added_lines', [])
+    deleted_lines = operations.get('deleted_lines', [])
+    modified_lines = operations.get('modified_lines', [])
+
+    if not modified_lines and not added_lines and not deleted_lines:
+        return False
+
+    # All added/deleted lines must be headers
+    for line in added_lines:
+        if not line.get('is_header', False):
+            return False
+    for line in deleted_lines:
+        if not line.get('is_header', False):
+            return False
+
+    # Check modified_lines: each must be a heading-level-only change
+    for line in modified_lines:
+        if not line.get('is_header', False):
+            return False
+        new_content = line.get('content', '').strip()
+        old_content = line.get('original_content', '').strip()
+        if not new_content or not old_content:
+            return False
+        new_match = re.match(r'^(#{1,6})\s+(.+)', new_content)
+        old_match = re.match(r'^(#{1,6})\s+(.+)', old_content)
+        if not new_match or not old_match:
+            return False
+        if new_match.group(2).strip() != old_match.group(2).strip():
+            return False
+        if len(new_match.group(1)) == len(old_match.group(1)):
+            return False
+
+    # Check add+delete pairs: must form valid heading-level pairs
+    if added_lines and deleted_lines:
+        if not _are_add_delete_heading_level_pairs(added_lines, deleted_lines):
+            return False
+    elif added_lines or deleted_lines:
+        # Unpaired adds or deletes without modified_lines = not heading-level-only
+        if not modified_lines:
+            return False
+
+    # Must have at least some heading-level changes detected
+    return bool(modified_lines) or bool(added_lines)
 
 
 def detect_restructured_file(file_content, base_file_content, operations):
@@ -2178,6 +2299,101 @@ def find_previous_section_for_added(added_sections, hierarchy_dict):
     
     return insertion_points
 
+def _normalize_heading_title_for_level_match(heading_content):
+    """Strip heading markers and anchors for title comparison in level-change detection."""
+    if not heading_content:
+        return ""
+    first_line = heading_content.split('\n')[0].strip()
+    match = re.match(r'^#{1,6}\s+(.*)', first_line)
+    if not match:
+        return first_line
+    title = match.group(1).strip()
+    title = re.sub(r'\s*\{#[^}]+\}\s*$', '', title)
+    return title
+
+
+def _collapse_heading_level_pairs(source_diff_dict):
+    """Collapse added+deleted pairs that are heading-level-only changes.
+
+    Mutates source_diff_dict in place: removes the paired added_* and deleted_*
+    entries and inserts a modified_* entry with heading_level_change_only marking.
+    """
+    added_keys = {k: v for k, v in source_diff_dict.items() if k.startswith("added_")}
+    deleted_keys = {k: v for k, v in source_diff_dict.items() if k.startswith("deleted_")}
+
+    if not added_keys or not deleted_keys:
+        return
+
+    matched_added = set()
+    matched_deleted = set()
+    new_entries = {}
+
+    for del_key, del_entry in deleted_keys.items():
+        old_content = del_entry.get("old_content", "")
+        if not old_content:
+            continue
+        old_title = _normalize_heading_title_for_level_match(old_content)
+        if not old_title:
+            continue
+        old_first_line = old_content.split('\n')[0].strip()
+        old_match = re.match(r'^(#{1,6})\s+', old_first_line)
+        if not old_match:
+            continue
+        old_level = len(old_match.group(1))
+
+        for add_key, add_entry in added_keys.items():
+            if add_key in matched_added:
+                continue
+            new_content = add_entry.get("new_content", "")
+            if not new_content:
+                continue
+            new_title = _normalize_heading_title_for_level_match(new_content)
+            if not new_title:
+                continue
+            if old_title != new_title:
+                continue
+            new_first_line = new_content.split('\n')[0].strip()
+            new_match = re.match(r'^(#{1,6})\s+', new_first_line)
+            if not new_match:
+                continue
+            new_level = len(new_match.group(1))
+            if new_level == old_level:
+                continue
+
+            # Compare body content (everything after the heading line)
+            old_body = '\n'.join(old_content.split('\n')[1:])
+            new_body = '\n'.join(new_content.split('\n')[1:])
+            if old_body != new_body:
+                continue
+
+            # This is a heading-level-only change
+            add_line = add_entry.get("new_line_number", 0)
+            modified_key = f"modified_{add_line}"
+            new_entries[modified_key] = {
+                "new_line_number": add_line,
+                "original_hierarchy": del_entry.get("original_hierarchy", ""),
+                "operation": "modified",
+                "new_content": new_content,
+                "old_content": old_content,
+                "heading_level_change_only": True,
+                "old_heading_level": old_level,
+                "new_heading_level": new_level,
+            }
+            matched_added.add(add_key)
+            matched_deleted.add(del_key)
+            print(
+                f"   📐 Collapsed add+delete pair into heading-level-only change: "
+                f"{del_key}+{add_key} → {modified_key} ({'#' * old_level} → {'#' * new_level})"
+            )
+            break
+
+    for key in matched_added:
+        del source_diff_dict[key]
+    for key in matched_deleted:
+        del source_diff_dict[key]
+    source_diff_dict.update(new_entries)
+
+
 def build_source_diff_dict(modified_sections, added_sections, deleted_sections, all_hierarchy_dict, base_hierarchy_dict, operations, file_content, base_file_content):
     """Build source diff dictionary with correct structure for matching"""
     source_diff_dict = {}
@@ -2397,8 +2613,20 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
             if is_bottom_modified:
                 modified_entry["matching_hierarchy"] = original_hierarchy
 
+            # Detect heading-level-only changes (e.g. ## → ###)
+            hl_only, hl_old_level, hl_new_level = is_heading_level_only_change(
+                new_content, old_content
+            )
+            if hl_only:
+                modified_entry["heading_level_change_only"] = True
+                modified_entry["old_heading_level"] = hl_old_level
+                modified_entry["new_heading_level"] = hl_new_level
+
             source_diff_dict[f"modified_{line_num_str}"] = modified_entry
-            print(f"   ✅ Real modification detected at line {line_num_str}: content changed")
+            if hl_only:
+                print(f"   📐 Heading-level-only change at line {line_num_str}: {'#' * hl_old_level} → {'#' * hl_new_level}")
+            else:
+                print(f"   ✅ Real modification detected at line {line_num_str}: content changed")
         else:
             print(f"   🚫 Filtered out false positive at line {line_num_str}: content unchanged (likely line shift artifact)")
     
@@ -2578,7 +2806,12 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
             "new_content": None,  # No new content for deleted sections
             "old_content": old_content  # Show what was deleted
         }
-    
+
+    # Post-processing: detect heading-level-only changes among added+deleted pairs.
+    # When a heading was only re-leveled (e.g. ## foo → ### foo) but fell through
+    # header pairing, collapse the add+delete pair into a single modified entry.
+    _collapse_heading_level_pairs(source_diff_dict)
+
     # Sort the dictionary by new_line_number for better readability
     sorted_items = sorted(source_diff_dict.items(), key=lambda x: x[1]['new_line_number'])
     source_diff_dict = dict(sorted_items)
@@ -3077,11 +3310,21 @@ def analyze_source_changes(
         )
         print(f"   📝 Effective diff analysis: {len(operations['added_lines'])} added, {len(operations['modified_lines'])} modified, {len(operations['deleted_lines'])} deleted lines")
 
+        # Fast-path: if ALL changes are heading-level-only (# count changes),
+        # skip the restructure detection entirely and proceed to incremental
+        # processing which will handle them without AI translation.
+        is_heading_level_only = detect_heading_level_only_file(
+            file_content, base_file_content, operations
+        )
+        if is_heading_level_only:
+            print(f"   📐 Detected heading-level-only changes — skipping restructure detection")
+
         # Detect restructured documents (both commit and PR mode): if ALL
         # sub-section headings are in the diff, route the file to full
         # translation instead of incremental section-level processing.
         if (
-            source_context.get("mode") in ("commit", "pr")
+            not is_heading_level_only
+            and source_context.get("mode") in ("commit", "pr")
             and (
                 detect_restructured_file(file_content, base_file_content, operations)
                 or detect_structural_change(base_file_content, file_content)

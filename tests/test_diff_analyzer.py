@@ -21,12 +21,14 @@ from diff_analyzer import (
     build_hierarchy_dict,
     build_source_diff_dict,
     collect_added_heading_prefix_lines,
+    detect_heading_level_only_file,
     detect_restructured_file,
     filter_changed_files_to_pr_scope,
     filter_related_resources_resource_card_diff,
     get_pr_diff,
     get_target_file_content,
     get_target_hierarchy_and_content,
+    is_heading_level_only_change,
     maybe_use_normalized_snapshot_operations,
     parse_pr_commit_range_url,
     parse_pr_url,
@@ -2066,6 +2068,363 @@ class DetectRestructuredFileTest(unittest.TestCase):
         self.assertIn(file_path, added_files)
         self.assertEqual(added_files[file_path], head_content)
         self.assertIn(file_path, restructured_files)
+
+
+class HeadingLevelOnlyChangeTest(unittest.TestCase):
+    """Tests for is_heading_level_only_change() and detect_heading_level_only_file()."""
+
+    def test_basic_level_change(self):
+        new = "### log.file\nSome content here\nMore content"
+        old = "## log.file\nSome content here\nMore content"
+        result, old_level, new_level = is_heading_level_only_change(new, old)
+        self.assertTrue(result)
+        self.assertEqual(old_level, 2)
+        self.assertEqual(new_level, 3)
+
+    def test_same_level_returns_false(self):
+        new = "## log.file\nSome content"
+        old = "## log.file\nSome content"
+        result, _, _ = is_heading_level_only_change(new, old)
+        self.assertFalse(result)
+
+    def test_title_change_returns_false(self):
+        new = "### log.file-new\nSome content"
+        old = "## log.file\nSome content"
+        result, _, _ = is_heading_level_only_change(new, old)
+        self.assertFalse(result)
+
+    def test_body_change_returns_false(self):
+        new = "### log.file\nNew content here"
+        old = "## log.file\nOld content here"
+        result, _, _ = is_heading_level_only_change(new, old)
+        self.assertFalse(result)
+
+    def test_empty_content(self):
+        result, _, _ = is_heading_level_only_change("", "## title\ncontent")
+        self.assertFalse(result)
+        result, _, _ = is_heading_level_only_change("## title\ncontent", "")
+        self.assertFalse(result)
+
+    def test_non_heading_first_line(self):
+        new = "Not a heading\nSome content"
+        old = "## title\nSome content"
+        result, _, _ = is_heading_level_only_change(new, old)
+        self.assertFalse(result)
+
+    def test_heading_with_anchor(self):
+        new = "### log.file {#log-file}\nContent"
+        old = "## log.file {#log-file}\nContent"
+        result, old_level, new_level = is_heading_level_only_change(new, old)
+        self.assertTrue(result)
+        self.assertEqual(old_level, 2)
+        self.assertEqual(new_level, 3)
+
+    def test_detect_file_all_heading_level_changes(self):
+        operations = {
+            'added_lines': [],
+            'deleted_lines': [],
+            'modified_lines': [
+                {'line_number': 5, 'is_header': True, 'content': '### log.file', 'original_content': '## log.file'},
+                {'line_number': 20, 'is_header': True, 'content': '### log.reporter', 'original_content': '## log.reporter'},
+            ]
+        }
+        result = detect_heading_level_only_file("", "", operations)
+        self.assertTrue(result)
+
+    def test_detect_file_with_non_header_modification(self):
+        operations = {
+            'added_lines': [],
+            'deleted_lines': [],
+            'modified_lines': [
+                {'line_number': 5, 'is_header': True, 'content': '### log.file', 'original_content': '## log.file'},
+                {'line_number': 10, 'is_header': False, 'content': 'new text', 'original_content': 'old text'},
+            ]
+        }
+        result = detect_heading_level_only_file("", "", operations)
+        self.assertFalse(result)
+
+    def test_detect_file_with_content_added_lines(self):
+        operations = {
+            'added_lines': [
+                {'line_number': 15, 'is_header': False, 'content': 'new paragraph'},
+            ],
+            'deleted_lines': [],
+            'modified_lines': [
+                {'line_number': 5, 'is_header': True, 'content': '### log.file', 'original_content': '## log.file'},
+            ]
+        }
+        result = detect_heading_level_only_file("", "", operations)
+        self.assertFalse(result)
+
+    def test_detect_file_add_delete_pairs(self):
+        """Heading level changes may appear as add/delete pairs in unified diffs."""
+        operations = {
+            'added_lines': [
+                {'line_number': 5, 'is_header': True, 'content': '### log.file'},
+            ],
+            'deleted_lines': [
+                {'line_number': 5, 'is_header': True, 'content': '## log.file'},
+            ],
+            'modified_lines': []
+        }
+        result = detect_heading_level_only_file("", "", operations)
+        self.assertTrue(result)
+
+    def test_detect_file_add_delete_pairs_title_mismatch(self):
+        operations = {
+            'added_lines': [
+                {'line_number': 5, 'is_header': True, 'content': '### new-section'},
+            ],
+            'deleted_lines': [
+                {'line_number': 5, 'is_header': True, 'content': '## old-section'},
+            ],
+            'modified_lines': []
+        }
+        result = detect_heading_level_only_file("", "", operations)
+        self.assertFalse(result)
+
+    def test_build_source_diff_dict_marks_heading_level_only(self):
+        """build_source_diff_dict should mark heading-level-only entries."""
+        base_content = "# Title\n\n## log\n\nSome intro.\n\n## log.file\n\nFile config here.\n"
+        head_content = "# Title\n\n## log\n\nSome intro.\n\n### log.file\n\nFile config here.\n"
+
+        base_hierarchy = build_hierarchy_dict(base_content)
+        head_hierarchy = build_hierarchy_dict(head_content)
+
+        # Heading is at line 7 in both files
+        modified_sections = {7: head_hierarchy[7]}
+        added_sections = {}
+        deleted_sections = {}
+
+        operations = {
+            'added_lines': [],
+            'deleted_lines': [],
+            'modified_lines': [
+                {'line_number': 7, 'is_header': True, 'content': '### log.file', 'original_content': '## log.file'},
+            ]
+        }
+
+        result = build_source_diff_dict(
+            modified_sections, added_sections, deleted_sections,
+            head_hierarchy, base_hierarchy, operations,
+            head_content, base_content
+        )
+
+        self.assertIn("modified_7", result)
+        entry = result["modified_7"]
+        self.assertTrue(entry.get("heading_level_change_only"))
+        self.assertEqual(entry["old_heading_level"], 2)
+        self.assertEqual(entry["new_heading_level"], 3)
+
+    def test_build_source_diff_dict_collapses_add_delete_heading_level_pair(self):
+        """Added+deleted heading-level pairs should become one modified entry."""
+        base_content = "# Title\n\n## Parent\n\n## Child\n\nBody text.\n"
+        head_content = "# Title\n\n## Parent\n\n### Child\n\nBody text.\n"
+
+        base_hierarchy = build_hierarchy_dict(base_content)
+        head_hierarchy = build_hierarchy_dict(head_content)
+
+        result = build_source_diff_dict(
+            modified_sections={},
+            added_sections={5: head_hierarchy[5]},
+            deleted_sections={5: base_hierarchy[5]},
+            all_hierarchy_dict=head_hierarchy,
+            base_hierarchy_dict=base_hierarchy,
+            operations={
+                'added_lines': [
+                    {'line_number': 5, 'is_header': True, 'content': '### Child'},
+                ],
+                'deleted_lines': [
+                    {'line_number': 5, 'is_header': True, 'content': '## Child'},
+                ],
+                'modified_lines': [],
+            },
+            file_content=head_content,
+            base_file_content=base_content,
+        )
+
+        self.assertEqual(list(result.keys()), ["modified_5"])
+        entry = result["modified_5"]
+        self.assertEqual(entry["operation"], "modified")
+        self.assertTrue(entry["heading_level_change_only"])
+        self.assertEqual(entry["old_heading_level"], 2)
+        self.assertEqual(entry["new_heading_level"], 3)
+        self.assertEqual(entry["old_content"], "## Child\n\nBody text.\n")
+        self.assertEqual(entry["new_content"], "### Child\n\nBody text.\n")
+
+
+class ApplyHeadingLevelChangeTest(unittest.TestCase):
+    """Tests for apply_heading_level_change_to_target()."""
+
+    def setUp(self):
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        from file_updater import apply_heading_level_change_to_target
+        self.apply_fn = apply_heading_level_change_to_target
+
+    def test_basic_level_increase(self):
+        target = "## log.file\n\n配置日志文件。"
+        result = self.apply_fn(target, old_level=2, new_level=3)
+        self.assertEqual(result, "### log.file\n\n配置日志文件。")
+
+    def test_level_decrease(self):
+        target = "### log.file\n\nContent here."
+        result = self.apply_fn(target, old_level=3, new_level=2)
+        self.assertEqual(result, "## log.file\n\nContent here.")
+
+    def test_multi_level_jump(self):
+        target = "## section\n\nBody text"
+        result = self.apply_fn(target, old_level=2, new_level=4)
+        self.assertEqual(result, "#### section\n\nBody text")
+
+    def test_preserves_body_content(self):
+        target = "## tikv-client.copr-cache\n\nCoprocessor cache config.\n\n- `capacity`: 1GB"
+        result = self.apply_fn(target, old_level=2, new_level=3)
+        expected = "### tikv-client.copr-cache\n\nCoprocessor cache config.\n\n- `capacity`: 1GB"
+        self.assertEqual(result, expected)
+
+    def test_empty_content(self):
+        self.assertEqual(self.apply_fn("", 2, 3), "")
+        self.assertIsNone(self.apply_fn(None, 2, 3))
+
+    def test_non_heading_content(self):
+        target = "Not a heading\nSome content"
+        result = self.apply_fn(target, old_level=2, new_level=3)
+        self.assertEqual(result, target)
+
+    def test_clamp_to_valid_levels(self):
+        target = "# Title\nContent"
+        result = self.apply_fn(target, old_level=2, new_level=1)
+        self.assertEqual(result, "# Title\nContent")
+
+    def test_heading_with_anchor_preserved(self):
+        target = "## log.file {#log-file}\n\nContent"
+        result = self.apply_fn(target, old_level=2, new_level=3)
+        self.assertEqual(result, "### log.file {#log-file}\n\nContent")
+
+    def test_direct_level_not_delta(self):
+        """Target already at new_level should not be shifted further (Comment 2 fix)."""
+        target = "### log.file\n\nContent"
+        # Source changed from 2→3, target already at 3. Should stay at 3, not go to 4.
+        result = self.apply_fn(target, old_level=2, new_level=3)
+        self.assertEqual(result, "### log.file\n\nContent")
+
+    def test_target_at_different_level(self):
+        """Target at an unexpected level still gets set to new_level."""
+        target = "#### section\n\nContent"
+        result = self.apply_fn(target, old_level=2, new_level=3)
+        self.assertEqual(result, "### section\n\nContent")
+
+
+class CollapseHeadingLevelPairsTest(unittest.TestCase):
+    """Tests for _collapse_heading_level_pairs() and the add+delete pairing path."""
+
+    def test_collapse_simple_pair(self):
+        """An added+deleted pair with same title/body becomes a modified entry."""
+        source_diff_dict = {
+            "deleted_7": {
+                "new_line_number": 7,
+                "original_hierarchy": "## log.file",
+                "operation": "deleted",
+                "new_content": None,
+                "old_content": "## log.file\n\nContent here.",
+            },
+            "added_7": {
+                "new_line_number": 7,
+                "original_hierarchy": "## log > ### log.file",
+                "operation": "added",
+                "new_content": "### log.file\n\nContent here.",
+                "old_content": None,
+            },
+        }
+        from diff_analyzer import _collapse_heading_level_pairs
+        _collapse_heading_level_pairs(source_diff_dict)
+
+        self.assertNotIn("deleted_7", source_diff_dict)
+        self.assertNotIn("added_7", source_diff_dict)
+        self.assertIn("modified_7", source_diff_dict)
+        entry = source_diff_dict["modified_7"]
+        self.assertTrue(entry["heading_level_change_only"])
+        self.assertEqual(entry["old_heading_level"], 2)
+        self.assertEqual(entry["new_heading_level"], 3)
+        self.assertEqual(entry["original_hierarchy"], "## log.file")
+
+    def test_no_collapse_different_titles(self):
+        """Pairs with different titles should not be collapsed."""
+        source_diff_dict = {
+            "deleted_7": {
+                "new_line_number": 7,
+                "original_hierarchy": "## old-section",
+                "operation": "deleted",
+                "new_content": None,
+                "old_content": "## old-section\n\nContent.",
+            },
+            "added_7": {
+                "new_line_number": 7,
+                "original_hierarchy": "### new-section",
+                "operation": "added",
+                "new_content": "### new-section\n\nContent.",
+                "old_content": None,
+            },
+        }
+        from diff_analyzer import _collapse_heading_level_pairs
+        _collapse_heading_level_pairs(source_diff_dict)
+
+        self.assertIn("deleted_7", source_diff_dict)
+        self.assertIn("added_7", source_diff_dict)
+        self.assertNotIn("modified_7", source_diff_dict)
+
+    def test_no_collapse_body_differs(self):
+        """Pairs with same title but different body should not be collapsed."""
+        source_diff_dict = {
+            "deleted_7": {
+                "new_line_number": 7,
+                "original_hierarchy": "## section",
+                "operation": "deleted",
+                "new_content": None,
+                "old_content": "## section\n\nOld content.",
+            },
+            "added_7": {
+                "new_line_number": 7,
+                "original_hierarchy": "### section",
+                "operation": "added",
+                "new_content": "### section\n\nNew content.",
+                "old_content": None,
+            },
+        }
+        from diff_analyzer import _collapse_heading_level_pairs
+        _collapse_heading_level_pairs(source_diff_dict)
+
+        self.assertIn("deleted_7", source_diff_dict)
+        self.assertIn("added_7", source_diff_dict)
+
+    def test_are_headers_similar_allows_level_change(self):
+        """are_headers_similar should pair headings with same title but different level."""
+        from diff_analyzer import analyze_diff_operations
+        patch = (
+            "@@ -5,3 +5,3 @@\n"
+            " some context\n"
+            "-## log.file\n"
+            "+### log.file\n"
+            " more context\n"
+        )
+        changed_file = SimpleNamespace(
+            filename="config.md", status="modified", patch=patch, previous_filename=None
+        )
+        operations = analyze_diff_operations(changed_file)
+        # The heading should be paired as a modified line
+        modified_headers = [
+            m for m in operations['modified_lines'] if m.get('is_header')
+        ]
+        self.assertTrue(
+            len(modified_headers) >= 1,
+            f"Expected heading-level change to be paired as modified; "
+            f"got added={len(operations['added_lines'])}, "
+            f"deleted={len(operations['deleted_lines'])}, "
+            f"modified={len(operations['modified_lines'])}"
+        )
+        mod = modified_headers[0]
+        self.assertIn("### log.file", mod['content'])
+        self.assertIn("## log.file", mod.get('original_content', ''))
 
 
 if __name__ == "__main__":

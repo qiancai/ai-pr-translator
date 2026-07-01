@@ -805,6 +805,41 @@ class FileUpdaterRegressionTest(unittest.TestCase):
             updated_content = target_file.read_text(encoding="utf-8")
             self.assertEqual(updated_content, "# Example\n\n## Last section\n\nNew content\n")
 
+    def test_update_resolves_stale_target_line_by_leaf_heading(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            target_file = tmp_path / "example.md"
+            match_file = tmp_path / "example-match_source_diff_to_target.json"
+
+            target_file.write_text(
+                "# Example\n\n## Parent\n\nParent intro\n\n### Child\n\nOld content\n",
+                encoding="utf-8",
+            )
+            match_file.write_text(
+                json.dumps(
+                    {
+                        "modified_20": {
+                            "source_operation": "modified",
+                            "target_line": "3",
+                            "target_hierarchy": "## Parent > ### Child",
+                            "target_new_content": "### Child\n\nNew content\n",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            success = update_target_document_from_match_data(
+                str(match_file), str(tmp_path), "example.md"
+            )
+
+            self.assertTrue(success)
+            updated_content = target_file.read_text(encoding="utf-8")
+            self.assertEqual(
+                updated_content,
+                "# Example\n\n## Parent\n\nParent intro\n\n### Child\n\nNew content\n",
+            )
+
     def test_large_system_sections_are_translated_in_chunks_and_merged(self):
         class FakeAIClient:
             def __init__(self):
