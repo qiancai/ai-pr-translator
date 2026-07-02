@@ -82,6 +82,7 @@ from main_workflow import (
     git_add_successful_task_changes,
     process_regular_modified_file,
 )
+from index_file_processor import process_index_file
 from toc_processor import process_toc_file
 from translation_structure_validator import validate_markdown_heading_structures
 from workflow_ignore_config import load_workflow_ignore_config
@@ -328,6 +329,8 @@ def _process_commit_modified_file(
         return make_task_result("skipped", "Already handled in TOC step")
     if file_type == "special_file_keyword":
         return make_task_result("skipped", "Already handled in keyword step")
+    if file_type == "special_file_index":
+        return make_task_result("skipped", "Already handled in _index.md step")
     if file_type != "regular_modified":
         return make_task_result("failure", f"Unknown file processing type: {file_type}")
 
@@ -949,6 +952,7 @@ def remove_incremental_work_for_files(
     deleted_sections,
     toc_files,
     keyword_files,
+    index_files=None,
 ):
     """Remove per-diff work queues for files that will be translated in full."""
     for file_path in file_paths:
@@ -957,6 +961,8 @@ def remove_incremental_work_for_files(
         deleted_sections.pop(file_path, None)
         toc_files.pop(file_path, None)
         keyword_files.pop(file_path, None)
+        if index_files is not None:
+            index_files.pop(file_path, None)
 
 
 def apply_source_files_full_translation_mode(
@@ -973,6 +979,7 @@ def apply_source_files_full_translation_mode(
     toc_files,
     keyword_files,
     translation_stats,
+    index_files=None,
 ):
     """Switch selected SOURCE_FILES from diff-based queues to full-file translation."""
     thread_safe_print(
@@ -998,6 +1005,7 @@ def apply_source_files_full_translation_mode(
         deleted_sections,
         toc_files,
         keyword_files,
+        index_files=index_files,
     )
     added_files.update(full_translation_files)
     for file_path in full_translation_failures:
@@ -1094,6 +1102,7 @@ def apply_toc_scope_added_files(
     added_files,
     keyword_files,
     translation_stats,
+    index_files=None,
 ):
     """Queue files newly linked from Cloud TOCs for full file-added translation."""
     scope_added_file_paths = collect_toc_scope_added_files(
@@ -1127,6 +1136,7 @@ def apply_toc_scope_added_files(
         # switch from diff-based work to full file-added translation.
         {},
         keyword_files,
+        index_files=index_files,
     )
     added_files.update(scope_added_file_contents)
 
@@ -1260,6 +1270,7 @@ def print_group_summary(group_label, counts):
     thread_safe_print(f"   🗑️  Deleted files: {counts['deleted_files']} processed")
     thread_safe_print(f"   📋 TOC files: {counts['toc_files']} processed")
     thread_safe_print(f"   📋 Keyword files: {counts['keyword_files']} processed")
+    thread_safe_print(f"   📄 Index files: {counts.get('index_files', 0)} processed")
     thread_safe_print(f"   📝 Modified files: {counts['modified_sections']} processed")
     thread_safe_print(f"   🖼️  Added images: {counts['added_images']} processed")
     thread_safe_print(f"   🖼️  Modified images: {counts['modified_images']} processed")
@@ -1416,6 +1427,7 @@ def process_translation_group(
         deleted_files = []
         toc_files = {}
         keyword_files = {}
+        index_files = {}
         added_images = []
         modified_images = []
         deleted_images = []
@@ -1431,6 +1443,7 @@ def process_translation_group(
                     "deleted_files": 0,
                     "toc_files": 0,
                     "keyword_files": 0,
+                    "index_files": 0,
                     "modified_sections": 0,
                     "added_images": 0,
                     "modified_images": 0,
@@ -1447,7 +1460,7 @@ def process_translation_group(
         exclude_folders = build_exclude_folders(repo_config)
 
         try:
-            added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images, restructured_files = analyze_source_changes(
+            added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images, restructured_files, index_files = analyze_source_changes(
                 diff_context,
                 github_client,
                 special_files=SPECIAL_FILES,
@@ -1493,22 +1506,30 @@ def process_translation_group(
             toc_files,
             keyword_files,
             translation_stats,
+            index_files=index_files,
         )
     else:
-        full_translation_file_paths.update(
-            apply_toc_scope_added_files(
-                toc_files,
-                diff_context,
-                github_client,
-                commit_ignore_files,
-                added_sections,
-                modified_sections,
-                deleted_sections,
-                added_files,
-                keyword_files,
-                translation_stats,
+        explicit_source_files = normalize_source_files(source_files, source_folder)
+        if explicit_source_files:
+            thread_safe_print(
+                "ℹ️  Explicit SOURCE_FILES provided; skipping Cloud TOC scope expansion."
             )
-        )
+        else:
+            full_translation_file_paths.update(
+                apply_toc_scope_added_files(
+                    toc_files,
+                    diff_context,
+                    github_client,
+                    commit_ignore_files,
+                    added_sections,
+                    modified_sections,
+                    deleted_sections,
+                    added_files,
+                    keyword_files,
+                    translation_stats,
+                    index_files=index_files,
+                )
+            )
 
     # Restructured files were rerouted to added_files by
     # detect_restructured_file() in analyze_source_changes().  They need
@@ -1643,6 +1664,35 @@ def process_translation_group(
                 successful_file_paths.add(result["file_path"])
         git_add_successful_task_changes(keyword_results, TARGET_REPO_PATH)
 
+    if index_files:
+        thread_safe_print(f"\n📄 Processing {len(index_files)} _index.md files...")
+        index_tasks = []
+        for file_path, index_data in index_files.items():
+            def run_index_file(path=file_path, data=index_data):
+                if data.get("type") != "index":
+                    return make_task_result("failure", f"Unknown index data type: {data.get('type')}")
+
+                success = process_index_file(
+                    path,
+                    data,
+                    diff_context,
+                    github_client,
+                    ai_client,
+                    repo_config,
+                    glossary_matcher=glossary_matcher,
+                )
+                if success:
+                    return make_task_result("success")
+                return make_task_result("failure", "_index.md processor returned failure")
+
+            index_tasks.append(make_file_task(file_path, run_index_file))
+
+        index_results = run_file_tasks(index_tasks, "_index.md files", parallel_file_processing)
+        for result in index_results:
+            if _record_translation_task_result(result, translation_stats):
+                successful_file_paths.add(result["file_path"])
+        git_add_successful_task_changes(index_results, TARGET_REPO_PATH)
+
     if modified_sections:
         thread_safe_print(f"\n📝 Processing {len(modified_sections)} modified files...")
         modified_tasks = []
@@ -1697,6 +1747,7 @@ def process_translation_group(
         "deleted_files": len(deleted_files),
         "toc_files": len(toc_files),
         "keyword_files": len(keyword_files),
+        "index_files": len(index_files),
         "modified_sections": len(modified_sections),
         "added_images": len(added_images),
         "modified_images": len(modified_images),
@@ -1808,6 +1859,7 @@ def main():
         "deleted_files": 0,
         "toc_files": 0,
         "keyword_files": 0,
+        "index_files": 0,
         "modified_sections": 0,
         "added_images": 0,
         "modified_images": 0,
@@ -2041,6 +2093,7 @@ def main():
     thread_safe_print(f"   🗑️  Deleted files: {total_counts['deleted_files']} processed")
     thread_safe_print(f"   📋 TOC files: {total_counts['toc_files']} processed")
     thread_safe_print(f"   📋 Keyword files: {total_counts['keyword_files']} processed")
+    thread_safe_print(f"   📄 Index files: {total_counts.get('index_files', 0)} processed")
     thread_safe_print(f"   📝 Modified files: {total_counts['modified_sections']} processed")
     thread_safe_print(f"   🖼️  Added images: {total_counts['added_images']} processed")
     thread_safe_print(f"   🖼️  Modified images: {total_counts['modified_images']} processed")

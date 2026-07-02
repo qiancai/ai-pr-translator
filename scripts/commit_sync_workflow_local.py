@@ -17,7 +17,7 @@ TEST_OPTION = "cloud"  # Options: "ai", "cloud", "ja"
 SOURCE_FILES_TRANSLATION_MODE = "incremental"
 # Options: "manual" to add/update per-file Corresponding EN commit markers,
 # or "scheduled" to remove existing markers after successful translation.
-COMMIT_SYNC_RUN_TYPE = "scheduled"
+COMMIT_SYNC_RUN_TYPE = "manual"
 # Options: "Yes" to ignore RelatedResources sections containing ResourceCard,
 # or "No" to keep those sections in the normal commit-mode translation flow.
 IGNORE_RESOURCE_CARD_SECTION = "Yes"
@@ -59,11 +59,11 @@ TEST_CONFIGS = {
         "TARGET_REPO": "pingcap/docs",
         # Set SOURCE_BASE_REF from latest_translation_commit.json and SOURCE_HEAD_REF from release-8.5 HEAD.
         "SOURCE_BASE_REF": "6376b9086871957f4809711c83e021a01b0a8f5d",
-        "SOURCE_HEAD_REF": "6a3301ed41e2d6edcc5f6d76f06fffdfe029acd5",#ecd31cc2c25ad6715af68d05794da89265cfe4d8
+        "SOURCE_HEAD_REF": "42da4252914248472710bc8f9d3bb0546015093e",#ecd31cc2c25ad6715af68d05794da89265cfe4d8
         # Keep SOURCE_FOLDER empty. Put resolved Cloud TOC-scoped files here.
         "SOURCE_FOLDER": "", ## Leave this field empty when translating cloud docs.
-        "SOURCE_FILES": "coprocessor-cache.md,tiflash/tiflash-results-materialization.md",
-        "AUTO_RESOLVE_TOC_SOURCE_FILES": True,
+        "SOURCE_FILES": "tidb-cloud/premium/_index.md,tidb-cloud/starter/_index.md",
+        "AUTO_RESOLVE_TOC_SOURCE_FILES": False,
         "CLOUD_TOC_FILES": (
             "TOC-tidb-cloud.md,"
             "TOC-tidb-cloud-starter.md,"

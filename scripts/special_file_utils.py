@@ -48,6 +48,19 @@ def is_toc_file_name(filename, ignore_files=None):
     return basename == "TOC.md" or basename.startswith("TOC-")
 
 
+def is_index_file_name(filename, ignore_files=None):
+    """Return True for _index.md files that need index-specific processing."""
+    normalized_filename = _normalize_rel_path(filename)
+    basename = os.path.basename(normalized_filename)
+    ignored = {_normalize_rel_path(path) for path in (ignore_files or [])}
+    ignored_basenames = {os.path.basename(path) for path in ignored}
+
+    if normalized_filename in ignored or basename in ignored_basenames:
+        return False
+
+    return basename == "_index.md"
+
+
 def source_scope_includes_folder(folder_name, source_folder=None, source_files=None):
     """Return True when source filters include a folder path."""
     folder = _normalize_rel_path(folder_name).strip("/")

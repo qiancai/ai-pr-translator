@@ -57,7 +57,7 @@ from parallel_file_processor import (
     run_file_tasks,
     should_parallelize_file_processing,
 )
-from special_file_utils import is_toc_file_name
+from special_file_utils import is_index_file_name, is_toc_file_name
 from workflow_ignore_config import load_workflow_ignore_config
 
 # Glossary terms path (optional, defaults to resources/terms.md in the docs repo)
@@ -398,6 +398,9 @@ def determine_file_processing_type(source_file_path, file_sections, special_file
     if is_toc_file_name(source_file_path, ignore_files):
         return "special_file_toc"
 
+    if is_index_file_name(source_file_path, ignore_files):
+        return "special_file_index"
+
     if special_files and basename in special_files:
         if basename == "keywords.md":
             if isinstance(file_sections, dict) and file_sections.get("keyword_regular_only"):
@@ -681,7 +684,7 @@ def _process_single_modified_file_for_pr(
         return make_task_result("skipped", "Special file already processed in Step 3.3")
     if file_type == "special_file_keyword":
         return make_task_result("skipped", "Keyword file already processed in Step 3.3b")
-    if file_type != "regular_modified":
+    if file_type not in ("regular_modified", "special_file_index"):
         return make_task_result("failure", f"Unknown file processing type: {file_type}")
 
     success, failure_reason = process_regular_modified_file(
@@ -923,7 +926,7 @@ def main():
     
     # Step 2: Analyze source changes with operation categorization
     thread_safe_print(f"\n📊 Step 2: Analyzing source changes...")
-    added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images, restructured_files = analyze_source_changes(
+    added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images, restructured_files, index_files = analyze_source_changes(
         source_context, github_client,
         special_files=SPECIAL_FILES, 
         ignore_files=PR_MODE_IGNORE_FILES,

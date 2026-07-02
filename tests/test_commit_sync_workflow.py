@@ -1817,6 +1817,97 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
         self.assertIn("TOC-tidb-cloud.md", toc_files)
         self.assertEqual(stats.failed, [])
 
+    def test_process_translation_group_skips_toc_scope_when_source_files_explicit(self):
+        changed_file = SimpleNamespace(
+            filename="tidb-cloud/dedicated/_index.md",
+            status="modified",
+            patch="@@ -1 +1 @@\n-old\n+new\n",
+        )
+        zero_counts = {
+            "added_files": 0,
+            "deleted_files": 0,
+            "toc_files": 0,
+            "keyword_files": 0,
+            "index_files": 1,
+            "modified_sections": 0,
+            "added_images": 0,
+            "modified_images": 0,
+            "deleted_images": 0,
+        }
+
+        with mock.patch.object(
+            workflow,
+            "analyze_source_changes",
+            return_value=({}, {}, {}, {}, [], {}, {}, [], [], [], set(), {
+                "tidb-cloud/dedicated/_index.md": {
+                    "type": "index",
+                    "source_base_content": "---\n---\n",
+                    "source_head_content": "---\n---\n",
+                }
+            }),
+        ), mock.patch.object(
+            workflow,
+            "apply_toc_scope_added_files",
+            side_effect=AssertionError("Cloud TOC scope should be skipped for explicit SOURCE_FILES"),
+        ), mock.patch.object(
+            workflow,
+            "should_parallelize_file_processing",
+            return_value=False,
+        ), mock.patch.object(
+            workflow,
+            "run_file_tasks",
+            return_value=[{
+                "file_path": "tidb-cloud/dedicated/_index.md",
+                "ok": True,
+                "result": {"status": "success", "reason": ""},
+                "error": None,
+            }],
+        ), mock.patch.object(
+            workflow,
+            "_record_translation_task_result",
+            return_value=True,
+        ), mock.patch.object(
+            workflow,
+            "git_add_successful_task_changes",
+        ), mock.patch.object(
+            workflow,
+            "process_index_file",
+            return_value=True,
+        ):
+            result = workflow.process_translation_group(
+                "explicit SOURCE_FILES",
+                source_files_translation_mode="incremental",
+                source_files="tidb-cloud/dedicated/_index.md",
+                source_folder="",
+                diff_context={
+                    "mode": "commit",
+                    "source_repo": "pingcap/docs",
+                    "target_repo": "pingcap/docs",
+                    "base_ref": "base",
+                    "head_ref": "head",
+                },
+                filtered_changed_files=[changed_file],
+                pr_diff=changed_file.patch,
+                github_client=object(),
+                ai_client=object(),
+                repo_config={
+                    "source_language": "English",
+                    "target_language": "Chinese",
+                    "target_local_path": "/tmp/unused",
+                },
+                repo_configs={},
+                glossary_matcher=None,
+                commit_ignore_files=[],
+                translation_stats=workflow.TranslationStats(),
+            )
+
+        self.assertTrue(result["attempted"])
+        self.assertEqual(
+            result["successful_file_paths"],
+            {"tidb-cloud/dedicated/_index.md"},
+        )
+        self.assertEqual(result["counts"], zero_counts)
+
     def test_translation_stats_writes_failure_report(self):
         stats = workflow.TranslationStats()
         stats.mark_failure("cloud.md", "Matcher failed")

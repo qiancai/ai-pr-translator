@@ -416,7 +416,7 @@ class DiffAnalyzerContextTest(unittest.TestCase):
             repo_configs=self.repo_configs,
         )
 
-        self.assertEqual(result, ({}, {}, {}, {}, [], {}, {}, [], [], [], set()))
+        self.assertEqual(result, ({}, {}, {}, {}, [], {}, {}, [], [], [], set(), {}))
         self.assertFalse(self.generated_file.exists())
 
     def test_commit_related_resources_modified_section_is_filtered(self):
@@ -489,7 +489,7 @@ class DiffAnalyzerContextTest(unittest.TestCase):
             repo_configs=self.repo_configs,
         )
 
-        self.assertEqual(result, ({}, {}, {}, {}, [], {}, {}, [], [], [], set()))
+        self.assertEqual(result, ({}, {}, {}, {}, [], {}, {}, [], [], [], set(), {}))
         self.assertFalse(self.generated_file.exists())
 
     def test_commit_related_resources_deleted_section_is_filtered(self):
@@ -565,7 +565,7 @@ class DiffAnalyzerContextTest(unittest.TestCase):
             repo_configs=self.repo_configs,
         )
 
-        self.assertEqual(result, ({}, {}, {}, {}, [], {}, {}, [], [], [], set()))
+        self.assertEqual(result, ({}, {}, {}, {}, [], {}, {}, [], [], [], set(), {}))
         self.assertFalse(self.generated_file.exists())
 
     def test_pr_related_resources_section_is_not_filtered(self):
@@ -955,6 +955,7 @@ class DiffAnalyzerContextTest(unittest.TestCase):
             modified_images,
             deleted_images,
             _restructured,
+            _index_files,
         ) = analyze_source_changes(
             context,
             github,
@@ -1030,6 +1031,7 @@ class DiffAnalyzerContextTest(unittest.TestCase):
             modified_images,
             deleted_images,
             _restructured,
+            _index_files,
         ) = analyze_source_changes(
             context,
             github,
@@ -1588,6 +1590,7 @@ class DiffAnalyzerContextTest(unittest.TestCase):
             modified_images,
             deleted_images,
             _restructured,
+            _index_files,
         ) = analyze_source_changes(
             commit_context,
             github,

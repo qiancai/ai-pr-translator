@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 from github import Github
 from log_sanitizer import sanitize_exception_message
 from section_matcher import clean_title_for_matching
-from special_file_utils import find_heading_line_indices, is_toc_file_name
+from special_file_utils import find_heading_line_indices, is_index_file_name, is_toc_file_name
 from translation_structure_validator import (
     custom_content_tag_signature,
     extract_custom_content_tags,
@@ -2924,6 +2924,7 @@ def analyze_source_changes(
     ignored_files = []       # Files that were ignored
     toc_files = {}           # Special TOC files requiring special processing
     keyword_files = {}       # Special keyword files requiring keyword-specific processing
+    index_files = {}         # Special _index.md files requiring index-specific processing
     
     # Image-related returns
     added_images = []        # New image files that were added
@@ -3019,6 +3020,23 @@ def analyze_source_changes(
         special_files = special_files or []
         is_keyword_file = basename == "keywords.md" and basename in special_files
         is_toc_file = is_toc_file_name(file.filename, ignore_files)
+        is_index_file = is_index_file_name(file.filename, ignore_files)
+
+        if is_index_file and source_context.get("mode") == "commit":
+            print(f"   📄 Detected _index.md file: {file.filename}")
+            try:
+                source_base_content = repository.get_contents(file.filename, ref=base_ref).decoded_content.decode('utf-8')
+            except Exception as e:
+                print(f"   ⚠️  Could not get base _index.md content: {sanitize_exception_message(e)}")
+                source_base_content = ""
+
+            index_files[file.filename] = {
+                'type': 'index',
+                'source_base_content': source_base_content,
+                'source_head_content': file_content,
+            }
+            print(f"   📄 _index.md snapshot sync queued for processing")
+            continue
 
         # Check if this is a special file requiring dedicated processing
         if is_keyword_file or is_toc_file:
@@ -3762,4 +3780,4 @@ def analyze_source_changes(
         for ignored_file in ignored_files:
             print(f"      - {ignored_file}")
     
-    return added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images, restructured_files
+    return added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images, restructured_files, index_files
