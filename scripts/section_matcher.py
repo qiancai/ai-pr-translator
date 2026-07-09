@@ -841,6 +841,7 @@ def resolve_batched_ai_matches(source_sections, ai_sections, target_hierarchy_di
     used_lines = set()
     resolved = {}
     failed_keys = []
+    last_target_line = "0"
 
     for (key, source_hierarchy), ai_section in zip(source_sections.items(), ai_sections):
         source_operation = source_diff_dict.get(key, {}).get("operation", "")
@@ -853,7 +854,11 @@ def resolve_batched_ai_matches(source_sections, ai_sections, target_hierarchy_di
             failed_keys.append(key)
             continue
 
-        target_line, target_hierarchy_str = choose_best_ai_match(candidates, source_hierarchy)
+        target_line, target_hierarchy_str = choose_best_ai_match(
+            candidates,
+            source_hierarchy,
+            previous_target_line=last_target_line,
+        )
         if not target_line or (target_line in used_lines and not allow_reused_line):
             thread_safe_print(f"      ✗ Duplicate or invalid batched match for {key}: {ai_section}")
             failed_keys.append(key)
@@ -861,6 +866,7 @@ def resolve_batched_ai_matches(source_sections, ai_sections, target_hierarchy_di
 
         if not allow_reused_line:
             used_lines.add(target_line)
+        last_target_line = target_line
         resolved[key] = build_target_match_result(
             key, source_operation, target_line, target_hierarchy_str
         )
@@ -887,6 +893,7 @@ def resolve_keyed_ai_matches(source_sections, keyed_sections, target_hierarchy_d
     used_lines = set()
     resolved = {}
     failed_keys = list(missing_keys)
+    last_target_line = "0"
 
     for key, source_hierarchy in source_sections.items():
         if key not in keyed_sections:
@@ -903,7 +910,11 @@ def resolve_keyed_ai_matches(source_sections, keyed_sections, target_hierarchy_d
             failed_keys.append(key)
             continue
 
-        target_line, target_hierarchy_str = choose_best_ai_match(candidates, source_hierarchy)
+        target_line, target_hierarchy_str = choose_best_ai_match(
+            candidates,
+            source_hierarchy,
+            previous_target_line=last_target_line,
+        )
         if not target_line or (target_line in used_lines and not allow_reused_line):
             thread_safe_print(f"      ✗ Duplicate or invalid keyed match for {key}: {ai_section}")
             failed_keys.append(key)
@@ -911,6 +922,7 @@ def resolve_keyed_ai_matches(source_sections, keyed_sections, target_hierarchy_d
 
         if not allow_reused_line:
             used_lines.add(target_line)
+        last_target_line = target_line
         resolved[key] = build_target_match_result(
             key, source_operation, target_line, target_hierarchy_str
         )
@@ -1079,8 +1091,14 @@ def find_step_heading_fallback_match(source_hierarchy, target_hierarchy):
 
     return None
 
-def choose_best_ai_match(ai_matched, source_hierarchy):
-    """Pick the best line when AI returns multiple possible sections."""
+def choose_best_ai_match(ai_matched, source_hierarchy, previous_target_line=None):
+    """Pick the best line when AI returns multiple possible sections.
+
+    When previous_target_line is set (batch/keyed resolve context), uses document-
+    order heuristics: prefer the first candidate strictly after previous_target_line.
+    When previous_target_line is None (single-section fallback), preserves the legacy
+    heuristic of picking the largest line number to avoid top-level titles.
+    """
     if not ai_matched:
         return None, None
     if len(ai_matched) == 1:
@@ -1090,7 +1108,6 @@ def choose_best_ai_match(ai_matched, source_hierarchy):
     source_level = get_heading_level(source_hierarchy)
     items = list(ai_matched.items())
 
-    # Prefer same heading level as source section.
     if source_level is not None:
         same_level = []
         for line, hierarchy in items:
@@ -1098,8 +1115,21 @@ def choose_best_ai_match(ai_matched, source_hierarchy):
             if h_level == source_level:
                 same_level.append((line, hierarchy))
         if same_level:
-            # If multiple same-level matches, keep the one with largest line number
-            # (usually the more specific/inner section in this workflow).
+            if previous_target_line is not None:
+                forward_candidates = [
+                    (line, hierarchy)
+                    for line, hierarchy in same_level
+                    if int(line) > int(previous_target_line)
+                ]
+                if forward_candidates:
+                    forward_candidates.sort(key=lambda x: int(x[0]))
+                    return forward_candidates[0]
+                # No forward candidates; pick earliest available.
+                same_level.sort(key=lambda x: int(x[0]))
+                return same_level[0]
+
+            # Single-section mode (no ordering context): pick largest line number
+            # to avoid accidentally choosing the top-level document title.
             same_level.sort(key=lambda x: int(x[0]))
             return same_level[-1]
 

@@ -2631,6 +2631,8 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
             print(f"   🚫 Filtered out false positive at line {line_num_str}: content unchanged (likely line shift artifact)")
     
     # Process added sections - find next section from current document hierarchy
+    added_line_nums = set(int(ln) for ln in added_sections.keys())
+
     for line_num_str, hierarchy in added_sections.items():
         line_num = int(line_num_str)
         
@@ -2646,6 +2648,10 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
         # Find the next section that comes after the added section in the current document
         for curr_line_num, curr_hierarchy in current_sections:
             if curr_line_num > line_num:
+                # Skip sections that are themselves newly added — they cannot
+                # serve as stable insertion anchors against the BASE document.
+                if curr_line_num in added_line_nums:
+                    continue
                 # Found the next section in current document
                 # Now find its original hierarchy in base document
                 curr_line_str = str(curr_line_num)

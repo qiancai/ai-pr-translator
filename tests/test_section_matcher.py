@@ -113,6 +113,122 @@ class SectionMatcherRegressionTest(unittest.TestCase):
             },
         )
 
+    def test_batch_match_uses_source_order_for_duplicate_step_titles(self):
+        repo_config = {
+            "source_language": "English",
+            "target_language": "Chinese",
+        }
+        target_lines = [
+            "# 文档标题",
+            "",
+            "## 使用 AWS 设置私有端点（端点共享模型）",
+            "",
+            "### Step 2. 创建 AWS interface 端点",
+            "",
+            "## 使用 AWS 设置私有端点（端点独占模型）",
+            "",
+            "### Step 2. 创建 AWS interface 端点",
+            "",
+        ]
+        target_hierarchy = {
+            "1": "# 文档标题",
+            "3": "## 使用 AWS 设置私有端点（端点共享模型）",
+            "5": "## 使用 AWS 设置私有端点（端点共享模型） > ### Step 2. 创建 AWS interface 端点",
+            "7": "## 使用 AWS 设置私有端点（端点独占模型）",
+            "9": "## 使用 AWS 设置私有端点（端点独占模型） > ### Step 2. 创建 AWS interface 端点",
+        }
+        source_diff_dict = {
+            "modified_50": {
+                "operation": "modified",
+                "original_hierarchy": "## Set up a private endpoint with AWS (endpoint shared model) > ### Step 2. Create an AWS interface endpoint",
+                "old_content": "old",
+                "new_content": "new",
+            },
+            "modified_100": {
+                "operation": "modified",
+                "original_hierarchy": "## Set up a private endpoint with AWS (endpoint exclusive model) > ### Step 2. Create an AWS interface endpoint",
+                "old_content": "old",
+                "new_content": "new",
+            },
+        }
+        ai_client = FakeAIClient(
+            [
+                "```\n### Step 2. 创建 AWS interface 端点\n### Step 2. 创建 AWS interface 端点\n```"
+            ]
+        )
+
+        result = match_source_diff_to_target(
+            source_diff_dict,
+            target_hierarchy,
+            target_lines,
+            ai_client,
+            repo_config,
+            max_non_system_sections=120,
+        )
+
+        self.assertEqual(result["modified_50"]["target_line"], "5")
+        self.assertEqual(result["modified_100"]["target_line"], "9")
+
+    def test_batch_match_added_sections_disambiguated_by_forward_logic(self):
+        """Added sections allow line reuse, so used_lines can't disambiguate.
+
+        Forward logic (previous_target_line) must advance through duplicates.
+        """
+        repo_config = {
+            "source_language": "English",
+            "target_language": "Chinese",
+        }
+        target_lines = [
+            "# Title",
+            "",
+            "## Parent A",
+            "",
+            "### Configure",
+            "",
+            "## Parent B",
+            "",
+            "### Configure",
+            "",
+        ]
+        target_hierarchy = {
+            "1": "# Title",
+            "3": "## Parent A",
+            "5": "## Parent A > ### Configure",
+            "7": "## Parent B",
+            "9": "## Parent B > ### Configure",
+        }
+        source_diff_dict = {
+            "added_10": {
+                "operation": "added",
+                "original_hierarchy": "## Parent A > ### Configure",
+                "old_content": "",
+                "new_content": "new",
+            },
+            "added_20": {
+                "operation": "added",
+                "original_hierarchy": "## Parent B > ### Configure",
+                "old_content": "",
+                "new_content": "new",
+            },
+        }
+        ai_client = FakeAIClient(
+            [
+                "```\n### Configure\n### Configure\n```"
+            ]
+        )
+
+        result = match_source_diff_to_target(
+            source_diff_dict,
+            target_hierarchy,
+            target_lines,
+            ai_client,
+            repo_config,
+            max_non_system_sections=120,
+        )
+
+        self.assertEqual(result["added_10"]["target_line"], "5")
+        self.assertEqual(result["added_20"]["target_line"], "9")
+
     def test_match_source_diff_to_target_batches_non_direct_sections_once(self):
         repo_config = {
             "source_language": "English",
