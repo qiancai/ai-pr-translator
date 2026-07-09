@@ -271,12 +271,37 @@ class TestBuildTranslationMemory(unittest.TestCase):
         ]
         base_map, target_map = build_index_translation_memory(base_lines, target_lines)
 
-        key = ("link", "https://docs.pingcap.com/tidbcloud/tidb-cloud-intro")
+        key = ("link", "https://docs.pingcap.com/tidbcloud/tidb-cloud-intro", "Why TiDB Cloud")
         self.assertIn(key, target_map)
         self.assertEqual(
             target_map[key],
             "[为什么选择 TiDB Cloud](https://docs.pingcap.com/tidbcloud/tidb-cloud-intro)",
         )
+
+
+    def test_duplicate_url_different_display_text(self):
+        """When two base links share the same URL but differ in display text,
+        each should map to its own target translation (no cross-contamination).
+        This reproduces the bug where CSV and Parquet links both pointed to
+        import-csv-files, causing the CSV position to receive the Parquet
+        translation."""
+        base_lines = [
+            "[From CSV Files](https://docs.pingcap.com/tidbcloud/import-csv-files)",
+            "[From Apache Parquet Files](https://docs.pingcap.com/tidbcloud/import-csv-files)",
+        ]
+        target_lines = [
+            "[从 CSV 文件导入](https://docs.pingcap.com/zh/tidbcloud/import-csv-files)",
+            "[从 Apache Parquet 文件导入](https://docs.pingcap.com/zh/tidbcloud/import-csv-files)",
+        ]
+        base_map, target_map = build_index_translation_memory(base_lines, target_lines)
+
+        csv_key = ("link", "https://docs.pingcap.com/tidbcloud/import-csv-files", "From CSV Files")
+        parquet_key = ("link", "https://docs.pingcap.com/tidbcloud/import-csv-files", "From Apache Parquet Files")
+
+        self.assertIn(csv_key, target_map)
+        self.assertIn(parquet_key, target_map)
+        self.assertIn("从 CSV 文件导入", target_map[csv_key])
+        self.assertIn("从 Apache Parquet 文件导入", target_map[parquet_key])
 
 
 class TestLocalizeDocsAbsoluteLinks(unittest.TestCase):
@@ -405,6 +430,69 @@ class TestPlanSyncedIndexLines(unittest.TestCase):
             SOURCE_BASE, SOURCE_HEAD, ""
         )
         self.assertTrue(len(to_translate) > 0)
+
+    def test_duplicate_url_only_changed_line_sent_to_ai(self):
+        """When two links share a URL and one gets a URL fix, the unchanged
+        link must keep its original target translation and only the changed
+        link should be sent for AI translation.
+
+        Reproduces the dedicated/_index.md bug where both the CSV and Parquet
+        entries pointed to import-csv-files.  Fixing the Parquet URL should
+        NOT corrupt the CSV translation."""
+        source_base = "\n".join([
+            '<LearningPath label="Migrate" icon="cloud3">',
+            "",
+            "[From CSV Files](https://docs.pingcap.com/tidbcloud/import-csv-files)",
+            "",
+            "[From Apache Parquet Files](https://docs.pingcap.com/tidbcloud/import-csv-files)",
+            "",
+            "</LearningPath>",
+        ])
+        source_head = "\n".join([
+            '<LearningPath label="Migrate" icon="cloud3">',
+            "",
+            "[From CSV Files](https://docs.pingcap.com/tidbcloud/import-csv-files)",
+            "",
+            "[From Apache Parquet Files](https://docs.pingcap.com/tidbcloud/import-parquet-files)",
+            "",
+            "</LearningPath>",
+        ])
+        target_existing = "\n".join([
+            '<LearningPath label="迁移" icon="cloud3">',
+            "",
+            "[从 CSV 文件导入](https://docs.pingcap.com/zh/tidbcloud/import-csv-files)",
+            "",
+            "[从 Apache Parquet 文件导入](https://docs.pingcap.com/zh/tidbcloud/import-csv-files)",
+            "",
+            "</LearningPath>",
+        ])
+
+        planned, to_translate = plan_synced_index_lines(
+            source_base, source_head, target_existing
+        )
+
+        result_text = "\n".join(
+            line if line is not None else "<NEED_TRANSLATE>"
+            for line in planned
+        )
+
+        # CSV line must keep its own translation, NOT the Parquet translation
+        self.assertIn("从 CSV 文件导入", result_text)
+        self.assertNotIn(
+            "[从 Apache Parquet 文件导入](https://docs.pingcap.com/zh/tidbcloud/import-csv-files)",
+            result_text.split("\n")[2],
+            "CSV position must not contain the Parquet translation",
+        )
+
+        # Parquet line (URL changed) should be sent for AI translation
+        parquet_lines = [line for _, line in to_translate if "Parquet" in line]
+        self.assertEqual(
+            len(parquet_lines), 1,
+            f"Expected exactly one Parquet line in to_translate: {to_translate}",
+        )
+
+        # Unchanged label should be reused
+        self.assertIn("迁移", result_text)
 
 
 class TestProcessIndexFileBySourceSnapshot(unittest.TestCase):

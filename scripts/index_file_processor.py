@@ -160,10 +160,12 @@ def _needs_translation(entry):
 def _line_translation_key(entry):
     """Build a stable identity key for matching source lines across versions.
 
-    Links are keyed by URL; tags by their full attribute set.
+    Links are keyed by (URL, display_text) to avoid collisions when multiple
+    links share the same URL (e.g. a typo where both CSV and Parquet entries
+    point to the same path).  Tags are keyed by their attribute set.
     """
     if entry["type"] == "link":
-        return ("link", entry["url"])
+        return ("link", entry["url"], entry.get("display_text", ""))
     if entry["type"] == "tag" and entry.get("tag_kind") == "container_open":
         return ("container_open",)
     if entry["type"] == "tag" and entry.get("tag_kind") == "path_open":
