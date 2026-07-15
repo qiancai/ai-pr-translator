@@ -7,8 +7,10 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from structural_reconciler import (
+    _deterministic_version_mark_inner,
     _split_into_heading_sections,
     reconcile_restructured_file,
+    reconcile_version_mark_only_change,
     split_into_blocks,
 )
 from diff_analyzer import detect_structural_change
@@ -303,6 +305,192 @@ class ReconcileNewSectionTest(unittest.TestCase):
         self.assertIn("正文 A。", out)
 
 
+class ReconcileVersionMarkMinimalUpdateTest(unittest.TestCase):
+    base = (
+        "# Variables\n\n"
+        "### `tidb_opt_partial_ordered_index_for_topn` "
+        "<span class=\"version-mark\">New in v8.5.6</span>\n\n"
+        "The first paragraph is unchanged.\n\n"
+        "The second paragraph is also unchanged.\n"
+    )
+    head = base.replace("New in v8.5.6", "New in v8.5.7")
+    target = (
+        "# 系统变量\n\n"
+        "### `tidb_opt_partial_ordered_index_for_topn` "
+        "<span class=\"version-mark\">从 v8.5.6 开始引入</span> "
+        "{#stable-variable-anchor}\n\n"
+        "第一段保持不变。\n\n"
+        "第二段也保持不变。\n"
+    )
+
+    def test_version_number_change_reuses_entire_target_section_without_ai(self):
+        ai = MockAI()
+        out = reconcile_restructured_file(
+            "version.md", self.head, self.base, self.target, ai, REPO_CONFIG,
+            source_mode="commit",
+        )
+
+        self.assertIsNotNone(out)
+        self.assertEqual(ai.calls, [])
+        self.assertIn("<span class=\"version-mark\">从 v8.5.7 开始引入</span>", out)
+        self.assertIn("{#stable-variable-anchor}", out)
+        self.assertIn("第一段保持不变。\n\n第二段也保持不变。", out)
+        self.assertNotIn("v8.5.6", out)
+
+    def test_version_number_change_survives_target_block_drift(self):
+        target = self.target.replace(
+            "第一段保持不变。\n\n第二段也保持不变。",
+            "第一段保持不变。\n第二段也保持不变。",
+        )
+        ai = MockAI()
+        out = reconcile_restructured_file(
+            "version-drift.md", self.head, self.base, target, ai, REPO_CONFIG,
+            source_mode="commit",
+        )
+
+        self.assertIsNotNone(out)
+        self.assertEqual(ai.calls, [])
+        self.assertIn("从 v8.5.7 开始引入", out)
+        self.assertIn("第一段保持不变。\n第二段也保持不变。", out)
+
+    def test_non_version_span_change_translates_only_span_inner_text(self):
+        base = self.base.replace("New in v8.5.6", "Experimental")
+        head = self.base.replace("New in v8.5.6", "Generally available")
+        target = self.target.replace("从 v8.5.6 开始引入", "实验特性")
+        ai = MockAI()
+        out = reconcile_restructured_file(
+            "version-wording.md", head, base, target, ai, REPO_CONFIG,
+            source_mode="commit",
+        )
+
+        self.assertIsNotNone(out)
+        self.assertEqual(
+            [content.strip() for content in ai.contents()],
+            ["Generally available"],
+        )
+        self.assertIn(
+            "<span class=\"version-mark\">Generally available</span> "
+            "{#stable-variable-anchor}",
+            out,
+        )
+        self.assertIn("第一段保持不变。\n\n第二段也保持不变。", out)
+
+    def test_mixed_version_mark_and_regular_section_changes(self):
+        base = (
+            "# Variables\n\n"
+            "## `var_a` <span class=\"version-mark\">New in v8.5.6</span>\n\n"
+            "Variable A body.\n\n"
+            "## Regular section\n\n"
+            "Old regular body.\n"
+        )
+        head = base.replace("v8.5.6", "v8.5.7").replace(
+            "Old regular body.", "Changed regular body."
+        )
+        target = (
+            "# 系统变量\n\n"
+            "## `var_a` <span class=\"version-mark\">从 v8.5.6 开始引入</span>\n\n"
+            "变量 A 正文保持不变。\n\n"
+            "## 普通章节\n\n"
+            "原有普通正文。\n"
+        )
+        ai = MockAI()
+
+        out = reconcile_restructured_file(
+            "mixed.md", head, base, target, ai, REPO_CONFIG,
+            source_mode="commit",
+        )
+
+        self.assertIsNotNone(out)
+        self.assertEqual(
+            [content.strip() for content in ai.contents()],
+            ["Changed regular body."],
+        )
+        self.assertIn("从 v8.5.7 开始引入", out)
+        self.assertIn("变量 A 正文保持不变。", out)
+        self.assertIn("## 普通章节", out)
+        self.assertIn("Changed regular body.", out)
+
+    def test_semantically_distinct_duplicate_markers_do_not_cross_pair(self):
+        base = (
+            "# Variables\n\n"
+            "## `var_name` <span class=\"version-mark\">New in v7.0</span>\n\n"
+            "Same source body.\n\n"
+            "## `var_name` <span class=\"version-mark\">Deprecated in v8.0</span>\n\n"
+            "Same source body.\n"
+        )
+        head = base.replace("v7.0", "v7.1").replace("v8.0", "v8.1")
+        target = (
+            "# 系统变量\n\n"
+            "## `var_name` <span class=\"version-mark\">从 v7.0 开始引入</span>\n\n"
+            "新增语义对应的译文。\n\n"
+            "## `var_name` <span class=\"version-mark\">从 v8.0 开始弃用</span>\n\n"
+            "弃用语义对应的译文。\n"
+        )
+        ai = MockAI()
+
+        out = reconcile_restructured_file(
+            "duplicate-markers.md", head, base, target, ai, REPO_CONFIG,
+            source_mode="commit",
+        )
+
+        self.assertIsNotNone(out)
+        self.assertEqual(ai.calls, [])
+        self.assertLess(out.index("从 v7.1 开始引入"), out.index("新增语义对应的译文"))
+        self.assertLess(out.index("从 v8.1 开始弃用"), out.index("弃用语义对应的译文"))
+
+    def test_nested_span_is_balanced_during_minimal_update(self):
+        base = (
+            "### `var_a` <span class=\"version-mark\">New in "
+            "<span class=\"highlight\">v8.5.6</span></span>\n\nBody.\n"
+        )
+        head = base.replace("v8.5.6", "v8.5.7")
+        target = (
+            "### `var_a` <span class=\"version-mark\">从 "
+            "<span class=\"highlight\">v8.5.6</span> 开始引入</span>\n\n正文。\n"
+        )
+
+        updated = reconcile_version_mark_only_change(
+            head, base, target, MockAI(), "English", "Chinese",
+            source_mode="commit",
+        )
+
+        self.assertEqual(
+            updated,
+            target.replace("v8.5.6", "v8.5.7"),
+        )
+        self.assertEqual(updated.count("<span"), updated.count("</span>"))
+
+    def test_ai_span_update_that_changes_target_structure_is_rejected(self):
+        base = (
+            "### `var_a` <span class=\"version-mark\">Experimental\nstatus</span>\n"
+        )
+        head = base.replace("Experimental", "Generally available")
+        target = (
+            "### `var_a` <span class=\"version-mark\">实验性\n状态</span>\n"
+        )
+
+        class StructureChangingAI(MockAI):
+            def chat_completion(self, messages, temperature=0.1):
+                self.calls.append(messages)
+                return "正式可用\n## 注入的标题"
+
+        updated = reconcile_version_mark_only_change(
+            head, base, target, StructureChangingAI(), "English", "Chinese",
+            source_mode="commit",
+        )
+
+        self.assertIsNone(updated)
+
+    def test_version_token_replacement_respects_target_boundaries(self):
+        change = {
+            "base_inner": "New in 8.5.6",
+            "head_inner": "New in 8.5.7",
+            "target_inner": "对应 18.5.6 client",
+        }
+
+        self.assertIsNone(_deterministic_version_mark_inner(change))
+
+
 class ReconcileWhitespaceTest(unittest.TestCase):
     def test_trailing_whitespace_only_change_is_reused(self):
         base = "# A\n\nIntro.\n\n## B\n\nLine with trailing space.   \n"
@@ -537,6 +725,17 @@ class DetectStructuralChangeTest(unittest.TestCase):
     def test_plain_content_edit_is_not_structural(self):
         base = "# T\n\n## A\n\nold body\n\n## B\n\nb\n"
         head = "# T\n\n## A\n\nnew body\n\n## B\n\nb\n"
+        self.assertFalse(detect_structural_change(base, head))
+
+    def test_version_mark_only_heading_edit_is_not_structural(self):
+        base = (
+            "# Variables\n\n"
+            "### `tidb_opt_partial_ordered_index_for_topn` "
+            "<span class=\"version-mark\">New in v8.5.6</span>\n\n"
+            "Unchanged body.\n"
+        )
+        head = base.replace("v8.5.6", "v8.5.7")
+
         self.assertFalse(detect_structural_change(base, head))
 
     def test_code_block_hashes_do_not_trigger_move(self):

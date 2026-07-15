@@ -341,6 +341,93 @@ class MainWorkflowRegressionTest(unittest.TestCase):
         self.assertFalse(reason)
         process_modified_sections.assert_not_called()
 
+    def test_regular_modified_file_applies_version_mark_only_without_ai(self):
+        old_source = (
+            "### `tidb_opt_partial_ordered_index_for_topn` "
+            "<span class=\"version-mark\">New in v8.5.6</span>\n\n"
+            "The body is unchanged.\n"
+        )
+        new_source = old_source.replace("v8.5.6", "v8.5.7")
+        target_content = (
+            "### `tidb_opt_partial_ordered_index_for_topn` "
+            "<span class=\"version-mark\">从 v8.5.6 开始引入</span> "
+            "{#stable-anchor}\n\n"
+            "正文保持不变。\n"
+        )
+        source_diff_dict = {
+            "modified_20": {
+                "operation": "modified",
+                "new_line_number": 20,
+                "new_content": new_source,
+                "old_content": old_source,
+                "original_hierarchy": (
+                    "## Variable reference > ### "
+                    "`tidb_opt_partial_ordered_index_for_topn` "
+                    "<span class=\"version-mark\">New in v8.5.6</span>"
+                ),
+            },
+        }
+        matched_sections = {
+            "modified_20": {
+                "target_line": "5",
+                "target_hierarchy": "## 变量参考 > ### `tidb_opt_partial_ordered_index_for_topn`",
+                "target_content": target_content,
+                "source_operation": "modified",
+                "source_old_content": old_source,
+                "source_new_content": new_source,
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_diff_file = Path(tmpdir) / "system-variables-source-diff-dict.json"
+            source_diff_file.write_text(
+                json.dumps(source_diff_dict),
+                encoding="utf-8",
+            )
+
+            def assert_match_file(match_file, target_local_path, target_file_name=None):
+                match_data = json.loads(Path(match_file).read_text(encoding="utf-8"))
+                updated = match_data["modified_20"]["target_new_content"]
+                self.assertEqual(
+                    updated,
+                    target_content.replace("v8.5.6", "v8.5.7"),
+                )
+                self.assertIn("{#stable-anchor}", updated)
+                self.assertIn("正文保持不变。", updated)
+                return True
+
+            with mock.patch.object(main_workflow, "ensure_temp_output_dir", return_value=tmpdir), \
+                mock.patch.object(main_workflow, "check_source_token_limit", return_value=(True, 10, 50000)), \
+                mock.patch("diff_analyzer.get_target_hierarchy_and_content", return_value=({"5": "## 变量参考 > ### variable"}, ["# 系统变量", "", "## 变量参考", "", "### variable"])), \
+                mock.patch("section_matcher.match_source_diff_to_target", return_value=matched_sections), \
+                mock.patch.object(main_workflow, "process_modified_sections") as process_modified_sections, \
+                mock.patch("file_updater.update_target_document_from_match_data", side_effect=assert_match_file):
+                success, reason = main_workflow.process_regular_modified_file(
+                    "system-variables.md",
+                    {"sections": {"20": "### variable"}},
+                    (
+                        "File: system-variables.md\n@@ -20,1 +20,1 @@\n"
+                        "-<span>New in v8.5.6</span>\n"
+                        "+<span>New in v8.5.7</span>"
+                    ),
+                    {"mode": "commit"},
+                    object(),
+                    object(),
+                    {
+                        "target_repo": "pingcap/docs",
+                        "target_local_path": tmpdir,
+                        "prefer_local_target_for_read": True,
+                        "source_language": "English",
+                        "target_language": "Chinese",
+                    },
+                    120,
+                    return_details=True,
+                )
+
+        self.assertTrue(success)
+        self.assertFalse(reason)
+        process_modified_sections.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

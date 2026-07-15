@@ -544,14 +544,37 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, so
                 )
             return finish(False, failure_reason)
         
-        # Separate heading-level-only changes from sections needing AI translation
+        # Separate deterministic/minimal heading changes from sections needing AI translation.
         from file_updater import apply_heading_level_change_to_target
+        from structural_reconciler import reconcile_version_mark_only_change
         heading_level_only_results = {}
+        version_mark_only_results = {}
         sections_for_ai = {}
 
         for key, section_info in enhanced_sections.items():
             source_entry = source_diff_dict.get(key, {})
-            if source_entry.get('heading_level_change_only'):
+            version_mark_result = None
+            if source_entry.get('operation') == 'modified':
+                version_mark_result = reconcile_version_mark_only_change(
+                    source_entry.get('new_content')
+                    or section_info.get('source_new_content', ''),
+                    source_entry.get('old_content')
+                    or section_info.get('source_old_content', ''),
+                    section_info.get('target_content', ''),
+                    ai_client,
+                    repo_config['source_language'],
+                    repo_config['target_language'],
+                    glossary_matcher=glossary_matcher,
+                    source_mode=source_mode,
+                )
+
+            if version_mark_result is not None:
+                version_mark_only_results[key] = version_mark_result
+                thread_safe_print(
+                    f"   ♻️  Version-mark-only: {key} — updated only the span "
+                    "inner text and reused the rest of the target section"
+                )
+            elif source_entry.get('heading_level_change_only'):
                 target_content = section_info.get('target_content', '')
                 old_level = source_entry['old_heading_level']
                 new_level = source_entry['new_heading_level']
@@ -566,10 +589,11 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, so
             else:
                 sections_for_ai[key] = section_info
 
-        if heading_level_only_results:
+        if heading_level_only_results or version_mark_only_results:
             thread_safe_print(
-                f"   📐 {len(heading_level_only_results)} section(s) handled as heading-level-only "
-                f"(no AI needed), {len(sections_for_ai)} section(s) still need AI translation"
+                f"   ♻️  Applied {len(version_mark_only_results)} version-mark-only and "
+                f"{len(heading_level_only_results)} heading-level-only update(s); "
+                f"{len(sections_for_ai)} section(s) still need normal AI translation"
             )
 
         # Step 2: Get AI translation for the remaining matched sections
@@ -597,12 +621,15 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, so
                     thread_safe_print(f"   ⚠️  AI translation failed or returned invalid results")
                     return finish(False, failure_reason)
             else:
-                if not heading_level_only_results:
+                if not heading_level_only_results and not version_mark_only_results:
                     thread_safe_print(f"   ⚠️  No results from process_modified_sections")
                     return finish(False, "No results from process_modified_sections")
                 ai_updated_sections = {}
         else:
-            thread_safe_print(f"   📐 All sections are heading-level-only — skipping AI translation entirely")
+            thread_safe_print(
+                "   ♻️  All matched sections used deterministic/minimal heading "
+                "updates — skipping normal section translation"
+            )
 
         # Step 3: Update match_source_diff_to_target.json with results
         thread_safe_print(f"   📝 Step 3: Updating {match_file} with results...")
@@ -616,6 +643,9 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, so
 
             if operation == 'deleted':
                 section_data['target_new_content'] = None
+            elif key in version_mark_only_results:
+                section_data['target_new_content'] = version_mark_only_results[key]
+                updated_count += 1
             elif key in heading_level_only_results:
                 section_data['target_new_content'] = heading_level_only_results[key]
                 updated_count += 1

@@ -53,6 +53,205 @@ from translation_structure_validator import (
 
 _CUSTOM_CONTENT_LINE_RE = re.compile(r"^</?CustomContent\b[^<>]*>$")
 _FENCE_RE = re.compile(r"^(```|~~~)")
+_SPAN_TAG_RE = re.compile(
+    r"<(?P<closing>/)?span\b(?P<attrs>[^>]*)>",
+    re.IGNORECASE | re.DOTALL,
+)
+_CLASS_ATTR_RE = re.compile(
+    r"\bclass\s*=\s*(['\"])(?P<classes>.*?)\1",
+    re.IGNORECASE | re.DOTALL,
+)
+_VERSION_RE = re.compile(r"(?<![\w.])v?\d+(?:\.\d+){1,3}(?![\w.])", re.IGNORECASE)
+_VERSION_MARK_PLACEHOLDER = "__VERSION_MARK_CONTENT__"
+
+
+def _find_version_mark_span(content):
+    """Return the sole balanced ``version-mark`` span in content.
+
+    A small stack is used instead of an ``.*?</span>`` regex so nested spans do
+    not truncate the outer version marker and leave unmatched closing tags when
+    its inner text is replaced.
+    """
+    stack = []
+    matches = []
+    for tag in _SPAN_TAG_RE.finditer(content):
+        if not tag.group("closing"):
+            class_match = _CLASS_ATTR_RE.search(tag.group("attrs"))
+            is_version_mark = bool(
+                class_match
+                and "version-mark" in class_match.group("classes").split()
+            )
+            stack.append((tag, is_version_mark))
+            continue
+
+        if not stack:
+            return None
+        opening, is_version_mark = stack.pop()
+        if is_version_mark:
+            matches.append(
+                {
+                    "inner": content[opening.end() : tag.start()],
+                    "inner_start": opening.end(),
+                    "inner_end": tag.start(),
+                }
+            )
+
+    if stack:
+        return None
+    return matches[0] if len(matches) == 1 else None
+
+
+def _replace_span_inner(content, span_match, replacement):
+    return (
+        content[: span_match["inner_start"]]
+        + replacement
+        + content[span_match["inner_end"] :]
+    )
+
+
+def _source_version_mark_only_change(head_content, base_content):
+    """Describe a source change confined to one version-mark span."""
+    if not head_content or not base_content:
+        return None
+
+    head_span = _find_version_mark_span(head_content)
+    base_span = _find_version_mark_span(base_content)
+    if not head_span or not base_span:
+        return None
+    if head_span["inner"] == base_span["inner"]:
+        return None
+
+    head_skeleton = _replace_span_inner(
+        head_content, head_span, _VERSION_MARK_PLACEHOLDER
+    )
+    base_skeleton = _replace_span_inner(
+        base_content, base_span, _VERSION_MARK_PLACEHOLDER
+    )
+    if _normalize_for_match(head_skeleton) != _normalize_for_match(base_skeleton):
+        return None
+
+    return {
+        "head_inner": head_span["inner"],
+        "base_inner": base_span["inner"],
+    }
+
+
+def _version_mark_only_change(head_content, base_content, target_content):
+    """Describe a span-only change that can reuse the complete target section.
+
+    The source comparison covers the complete supplied content, so callers can
+    safely retain every byte of the existing target outside the span.
+    """
+    source_change = _source_version_mark_only_change(head_content, base_content)
+    target_span = (
+        _find_version_mark_span(target_content) if target_content else None
+    )
+    if not source_change or not target_span:
+        return None
+    return {
+        **source_change,
+        "target_inner": target_span["inner"],
+        "target_span": target_span,
+    }
+
+
+def _deterministic_version_mark_inner(change):
+    """Return a target span with only its version token changed, when safe."""
+    base_versions = list(_VERSION_RE.finditer(change["base_inner"]))
+    head_versions = list(_VERSION_RE.finditer(change["head_inner"]))
+    if len(base_versions) != 1 or len(head_versions) != 1:
+        return None
+
+    base_match = base_versions[0]
+    head_match = head_versions[0]
+    base_skeleton = (
+        change["base_inner"][: base_match.start()]
+        + _VERSION_MARK_PLACEHOLDER
+        + change["base_inner"][base_match.end() :]
+    )
+    head_skeleton = (
+        change["head_inner"][: head_match.start()]
+        + _VERSION_MARK_PLACEHOLDER
+        + change["head_inner"][head_match.end() :]
+    )
+    if base_skeleton != head_skeleton:
+        return None
+
+    old_version = base_match.group(0)
+    new_version = head_match.group(0)
+    target_matches = [
+        match
+        for match in _VERSION_RE.finditer(change["target_inner"])
+        if match.group(0) == old_version
+    ]
+    if len(target_matches) != 1:
+        return None
+    target_match = target_matches[0]
+    return (
+        change["target_inner"][: target_match.start()]
+        + new_version
+        + change["target_inner"][target_match.end() :]
+    )
+
+
+def reconcile_version_mark_only_change(
+    head_content,
+    base_content,
+    target_content,
+    ai_client,
+    source_language,
+    target_language,
+    glossary_matcher=None,
+    source_mode="",
+):
+    """Minimally apply a source change confined to a version-mark span.
+
+    For a pure version-token bump, update the token deterministically without
+    calling AI. For other span wording changes, translate only the span's inner
+    text. In both cases every target byte outside that inner text is retained.
+    Return ``None`` when the source change is not span-only or cannot be applied
+    safely, allowing the caller to use its normal translation path.
+    """
+    change = _version_mark_only_change(head_content, base_content, target_content)
+    if not change:
+        return None
+
+    translated_inner = _deterministic_version_mark_inner(change)
+    if translated_inner is None:
+        translated_inner = translate_file_batch(
+            change["head_inner"],
+            ai_client,
+            source_language,
+            target_language,
+            glossary_matcher=glossary_matcher,
+            source_mode=source_mode,
+            context_reference=head_content,
+            prior_translation_reference=change["target_inner"],
+        ).strip()
+        # The model receives inner text, not markup. If it nevertheless emits a
+        # span or changes a single-line marker into multiple lines, let the
+        # caller use the normal guarded path instead of creating invalid HTML.
+        if (
+            not translated_inner
+            or "<span" in translated_inner.lower()
+            or "</span>" in translated_inner.lower()
+            or ("\n" not in change["head_inner"] and "\n" in translated_inner)
+        ):
+            return None
+
+    updated = _replace_span_inner(
+        target_content,
+        change["target_span"],
+        translated_inner,
+    )
+    structure_issue = compare_heading_structure(
+        "version-mark target section", target_content, updated
+    ) or compare_custom_content_structure(
+        "version-mark target section", target_content, updated
+    )
+    if structure_issue:
+        return None
+    return updated
 
 
 def split_into_blocks(content):
@@ -233,6 +432,52 @@ def _section_heading_key(section):
     return None
 
 
+def _section_heading_match_key(section):
+    """Return a heading key stable across version-token changes only.
+
+    Text such as ``New in`` and ``Deprecated in`` remains part of the key, so
+    semantically different markers on otherwise identical headings do not
+    collapse into one duplicate-heading group.
+    """
+    for block in section:
+        if not _block_is_heading(block):
+            continue
+        span = _find_version_mark_span(block)
+        if span:
+            normalized_inner = _VERSION_RE.sub(
+                _VERSION_MARK_PLACEHOLDER, span["inner"]
+            )
+            block = _replace_span_inner(block, span, normalized_inner)
+        return _normalize_for_match(block)
+    return None
+
+
+def _section_heading_span_key(section):
+    """Return a heading key ignoring all version-mark inner text."""
+    for block in section:
+        if not _block_is_heading(block):
+            continue
+        span = _find_version_mark_span(block)
+        if span:
+            block = _replace_span_inner(block, span, _VERSION_MARK_PLACEHOLDER)
+        return _normalize_for_match(block)
+    return None
+
+
+def _has_version_mark_only_section_change(base_source, head_source):
+    """Return True if any matched section changed only its version-mark span."""
+    base_sections = _split_into_heading_sections(base_source)
+    head_sections = _split_into_heading_sections(head_source)
+    matches = _match_head_sections_to_base(base_sections, head_sections)
+    for head_index, base_index in matches.items():
+        if _source_version_mark_only_change(
+            "".join(head_sections[head_index]),
+            "".join(base_sections[base_index]),
+        ):
+            return True
+    return False
+
+
 def _repair_and_validate_translated_structure(source_content, translated_content):
     """Repair heading-level drift and reject non-repairable section output.
 
@@ -293,7 +538,25 @@ def _translate_section_blocks(
     one section, never the complete document.
     """
     section_source = "".join(head_blocks)
+    base_source = "".join(base_blocks)
     prior_translation = "".join(target_blocks) if target_blocks else None
+
+    updated = reconcile_version_mark_only_change(
+        section_source,
+        base_source,
+        prior_translation,
+        ai_client,
+        source_language,
+        target_language,
+        glossary_matcher=glossary_matcher,
+        source_mode=source_mode,
+    )
+    if updated is not None:
+        thread_safe_print(
+            "   ♻️  Reconciler: minimally updated version-mark span and reused "
+            "the rest of its section"
+        )
+        return _strip_trailing_newlines(updated) + _trailing_newlines(section_source)
 
     if not base_blocks or not target_blocks or len(base_blocks) != len(target_blocks):
         # Without local source/target block parity there is no deterministic,
@@ -402,66 +665,95 @@ def _section_similarity_text(section):
 def _match_head_sections_to_base(base_sections, head_sections):
     """Match HEAD sections to BASE, handling duplicate heading titles safely.
 
-    Unique headings pair directly. For duplicate headings, exact full-section
-    matches are reserved first so an unchanged moved section cannot be consumed
-    by an earlier changed sibling. Remaining candidates are greedily paired by
-    source-body similarity; FIFO is used only as a deterministic tie-breaker
-    when the source content provides no stronger signal.
+    Exact heading keys are matched first. Duplicate exact headings reserve full
+    section matches and then use source-body similarity. Relaxed version-marker
+    matching is attempted only for a remaining unambiguous 1:1 pair, preventing
+    semantically different or duplicated markers from being cross-paired.
     """
-    base_groups = defaultdict(list)
-    head_groups = defaultdict(list)
-    for index, section in enumerate(base_sections):
-        base_groups[_section_heading_key(section)].append(index)
-    for index, section in enumerate(head_sections):
-        head_groups[_section_heading_key(section)].append(index)
-
     assignments = {}
+    unmatched_head = set(range(len(head_sections)))
+    unmatched_base = set(range(len(base_sections)))
+
+    def grouped(indices, sections, key_function):
+        result = defaultdict(list)
+        for index in sorted(indices):
+            result[key_function(sections[index])].append(index)
+        return result
+
+    # Phase 1: retain the original exact-heading behavior. Within an exact
+    # duplicate group, reserve unchanged sections before similarity matching.
+    base_groups = grouped(unmatched_base, base_sections, _section_heading_key)
+    head_groups = grouped(unmatched_head, head_sections, _section_heading_key)
     for heading_key, head_indices in head_groups.items():
         base_indices = base_groups.get(heading_key, [])
         if not base_indices:
             continue
 
-        unmatched_head = set(head_indices)
-        unmatched_base = set(base_indices)
-
-        # Reserve exact matches before considering changed duplicate sections.
+        group_head = set(head_indices)
+        group_base = set(base_indices)
         for head_index in head_indices:
             head_text = _normalize_for_match("".join(head_sections[head_index]))
             exact_base = next(
                 (
                     base_index
                     for base_index in base_indices
-                    if base_index in unmatched_base
+                    if base_index in group_base
                     and _normalize_for_match("".join(base_sections[base_index]))
                     == head_text
                 ),
                 None,
             )
-            if exact_base is None:
-                continue
-            assignments[head_index] = exact_base
-            unmatched_head.remove(head_index)
-            unmatched_base.remove(exact_base)
+            if exact_base is not None:
+                assignments[head_index] = exact_base
+                group_head.remove(head_index)
+                group_base.remove(exact_base)
 
-        # Match the remaining changed duplicates by source-body similarity.
         scored_pairs = []
-        for head_index in unmatched_head:
+        for head_index in group_head:
             head_body = _section_similarity_text(head_sections[head_index])
-            for base_index in unmatched_base:
+            for base_index in group_base:
                 base_body = _section_similarity_text(base_sections[base_index])
                 score = SequenceMatcher(
                     None, head_body, base_body, autojunk=False
                 ).ratio()
-                scored_pairs.append(
-                    (-score, head_index, base_index)
-                )
+                scored_pairs.append((-score, head_index, base_index))
 
         for _, head_index, base_index in sorted(scored_pairs):
-            if head_index not in unmatched_head or base_index not in unmatched_base:
+            if head_index not in group_head or base_index not in group_base:
+                continue
+            assignments[head_index] = base_index
+            group_head.remove(head_index)
+            group_base.remove(base_index)
+
+        unmatched_head.difference_update(set(head_indices) - group_head)
+        unmatched_base.difference_update(set(base_indices) - group_base)
+
+    def match_unambiguous_relaxed(key_function, require_span_only=False):
+        base_relaxed = grouped(unmatched_base, base_sections, key_function)
+        head_relaxed = grouped(unmatched_head, head_sections, key_function)
+        for heading_key, head_indices in head_relaxed.items():
+            base_indices = base_relaxed.get(heading_key, [])
+            if heading_key is None or len(head_indices) != 1 or len(base_indices) != 1:
+                continue
+            head_index = head_indices[0]
+            base_index = base_indices[0]
+            if require_span_only and not _source_version_mark_only_change(
+                "".join(head_sections[head_index]),
+                "".join(base_sections[base_index]),
+            ):
                 continue
             assignments[head_index] = base_index
             unmatched_head.remove(head_index)
             unmatched_base.remove(base_index)
+
+    # Phase 2 keeps marker semantics and ignores only version tokens. Phase 3
+    # supports non-version wording changes only when the complete section proves
+    # that the span inner text is the sole change and the pairing is unique.
+    match_unambiguous_relaxed(_section_heading_match_key)
+    match_unambiguous_relaxed(
+        _section_heading_span_key,
+        require_span_only=True,
+    )
 
     return assignments
 
@@ -479,9 +771,10 @@ def _reconcile_by_heading_sections(
     """Reconcile a structurally parallel translation with block-count drift.
 
     Base and target sections are paired by heading position (their translated
-    titles naturally differ).  HEAD sections are then matched to base sections
-    by the unchanged source heading, allowing moved sections to carry their
-    existing target text to the new position without translation.
+    titles naturally differ). HEAD sections are then matched to base sections
+    by exact source headings first. Version-marker matching is relaxed only for
+    unambiguous remaining pairs, allowing moved or version-bumped sections to
+    retain existing target text without risking duplicate-heading cross-pairs.
     """
     heading_issue = compare_heading_structure(
         source_file_path, base_source, existing_target
@@ -590,11 +883,22 @@ def reconcile_restructured_file(
     # finest granularity.  Translation files often have harmless paragraph or
     # blank-line drift, though; in that case align heading sections instead of
     # falling back to a destructive full-file translation.
-    if len(base_blocks) != len(target_blocks):
-        thread_safe_print(
-            f"   ⚠️  Reconciler: base/target block count mismatch "
-            f"({len(base_blocks)} vs {len(target_blocks)}); aligning by heading section"
-        )
+    block_mismatch = len(base_blocks) != len(target_blocks)
+    version_mark_only_change = (
+        not block_mismatch
+        and _has_version_mark_only_section_change(base_source, head_source)
+    )
+    if block_mismatch or version_mark_only_change:
+        if block_mismatch:
+            thread_safe_print(
+                f"   ⚠️  Reconciler: base/target block count mismatch "
+                f"({len(base_blocks)} vs {len(target_blocks)}); aligning by heading section"
+            )
+        else:
+            thread_safe_print(
+                "   ♻️  Reconciler: version-mark-only heading change; aligning "
+                "by section for a minimal update"
+            )
         reconciled = _reconcile_by_heading_sections(
             source_file_path,
             head_source,
