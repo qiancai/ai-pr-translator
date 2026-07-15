@@ -1296,12 +1296,14 @@ def reconcile_restructured_files(
 ):
     """Reconcile restructured files in place, reusing existing translations.
 
-    Each successfully reconciled file is written to the target, recorded as a
-    success, and removed from the full-translation queue.  Files that cannot be
-    reconciled (no existing target, structural drift, or self-check failure)
-    are left in ``added_files`` to fall back to full translation.
+    Each successfully reconciled file is written to the target and recorded as
+    a success. If an existing translated file cannot be reconciled safely, keep
+    it unchanged and record a failure; never turn a localized reconciliation
+    failure into a destructive full-file overwrite. A genuinely missing target
+    can still use the normal full-file creation path.
     """
     reconciled_paths = set()
+    failed_paths = set()
     source_mode = (
         diff_context.get("mode", "commit") if isinstance(diff_context, dict) else "commit"
     )
@@ -1311,20 +1313,28 @@ def reconcile_restructured_files(
     rr_strip = source_mode == "commit" and should_ignore_resource_card_section(repo_config)
 
     for file_path in sorted(restructured_files):
+        existing_target = read_target_file_content(TARGET_REPO_PATH, file_path)
+        if not existing_target:
+            thread_safe_print(
+                f"   ℹ️  Reconciler: no existing target for {file_path}; "
+                "using full translation"
+            )
+            continue
+
+        def mark_reconciliation_failure(reason):
+            thread_safe_print(
+                f"   ❌ Reconciler: {reason}; preserving existing target file"
+            )
+            translation_stats.mark_failure(file_path, reason)
+            failed_paths.add(file_path)
+
         try:
             head_source = get_source_ref_content(file_path, diff_context, github_client, "head_ref")
             base_source = get_source_ref_content(file_path, diff_context, github_client, "base_ref")
         except Exception as e:
-            thread_safe_print(
-                f"   ⚠️  Reconciler: could not load source for {file_path}: "
-                f"{sanitize_exception_message(e)}; using full translation"
-            )
-            continue
-
-        existing_target = read_target_file_content(TARGET_REPO_PATH, file_path)
-        if not existing_target:
-            thread_safe_print(
-                f"   ℹ️  Reconciler: no existing target for {file_path}; using full translation"
+            mark_reconciliation_failure(
+                f"could not load source for {file_path}: "
+                f"{sanitize_exception_message(e)}"
             )
             continue
 
@@ -1346,25 +1356,22 @@ def reconcile_restructured_files(
                 source_mode=source_mode,
             )
         except Exception as e:
-            # Isolate per-file failures (e.g. AI/network errors surfacing from
-            # translate_file_batch) so one file cannot abort the whole group;
-            # the file stays queued for full-translation fallback.
-            thread_safe_print(
-                f"   ❌ Reconciler raised for {file_path}: "
-                f"{sanitize_exception_message(e)}; using full translation"
+            mark_reconciliation_failure(
+                f"reconciliation raised for {file_path}: "
+                f"{sanitize_exception_message(e)}"
             )
             continue
 
         if reconciled is None:
-            thread_safe_print(
-                f"   ↩️  Reconciler declined {file_path}; using full translation"
+            mark_reconciliation_failure(
+                f"structure-preserving reconciliation declined {file_path}"
             )
             continue
 
         target_file_path = get_safe_target_file_path(TARGET_REPO_PATH, file_path)
         if not target_file_path:
-            thread_safe_print(
-                f"   ⚠️  Reconciler: unsafe target path for {file_path}; using full translation"
+            mark_reconciliation_failure(
+                f"unsafe target path for {file_path}"
             )
             continue
 
@@ -1372,9 +1379,9 @@ def reconcile_restructured_files(
             with open(target_file_path, "w", encoding="utf-8") as f:
                 f.write(reconciled)
         except Exception as e:
-            thread_safe_print(
-                f"   ❌ Reconciler: failed to write {target_file_path}: "
-                f"{sanitize_exception_message(e)}; using full translation"
+            mark_reconciliation_failure(
+                f"failed to write {target_file_path}: "
+                f"{sanitize_exception_message(e)}"
             )
             continue
 
@@ -1383,7 +1390,7 @@ def reconcile_restructured_files(
         successful_file_paths.add(file_path)
         reconciled_paths.add(file_path)
 
-    for file_path in reconciled_paths:
+    for file_path in reconciled_paths | failed_paths:
         added_files.pop(file_path, None)
         full_translation_file_paths.discard(file_path)
 
@@ -1537,7 +1544,7 @@ def process_translation_group(
     if restructured_files:
         thread_safe_print(
             f"\n🔄 Restructured files detected ({len(restructured_files)}), "
-            "will use full translation with overwrite:"
+            "will use structure-preserving reconciliation:"
         )
         for path in sorted(restructured_files):
             thread_safe_print(f"   - {path}")
@@ -1545,8 +1552,10 @@ def process_translation_group(
 
         # Try structure-preserving reconciliation first: rebuild each file in
         # HEAD order while reusing the existing translation for unchanged /
-        # moved sections.  Files that reconcile successfully are removed from
-        # the full-translation queue; the rest fall back to full translation.
+        # moved sections. Successfully reconciled files are removed from the
+        # full-translation queue. Existing targets that cannot be reconciled
+        # are preserved and reported as failures; only missing targets can use
+        # full-file creation.
         reconcile_restructured_files(
             restructured_files,
             added_files,

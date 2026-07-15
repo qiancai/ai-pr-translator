@@ -1167,6 +1167,41 @@ def _collect_heading_lines(content):
     ]
 
 
+def _has_common_heading_reorder(base_headings, head_headings):
+    """Return True when surviving headings changed relative order.
+
+    Comparing the complete heading multisets only catches a *pure* reorder.
+    Real documentation updates commonly move existing sections while also
+    adding, deleting, or renaming other sections.  Detect that case by
+    comparing the longest common subsequence with the multiset intersection:
+    if every surviving heading can be kept in order, there was no move; if
+    some cannot, at least one surviving section changed position.
+
+    The multiset/LCS formulation also handles duplicate headings without
+    treating an ordinary addition or deletion of one duplicate as a move.
+    """
+    common_heading_count = sum(
+        (Counter(base_headings) & Counter(head_headings)).values()
+    )
+    if common_heading_count < 2:
+        return False
+
+    # One-row dynamic-programming LCS.  Documentation files normally contain
+    # at most a few hundred headings, so O(n*m) time is small while avoiding a
+    # second quadratic-sized table.
+    previous = [0] * (len(head_headings) + 1)
+    for base_heading in base_headings:
+        current = [0]
+        for head_index, head_heading in enumerate(head_headings, 1):
+            if base_heading == head_heading:
+                current.append(previous[head_index - 1] + 1)
+            else:
+                current.append(max(previous[head_index], current[-1]))
+        previous = current
+
+    return previous[-1] < common_heading_count
+
+
 def detect_structural_change(base_content, head_content):
     """Detect partial restructures the incremental section path mishandles.
 
@@ -1174,9 +1209,9 @@ def detect_structural_change(base_content, head_content):
       (a) the CustomContent tag sequence differs between base and head — i.e.
           existing content was newly wrapped/unwrapped or tags were reordered
           (the unbalanced-tag failure mode); or
-      (b) the document's heading sequence is a pure reorder (same heading
-          multiset, different order) — i.e. one or more sections were moved
-          (the duplicated/dropped-section failure mode).
+      (b) surviving headings changed relative order, including when the same
+          update also added/deleted/renamed other headings — i.e. one or more
+          sections were moved (the duplicated/dropped-section failure mode).
 
     Both cases are routed to structural reconciliation, which rebuilds the file
     in HEAD order while reusing existing translations for unchanged sections.
@@ -1191,10 +1226,7 @@ def detect_structural_change(base_content, head_content):
 
     base_headings = _collect_heading_lines(base_content)
     head_headings = _collect_heading_lines(head_content)
-    if (
-        base_headings != head_headings
-        and Counter(base_headings) == Counter(head_headings)
-    ):
+    if _has_common_heading_reorder(base_headings, head_headings):
         return True
 
     return False
@@ -3355,7 +3387,7 @@ def analyze_source_changes(
             )
         ):
             print(f"   🔄 Detected restructured document (full restructure or moved/rewrapped sections)")
-            print(f"   🔄 Routing {file.filename} to structural reconciliation (with full-translation fallback)")
+            print(f"   🔄 Routing {file.filename} to structural reconciliation")
             restructured_content = file_content
             if should_ignore_related_resources_resource_card_sections(source_context):
                 restructured_content, skipped_sections = remove_related_resources_resource_card_sections(

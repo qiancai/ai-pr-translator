@@ -18,6 +18,39 @@ from translation_structure_validator import StructureValidationIssue
 
 
 class CommitSyncWorkflowHelpersTest(unittest.TestCase):
+    def test_restructured_reconciliation_failure_never_falls_back_to_overwrite(self):
+        stats = workflow.TranslationStats()
+        added_files = {"guide.md": "# New source\n"}
+        full_translation_paths = {"guide.md"}
+
+        with mock.patch.object(
+            workflow, "TARGET_REPO_PATH", "/tmp/target"
+        ), mock.patch.object(
+            workflow, "read_target_file_content", return_value="# 现有译文\n"
+        ), mock.patch.object(
+            workflow, "get_source_ref_content", return_value="# Source\n"
+        ), mock.patch.object(
+            workflow, "reconcile_restructured_file", return_value=None
+        ):
+            reconciled = workflow.reconcile_restructured_files(
+                {"guide.md"},
+                added_files,
+                full_translation_paths,
+                {"mode": "commit"},
+                object(),
+                object(),
+                {"ignore_resource_card_section": False},
+                None,
+                stats,
+                set(),
+            )
+
+        self.assertEqual(reconciled, set())
+        self.assertNotIn("guide.md", added_files)
+        self.assertNotIn("guide.md", full_translation_paths)
+        self.assertEqual(1, len(stats.failed))
+        self.assertIn("declined", stats.failed[0][1])
+
     def test_local_commit_sync_falls_back_to_trans_env_for_azure(self):
         config = {
             "AI_PROVIDER": "azure",

@@ -6,7 +6,11 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from structural_reconciler import reconcile_restructured_file, split_into_blocks
+from structural_reconciler import (
+    _split_into_heading_sections,
+    reconcile_restructured_file,
+    split_into_blocks,
+)
 from diff_analyzer import detect_structural_change
 from translation_structure_validator import (
     custom_content_tag_signature,
@@ -72,6 +76,13 @@ class SplitBlocksTest(unittest.TestCase):
         # fence must NOT split it.
         self.assertEqual(len(blocks), 3)
         self.assertIn("```sql\nA\n\nB\n```", blocks[1])
+
+    def test_section_splitting_uses_validator_heading_rules(self):
+        indented = "# Title\n\n   ## CommonMark heading\n\nbody\n"
+        too_deep = "# Title\n\n####### Not an ATX heading\n\nbody\n"
+
+        self.assertEqual(len(_split_into_heading_sections(indented)), 2)
+        self.assertEqual(len(_split_into_heading_sections(too_deep)), 1)
 
 
 class ReconcilePureMoveTest(unittest.TestCase):
@@ -305,14 +316,90 @@ class ReconcileWhitespaceTest(unittest.TestCase):
 
 
 class ReconcileFallbackTest(unittest.TestCase):
-    def test_block_count_mismatch_returns_none(self):
+    def test_heading_mismatch_returns_none(self):
         base = "# A\n\nx\n\n## B\n\ny\n"
         head = "# A\n\nx\n\n## B\n\ny\n"
-        # Target merged two blocks into one -> structurally drifted.
         target = "# A\n\nx\n"
         ai = MockAI()
         out = reconcile_restructured_file("drift.md", head, base, target, ai, REPO_CONFIG, source_mode="commit")
         self.assertIsNone(out)
+
+    def test_section_count_mismatch_returns_none_after_heading_check_passes(self):
+        base = "# A\n\nx\n"
+        head = "# A\n\nx changed\n"
+        target = "目标前言\n\n# 甲\n\nx\n"
+        ai = MockAI()
+
+        out = reconcile_restructured_file(
+            "preamble-drift.md", head, base, target, ai, REPO_CONFIG,
+            source_mode="commit",
+        )
+
+        self.assertIsNone(out)
+        self.assertEqual(ai.calls, [])
+
+    def test_section_aligned_structure_self_check_failure_returns_none(self):
+        base = "# T\n\n## A\n\nA one.\n\nA two.\n"
+        head = base + "\n## B\n\nB new.\n"
+        target = "# 标题\n\n## 甲\n\n甲一。\n甲二。\n"
+
+        class BadHeadingAI(MockAI):
+            def chat_completion(self, messages, temperature=0.1):
+                self.calls.append(messages)
+                return "缺少标题的新内容。\n"
+
+        ai = BadHeadingAI()
+        out = reconcile_restructured_file(
+            "bad-output.md", head, base, target, ai, REPO_CONFIG,
+            source_mode="commit",
+        )
+
+        self.assertIsNone(out)
+        self.assertEqual(len(ai.calls), 1)
+
+    def test_section_translation_repairs_heading_level_drift(self):
+        base = "# T\n\n## A\n\nA one.\n\nA two.\n"
+        head = base + "\n## B\n\nB new.\n"
+        target = "# 标题\n\n## 甲\n\n甲一。\n甲二。\n"
+
+        class WrongLevelAI(MockAI):
+            def chat_completion(self, messages, temperature=0.1):
+                self.calls.append(messages)
+                return "### 新章节\n\n新内容。\n"
+
+        out = reconcile_restructured_file(
+            "repaired-output.md", head, base, target, WrongLevelAI(), REPO_CONFIG,
+            source_mode="commit",
+        )
+
+        self.assertIsNotNone(out)
+        self.assertIn("## 新章节", out)
+        self.assertNotIn("### 新章节", out)
+
+    def test_new_section_restores_trailing_newlines_before_next_heading(self):
+        base = (
+            "# T\n\n## A\n\nA.\n\n## C\n\nC.\n"
+        )
+        head = (
+            "# T\n\n## A\n\nA.\n\n## B\n\nB new.\n\n## C\n\nC.\n"
+        )
+        # Target-only intro forces heading-section reconciliation.
+        target = (
+            "# 标题\n\n目标简介。\n\n## 甲\n\n甲。\n\n## 丙\n\n丙。\n"
+        )
+
+        class NoTrailingNewlineAI(MockAI):
+            def chat_completion(self, messages, temperature=0.1):
+                self.calls.append(messages)
+                return "## 乙\n\n乙的新内容。"  # Deliberately no final newline.
+
+        out = reconcile_restructured_file(
+            "newline.md", head, base, target, NoTrailingNewlineAI(), REPO_CONFIG,
+            source_mode="commit",
+        )
+
+        self.assertIsNotNone(out)
+        self.assertIn("乙的新内容。\n\n## 丙", out)
 
     def test_missing_inputs_return_none(self):
         ai = MockAI()
@@ -324,10 +411,122 @@ class ReconcileFallbackTest(unittest.TestCase):
         )
 
 
+class ReconcileBlockDriftBySectionTest(unittest.TestCase):
+    def test_move_with_addition_reuses_unchanged_section_despite_block_drift(self):
+        base = (
+            "# Title\n\n"
+            "## A\n\nA source paragraph one.\n\nA source paragraph two.\n\n"
+            "## B\n\nB old.\n"
+        )
+        head = (
+            "# Title\n\n"
+            "## B\n\nB changed.\n\n"
+            "## A\n\nA source paragraph one.\n\nA source paragraph two.\n\n"
+            "## C\n\nC new.\n"
+        )
+        # Section A has one target prose block for two source prose blocks, so
+        # whole-file block parity is intentionally broken.
+        target = (
+            "# 标题\n\n"
+            "## 甲 {#a}\n\n甲译文第一段。\n甲译文第二段。\n\n"
+            "## 乙 {#b}\n\n乙的旧译文。\n"
+        )
+        ai = MockAI()
+
+        out = reconcile_restructured_file(
+            "move.md", head, base, target, ai, REPO_CONFIG, source_mode="commit"
+        )
+
+        self.assertIsNotNone(out)
+        self.assertLess(out.index("## 乙 {#b}"), out.index("## 甲 {#a}"))
+        self.assertEqual(out.count("甲译文第一段。\n甲译文第二段。"), 1)
+        self.assertTrue(any("B changed." in content for content in ai.contents()))
+        self.assertTrue(any("C new." in content for content in ai.contents()))
+        self.assertFalse(any("A source paragraph" in content for content in ai.contents()))
+
+    def test_local_block_mismatch_retranslates_only_changed_section(self):
+        base = "# Title\n\n## A\n\nA one.\n\nA two.\n\n## B\n\nB stable.\n"
+        head = "# Title\n\n## A\n\nA one changed.\n\nA two.\n\n## B\n\nB stable.\n"
+        target = "# 标题\n\n## 甲\n\n甲一。\n甲二。\n\n## 乙\n\n乙保持不变。\n"
+        ai = MockAI()
+
+        out = reconcile_restructured_file(
+            "local-drift.md", head, base, target, ai, REPO_CONFIG, source_mode="commit"
+        )
+
+        self.assertIsNotNone(out)
+        self.assertIn("## 乙\n\n乙保持不变。", out)
+        self.assertFalse(any("B stable." in content for content in ai.contents()))
+        self.assertTrue(any("A one changed." in content for content in ai.contents()))
+        self.assertNotIn("Surrounding section, for context only", ai.prompts()[0])
+
+    def test_duplicate_headings_match_exact_section_before_changed_sibling(self):
+        base = (
+            "# Title\n\n"
+            "## Note\n\nAlpha source.\n\n"
+            "## Note\n\nBeta source.\n"
+        )
+        head = (
+            "# Title\n\n"
+            "## Note\n\nBeta source revised.\n\n"
+            "## Note\n\nAlpha source.\n"
+        )
+        # The target-only intro makes global block counts differ and exercises
+        # heading-section reconciliation. The first HEAD Note corresponds to
+        # the second BASE Note, despite sharing the same heading text.
+        target = (
+            "# 标题\n\n目标简介。\n\n"
+            "## 注意\n\nAlpha 旧译文。\n\n"
+            "## 注意\n\nBeta 旧译文。\n"
+        )
+        ai = MockAI()
+
+        out = reconcile_restructured_file(
+            "duplicate.md", head, base, target, ai, REPO_CONFIG,
+            source_mode="commit",
+        )
+
+        self.assertIsNotNone(out)
+        self.assertEqual(len(ai.calls), 1)
+        prompt = ai.prompts()[0]
+        self.assertIn("Beta 旧译文。", prompt)
+        self.assertNotIn("Alpha 旧译文。", prompt)
+        self.assertIn("Alpha 旧译文。", out)
+
+
 class DetectStructuralChangeTest(unittest.TestCase):
     def test_detects_section_move(self):
         base = "# T\n\n## A\n\na\n\n## B\n\nb\n"
         head = "# T\n\n## B\n\nb\n\n## A\n\na\n"
+        self.assertTrue(detect_structural_change(base, head))
+
+    def test_detects_section_move_with_added_and_deleted_headings(self):
+        base = "# T\n\n## A\n\na\n\n## B\n\nb\n\n## Removed\n\nold\n"
+        head = "# T\n\n## B\n\nb\n\n## Added\n\nnew\n\n## A\n\na\n"
+        self.assertTrue(detect_structural_change(base, head))
+
+    def test_add_and_delete_without_reorder_is_not_structural(self):
+        base = "# T\n\n## A\n\na\n\n## Removed\n\nold\n\n## B\n\nb\n"
+        head = "# T\n\n## A\n\na\n\n## Added\n\nnew\n\n## B\n\nb\n"
+        self.assertFalse(detect_structural_change(base, head))
+
+    def test_duplicate_heading_deletion_without_reorder_is_not_structural(self):
+        base = (
+            "# T\n\n## Note\n\na\n\n## A\n\nx\n\n"
+            "## Note\n\nb\n\n## B\n\ny\n"
+        )
+        head = "# T\n\n## Note\n\na\n\n## A\n\nx\n\n## B\n\ny\n"
+        self.assertFalse(detect_structural_change(base, head))
+
+    def test_duplicate_headings_with_surviving_reorder_are_structural(self):
+        base = (
+            "# T\n\n## Note\n\na\n\n## A\n\nx\n\n"
+            "## Note\n\nb\n\n## B\n\ny\n"
+        )
+        head = (
+            "# T\n\n## B\n\ny\n\n## Note\n\na\n\n"
+            "## A\n\nx\n\n## Note\n\nb\n"
+        )
         self.assertTrue(detect_structural_change(base, head))
 
     def test_detects_customcontent_change(self):
