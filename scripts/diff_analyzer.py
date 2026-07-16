@@ -3459,6 +3459,18 @@ def analyze_source_changes(
         
         print(f"   📝 Real content changes (non-header): {sorted(real_content_changes)}")
         
+        # Identify true content modification positions: lines that have both
+        # an addition and a deletion at the same head-side position.  These
+        # represent real value changes (e.g. "64KB" → "32KiB") and must NOT
+        # be filtered by the line-shift-artifact heuristic below.
+        _added_positions = {a['line_number'] for a in operations['added_lines']}
+        _deleted_head_positions = {
+            get_head_line_number(d)
+            for d in operations['deleted_lines']
+            if get_head_line_number(d) is not None
+        }
+        real_modification_positions = _added_positions & _deleted_head_positions
+
         # Find sections that contain actual content changes
         content_affected_sections = set()
         for changed_line in real_content_changes:
@@ -3497,16 +3509,14 @@ def analyze_source_changes(
                         print(f"   ⚠️  Skipping change at line {changed_line} (exact deleted header)")
                         break
                 
-                # Skip changes that are very close to deleted content AND far from their containing section
-                # This helps filter out line shift artifacts while keeping real content changes
-                if should_include:
+                # Skip changes that are very close to deleted content AND far from their containing section.
+                # This filters line-shift artifacts but must NOT discard true in-place modifications
+                # (lines where both an add and a delete occur at the same position).
+                if should_include and changed_line not in real_modification_positions:
                     for deleted_line in operations['deleted_lines']:
                         deleted_head_line = get_head_line_number(deleted_line)
                         if deleted_head_line is None:
                             continue
-                        # Only skip if both conditions are met:
-                        # 1. Very close to deleted content (within 5 lines)
-                        # 2. The change is far from its containing section (likely a shift artifact)
                         distance_to_deletion = abs(changed_line - deleted_head_line)
                         distance_to_section = changed_line - containing_section
                         
