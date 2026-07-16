@@ -241,6 +241,124 @@ def compare_custom_content_structure(file_path, source_content, target_content):
     )
 
 
+def extract_headings_with_line_numbers(content):
+    """Extract headings with 1-based line numbers, skipping fenced code blocks.
+
+    Returns a list of ``(line_number, level, text)`` tuples.
+    """
+    headings = []
+    for line_number, line in iter_markdown_content_lines(content):
+        heading_match = HEADING_RE.match(line)
+        if heading_match:
+            headings.append(
+                (line_number, len(heading_match.group(1)), heading_match.group(2).strip())
+            )
+    return headings
+
+
+def compare_added_file_line_integrity(source_content, target_content):
+    """Check heading line positions and total line count for added-file translations.
+
+    Returns a dict with match booleans, total line counts, and a list of
+    heading position mismatches so the caller can report details.
+    """
+    source_headings = extract_headings_with_line_numbers(source_content or "")
+    target_headings = extract_headings_with_line_numbers(target_content or "")
+
+    source_total = len((source_content or "").splitlines())
+    target_total = len((target_content or "").splitlines())
+
+    mismatched_headings = []
+    max_len = max(len(source_headings), len(target_headings))
+    for i in range(max_len):
+        src = source_headings[i] if i < len(source_headings) else None
+        tgt = target_headings[i] if i < len(target_headings) else None
+
+        src_line = src[0] if src else None
+        tgt_line = tgt[0] if tgt else None
+        if src_line == tgt_line:
+            continue
+
+        mismatched_headings.append({
+            "index": i + 1,
+            "source_line": src_line,
+            "source_heading": f"{'#' * src[1]} {src[2]}" if src else "(missing)",
+            "target_line": tgt_line,
+            "target_heading": f"{'#' * tgt[1]} {tgt[2]}" if tgt else "(missing)",
+        })
+
+    return {
+        "heading_lines_match": len(mismatched_headings) == 0,
+        "total_lines_match": source_total == target_total,
+        "source_total_lines": source_total,
+        "target_total_lines": target_total,
+        "mismatched_headings": mismatched_headings,
+    }
+
+
+_RELATED_RESOURCES_HEADING_RE = re.compile(r"related\s+resources", re.IGNORECASE)
+
+
+def _section_has_resource_card_block(section_text):
+    """Return True when *section_text* contains a RelatedResources + ResourceCard block."""
+    return bool(
+        re.search(r"<RelatedResources\b", section_text)
+        and re.search(r"<ResourceCard\b", section_text)
+    )
+
+
+def strip_related_resources_sections(content):
+    """Remove Related-resources sections that contain RelatedResources/ResourceCard tags.
+
+    In commit-based mode the translation pipeline skips these sections,
+    so the verification side should strip them from the source content
+    before comparison to avoid false-positive mismatches.
+    """
+    if not content:
+        return content
+    if "<RelatedResources" not in content or "<ResourceCard" not in content:
+        return content
+
+    lines = content.splitlines()
+
+    headings = []
+    for line_number, line in iter_markdown_content_lines(content):
+        heading_match = HEADING_RE.match(line)
+        if heading_match:
+            headings.append(
+                (line_number - 1, len(heading_match.group(1)), heading_match.group(2).strip())
+            )
+
+    sections_to_remove = []
+    for idx, (line_idx, level, text) in enumerate(headings):
+        if not _RELATED_RESOURCES_HEADING_RE.search(text):
+            continue
+        section_end = len(lines)
+        for next_idx in range(idx + 1, len(headings)):
+            if headings[next_idx][1] <= level:
+                section_end = headings[next_idx][0]
+                break
+        section_text = "\n".join(lines[line_idx:section_end])
+        if _section_has_resource_card_block(section_text):
+            sections_to_remove.append((line_idx, section_end))
+
+    if not sections_to_remove:
+        return content
+
+    removed = set()
+    for start, end in sections_to_remove:
+        removed.update(range(start, end))
+
+    kept = [line for i, line in enumerate(lines) if i not in removed]
+    while kept and not kept[-1].strip():
+        kept.pop()
+
+    result = "\n".join(kept)
+    if result and content.endswith(("\n", "\r")):
+        result += "\n"
+    return result
+
+
 def validate_markdown_heading_structures(
     file_paths: Iterable[str],
     source_content_loader: Callable[[str], Optional[str]],

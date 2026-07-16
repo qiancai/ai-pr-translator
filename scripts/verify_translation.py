@@ -33,9 +33,11 @@ except ImportError:
     sys.exit("openpyxl is required: pip install openpyxl")
 
 from translation_structure_validator import (
+    compare_added_file_line_integrity,
     compare_custom_content_structure,
     compact_custom_content_tags,
     extract_custom_content_tags,
+    strip_related_resources_sections,
 )
 
 
@@ -410,11 +412,19 @@ def _structure_worker_count(total, max_workers=None):
     return min(total, configured_workers)
 
 
-def _build_heading_structure(filepath, src, tgt):
+def _build_heading_structure(filepath, src, tgt, is_added=False):
     src_headings = _extract_headings(src) if src else []
     tgt_headings = _extract_headings(tgt) if tgt else []
     src_levels = [h[0] for h in src_headings]
     tgt_levels = [h[0] for h in tgt_headings]
+
+    match = src_levels == tgt_levels
+    line_integrity = None
+
+    if is_added and src and tgt:
+        line_integrity = compare_added_file_line_integrity(src, tgt)
+        if not line_integrity["heading_lines_match"] or not line_integrity["total_lines_match"]:
+            match = False
 
     return {
         "file": filepath,
@@ -422,7 +432,9 @@ def _build_heading_structure(filepath, src, tgt):
         "target_headings": tgt_headings,
         "source_compact": _compact_structure(src_headings),
         "target_compact": _compact_structure(tgt_headings),
-        "match": src_levels == tgt_levels,
+        "match": match,
+        "is_added_file": is_added,
+        "line_integrity": line_integrity,
     }
 
 
@@ -490,13 +502,21 @@ def _custom_content_failure_row(filepath, exc):
 
 
 def _collect_document_structures(
-    filepath, source_ctx, target_ctx, github_client, include_heading
+    filepath, source_ctx, target_ctx, github_client, include_heading,
+    is_added=False, commit_based_mode=False,
 ):
     src = _fetch_content(source_ctx, filepath, github_client)
     tgt = _fetch_content(target_ctx, filepath, github_client)
+
+    if commit_based_mode and src:
+        src = strip_related_resources_sections(src)
+
     return {
         "custom_content": _build_custom_content_structure(filepath, src, tgt),
-        "heading": _build_heading_structure(filepath, src, tgt) if include_heading else None,
+        "heading": (
+            _build_heading_structure(filepath, src, tgt, is_added=is_added)
+            if include_heading else None
+        ),
     }
 
 
@@ -547,7 +567,8 @@ def collect_custom_content_structures(
 
 
 def collect_document_structures(
-    file_paths, heading_files, source_ctx, target_ctx, github_client, max_workers=None
+    file_paths, heading_files, source_ctx, target_ctx, github_client,
+    max_workers=None, source_stats=None, mode="commit-based",
 ):
     """Collect CustomContent and selected heading structures with one fetch per file."""
     file_paths = list(file_paths)
@@ -555,6 +576,13 @@ def collect_document_structures(
     total = len(file_paths)
     if not total:
         return [], []
+
+    source_stats = source_stats or {}
+    commit_based_mode = mode == "commit-based"
+    added_files = {
+        fp for fp in file_paths
+        if source_stats.get(fp, {}).get("status") == "added"
+    }
 
     worker_count = _structure_worker_count(total, max_workers)
     custom_results = [None] * total
@@ -566,7 +594,9 @@ def collect_document_structures(
             include_heading = filepath in heading_files
             try:
                 result = _collect_document_structures(
-                    filepath, source_ctx, target_ctx, github_client, include_heading
+                    filepath, source_ctx, target_ctx, github_client, include_heading,
+                    is_added=filepath in added_files,
+                    commit_based_mode=commit_based_mode,
                 )
             except Exception as exc:
                 result = {
@@ -591,6 +621,8 @@ def collect_document_structures(
                 target_ctx,
                 github_client,
                 filepath in heading_files,
+                filepath in added_files,
+                commit_based_mode,
             ): (index, filepath)
             for index, filepath in enumerate(file_paths)
         }
@@ -983,6 +1015,76 @@ def _apply_heading_col_widths(ws):
         )
 
 
+def _write_line_integrity_detail_rows(ws, row_num, file_list):
+    """Write heading-line-position and total-line-count detail for added files."""
+    headers = ["#", "Source Line", "Source Heading", "Target Line", "Target Heading", "Line Match"]
+    for hd in file_list:
+        li = hd["line_integrity"]
+
+        row_num += 1
+        file_cell = ws.cell(row=row_num, column=1, value=hd["file"])
+        file_cell.font = _FILE_FONT
+        for col in range(1, len(headers) + 1):
+            ws.cell(row=row_num, column=col).fill = _FILE_FILL
+            ws.cell(row=row_num, column=col).border = _THIN_BORDER
+        total_note = (
+            f"Source: {li['source_total_lines']} lines  |  "
+            f"Target: {li['target_total_lines']} lines"
+        )
+        if not li["total_lines_match"]:
+            total_note += "  ← TOTAL LINE COUNT MISMATCH"
+        ws.cell(row=row_num, column=len(headers), value=total_note).font = Font(
+            italic=True, size=10, color="9C0006" if not li["total_lines_match"] else "404040",
+        )
+        row_num += 1
+
+        for col, h in enumerate(headers, 1):
+            cell = ws.cell(row=row_num, column=col, value=h)
+            cell.font = _HEADER_FONT
+            cell.fill = _HEADER_FILL
+            cell.alignment = Alignment(horizontal="center")
+            cell.border = _THIN_BORDER
+        row_num += 1
+
+        for mh in li["mismatched_headings"]:
+            vals = [
+                mh["index"],
+                mh["source_line"] if mh["source_line"] is not None else "(missing)",
+                mh["source_heading"],
+                mh["target_line"] if mh["target_line"] is not None else "(missing)",
+                mh["target_heading"],
+            ]
+            for col, v in enumerate(vals, 1):
+                cell = ws.cell(row=row_num, column=col, value=v)
+                cell.border = _THIN_BORDER
+                cell.alignment = Alignment(
+                    horizontal="center" if col in (1, 2, 4) else "left",
+                    vertical="center",
+                )
+
+            match_cell = ws.cell(row=row_num, column=6)
+            match_cell.border = _THIN_BORDER
+            match_cell.alignment = Alignment(horizontal="center")
+            match_cell.value = "✗"
+            match_cell.font = _MISMATCH_FONT
+            fill = _MISSING_FILL if mh["source_line"] is None or mh["target_line"] is None else _EXCEED_FILL
+            for col in range(1, len(headers) + 1):
+                ws.cell(row=row_num, column=col).fill = fill
+            row_num += 1
+
+        if not li["mismatched_headings"] and not li["total_lines_match"]:
+            ws.cell(
+                row=row_num, column=1,
+                value="All heading line positions match, but total line count differs.",
+            ).font = Font(italic=True, size=10, color="9C0006")
+            for col in range(1, len(headers) + 1):
+                ws.cell(row=row_num, column=col).border = _THIN_BORDER
+                ws.cell(row=row_num, column=col).fill = _WITHIN_FILL
+            row_num += 1
+
+    return row_num
+
+
 def _write_heading_sheet(wb, heading_data):
     """Write the main heading-structure sheet (overview + mismatched detail)."""
     if not heading_data:
@@ -1008,7 +1110,13 @@ def _write_heading_sheet(wb, heading_data):
     row_num += 2
 
     # ── Overview table ────────────────────────────────────────────────────
-    overview_headers = ["File", "Source Headings", "Target Headings", "Source Structure", "Target Structure", "Match"]
+    has_added = any(hd.get("is_added_file") for hd in heading_data)
+    overview_headers = [
+        "File", "Source Headings", "Target Headings",
+        "Source Structure", "Target Structure", "Match",
+    ]
+    if has_added:
+        overview_headers += ["Added File", "Src Lines", "Tgt Lines", "Line Integrity"]
     for col, h in enumerate(overview_headers, 1):
         cell = ws.cell(row=row_num, column=col, value=h)
         cell.font = _HEADER_FONT
@@ -1018,6 +1126,7 @@ def _write_heading_sheet(wb, heading_data):
     row_num += 1
 
     for hd in mismatched_list + matched_list:
+        li = hd.get("line_integrity")
         vals = [
             hd["file"],
             len(hd["source_headings"]),
@@ -1026,6 +1135,17 @@ def _write_heading_sheet(wb, heading_data):
             hd["target_compact"],
             "Match" if hd["match"] else "Mismatch",
         ]
+        if has_added:
+            if hd.get("is_added_file") and li:
+                li_ok = li["heading_lines_match"] and li["total_lines_match"]
+                vals += [
+                    "Yes",
+                    li["source_total_lines"],
+                    li["target_total_lines"],
+                    "OK" if li_ok else "Mismatch",
+                ]
+            else:
+                vals += ["No", "", "", "—"]
         fill = _EXACT_FILL if hd["match"] else _EXCEED_FILL
         for col, v in enumerate(vals, 1):
             cell = ws.cell(row=row_num, column=col, value=v)
@@ -1038,6 +1158,8 @@ def _write_heading_sheet(wb, heading_data):
         row_num += 1
 
     overview_widths = [60, 16, 16, 50, 50, 12]
+    if has_added:
+        overview_widths += [12, 10, 10, 14]
     for i, w in enumerate(overview_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = max(
             ws.column_dimensions[get_column_letter(i)].width or 0, w
@@ -1052,6 +1174,24 @@ def _write_heading_sheet(wb, heading_data):
         ).font = Font(bold=True, size=12, color="9C0006")
         row_num += 1
         row_num = _write_heading_detail_rows(ws, row_num, mismatched_list)
+
+    # ── Line integrity detail for added files with mismatches ─────────────
+    li_mismatch_files = [
+        hd for hd in heading_data
+        if hd.get("is_added_file") and hd.get("line_integrity")
+        and (
+            not hd["line_integrity"]["heading_lines_match"]
+            or not hd["line_integrity"]["total_lines_match"]
+        )
+    ]
+    if li_mismatch_files:
+        row_num += 2
+        ws.cell(
+            row=row_num, column=1,
+            value=f"Added-File Line Integrity — Mismatch ({len(li_mismatch_files)} files)",
+        ).font = Font(bold=True, size=12, color="9C0006")
+        row_num += 1
+        row_num = _write_line_integrity_detail_rows(ws, row_num, li_mismatch_files)
 
     _apply_heading_col_widths(ws)
 
@@ -1312,8 +1452,14 @@ def main():
         print(f"\n[4/4] Comparing document structures for {len(md_rows)} changed markdown files...")
         md_files = [r["file"] for r in md_rows]
         exceed_files = [r["file"] for r in md_exceed]
+        added_files = [
+            r["file"] for r in md_rows
+            if source_stats.get(r["file"], {}).get("status") == "added"
+        ]
+        heading_files = list(set(exceed_files) | set(added_files))
         custom_content_data, heading_data = collect_document_structures(
-            md_files, exceed_files, source_ctx, target_ctx, github_client
+            md_files, heading_files, source_ctx, target_ctx, github_client,
+            source_stats=source_stats, mode=MODE,
         )
         custom_report_data = [
             item for item in custom_content_data
@@ -1326,12 +1472,20 @@ def main():
             f"  CustomContent structure: {custom_match} match, "
             f"{custom_mismatch} mismatch, {custom_skipped} without CustomContent"
         )
-        if md_exceed:
+        if heading_files:
             h_match = sum(1 for h in heading_data if h["match"])
             h_mismatch = len(heading_data) - h_match
             print(f"  Heading structure: {h_match} match, {h_mismatch} mismatch")
+            li_files = [h for h in heading_data if h.get("line_integrity")]
+            if li_files:
+                li_ok = sum(
+                    1 for h in li_files
+                    if h["line_integrity"]["heading_lines_match"]
+                    and h["line_integrity"]["total_lines_match"]
+                )
+                print(f"  Added-file line integrity: {li_ok}/{len(li_files)} pass")
         else:
-            print("  Heading structure: no exceed-threshold files — skipped")
+            print("  Heading structure: no exceed-threshold or added files — skipped")
     else:
         print("\n[4/4] No markdown files — skipping document structure analysis.")
 
