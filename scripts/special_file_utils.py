@@ -61,6 +61,49 @@ def is_index_file_name(filename, ignore_files=None):
     return basename == "_index.md"
 
 
+def is_learning_path_index_content(content):
+    """Return True when the _index.md content should use the special index
+    processor (snapshot-sync) instead of regular section-based translation.
+
+    Returns True when the file body (outside frontmatter and code blocks)
+    contains no markdown headings (``#``).  Heading-less _index.md files —
+    whether they use ``<LearningPathContainer>`` components or are link-only
+    landing pages — cannot be reliably processed by heading-based section
+    matching and need the dedicated snapshot-sync path.
+    """
+    if not content:
+        return False
+
+    in_frontmatter = False
+    frontmatter_fence_count = 0
+    in_code_block = False
+
+    for line in content.split("\n"):
+        stripped = line.strip()
+
+        if stripped == "---":
+            frontmatter_fence_count += 1
+            in_frontmatter = frontmatter_fence_count == 1
+            if frontmatter_fence_count == 2:
+                in_frontmatter = False
+            continue
+
+        if in_frontmatter:
+            continue
+
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_code_block = not in_code_block
+            continue
+
+        if in_code_block:
+            continue
+
+        if stripped.startswith("#"):
+            return False
+
+    return True
+
+
 def source_scope_includes_folder(folder_name, source_folder=None, source_files=None):
     """Return True when source filters include a folder path."""
     folder = _normalize_rel_path(folder_name).strip("/")

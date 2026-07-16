@@ -707,6 +707,133 @@ class TestTranslateIndexLines(unittest.TestCase):
         self.assertEqual(result, {})
 
 
+class TestIsLearningPathIndexContent(unittest.TestCase):
+    """Test content-based classification of _index.md files."""
+
+    def test_learning_path_index_detected(self):
+        from special_file_utils import is_learning_path_index_content
+
+        content = """\
+---
+title: TiDB Cloud Documentation
+hide_sidebar: true
+---
+
+<LearningPathContainer platform="tidb-cloud" title="TiDB Cloud" subTitle="A fully-managed DBaaS.">
+
+<LearningPath label="Learn" icon="cloud1">
+
+[Why TiDB Cloud](https://docs.pingcap.com/tidbcloud/tidb-cloud-intro)
+
+</LearningPath>
+
+</LearningPathContainer>"""
+        self.assertTrue(is_learning_path_index_content(content))
+
+    def test_normal_index_with_headings(self):
+        from special_file_utils import is_learning_path_index_content
+
+        content = """\
+---
+title: TiDB for AI
+summary: Build modern AI applications with TiDB.
+---
+
+# TiDB for AI
+
+TiDB is a distributed SQL database designed for modern AI applications.
+
+## Quick start
+
+| Document | Description |
+| --- | --- |
+| [Get Started](/ai/quickstart.md) | Build your first AI app. |"""
+        self.assertFalse(is_learning_path_index_content(content))
+
+    def test_empty_content(self):
+        from special_file_utils import is_learning_path_index_content
+
+        self.assertFalse(is_learning_path_index_content(""))
+        self.assertFalse(is_learning_path_index_content(None))
+
+    def test_only_headings_no_learning_path(self):
+        from special_file_utils import is_learning_path_index_content
+
+        content = "# Title\n\nSome content\n\n## Section"
+        self.assertFalse(is_learning_path_index_content(content))
+
+    def test_learning_path_with_headings_treated_as_normal(self):
+        """If a file has both LearningPathContainer AND headings,
+        it should be treated as normal (headings take priority)."""
+        from special_file_utils import is_learning_path_index_content
+
+        content = """\
+---
+title: Mixed File
+---
+
+# Overview
+
+<LearningPathContainer platform="tidb-cloud" title="TiDB Cloud">
+</LearningPathContainer>"""
+        self.assertFalse(is_learning_path_index_content(content))
+
+    def test_heading_inside_code_block_ignored(self):
+        """Headings inside code blocks should not count as real headings."""
+        from special_file_utils import is_learning_path_index_content
+
+        content = """\
+---
+title: Test
+---
+
+<LearningPathContainer platform="tidb-cloud" title="TiDB Cloud">
+
+```markdown
+# This is inside a code block
+```
+
+[Link](https://example.com)
+
+</LearningPathContainer>"""
+        self.assertTrue(is_learning_path_index_content(content))
+
+    def test_link_only_index_no_headings(self):
+        """Link-only _index.md files (like starter/_index.md) have no headings
+        and should also use the special snapshot-sync path."""
+        from special_file_utils import is_learning_path_index_content
+
+        content = """\
+---
+title: TiDB Cloud Documentation
+hide_sidebar: true
+hide_commit: true
+summary: TiDB Cloud is a fully-managed DBaaS.
+---
+
+\u00a0
+
+\u00a0
+
+[Why TiDB Cloud](https://docs.pingcap.com/tidbcloud/tidb-cloud-intro/?plan=starter)
+
+[Key Concepts](https://docs.pingcap.com/tidbcloud/key-concepts/?plan=starter)"""
+        self.assertTrue(is_learning_path_index_content(content))
+
+    def test_frontmatter_title_with_hash_not_counted(self):
+        """YAML frontmatter values are not headings."""
+        from special_file_utils import is_learning_path_index_content
+
+        content = """\
+---
+title: '# Not a heading'
+---
+
+<LearningPathContainer platform="tidb-cloud" title="TiDB Cloud">
+</LearningPathContainer>"""
+        self.assertTrue(is_learning_path_index_content(content))
+
+
 class TestSpecialFileUtils(unittest.TestCase):
     def test_is_index_file_name(self):
         from special_file_utils import is_index_file_name

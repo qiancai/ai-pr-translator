@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 from github import Github
 from log_sanitizer import sanitize_exception_message
 from section_matcher import clean_title_for_matching
-from special_file_utils import find_heading_line_indices, is_index_file_name, is_toc_file_name
+from special_file_utils import find_heading_line_indices, is_index_file_name, is_learning_path_index_content, is_toc_file_name
 from translation_structure_validator import (
     custom_content_tag_signature,
     extract_custom_content_tags,
@@ -3061,20 +3061,23 @@ def analyze_source_changes(
         is_index_file = is_index_file_name(file.filename, ignore_files)
 
         if is_index_file and source_context.get("mode") == "commit":
-            print(f"   📄 Detected _index.md file: {file.filename}")
-            try:
-                source_base_content = repository.get_contents(file.filename, ref=base_ref).decoded_content.decode('utf-8')
-            except Exception as e:
-                print(f"   ⚠️  Could not get base _index.md content: {sanitize_exception_message(e)}")
-                source_base_content = ""
+            if is_learning_path_index_content(file_content):
+                print(f"   📄 Detected LearningPath _index.md file: {file.filename}")
+                try:
+                    source_base_content = repository.get_contents(file.filename, ref=base_ref).decoded_content.decode('utf-8')
+                except Exception as e:
+                    print(f"   ⚠️  Could not get base _index.md content: {sanitize_exception_message(e)}")
+                    source_base_content = ""
 
-            index_files[file.filename] = {
-                'type': 'index',
-                'source_base_content': source_base_content,
-                'source_head_content': file_content,
-            }
-            print(f"   📄 _index.md snapshot sync queued for processing")
-            continue
+                index_files[file.filename] = {
+                    'type': 'index',
+                    'source_base_content': source_base_content,
+                    'source_head_content': file_content,
+                }
+                print(f"   📄 LearningPath _index.md snapshot sync queued for processing")
+                continue
+            else:
+                print(f"   📄 Detected normal _index.md file (has headings, no LearningPath): {file.filename} — using regular translation path")
 
         # Check if this is a special file requiring dedicated processing
         if is_keyword_file or is_toc_file:

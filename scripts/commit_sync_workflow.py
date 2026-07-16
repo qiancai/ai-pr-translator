@@ -330,8 +330,10 @@ def _process_commit_modified_file(
     if file_type == "special_file_keyword":
         return make_task_result("skipped", "Already handled in keyword step")
     if file_type == "special_file_index":
-        return make_task_result("skipped", "Already handled in _index.md step")
-    if file_type != "regular_modified":
+        thread_safe_print(
+            f"   📄 Normal _index.md file in modified_sections — processing as regular file"
+        )
+    elif file_type != "regular_modified":
         return make_task_result("failure", f"Unknown file processing type: {file_type}")
 
     if should_ignore_resource_card_section(repo_config):
