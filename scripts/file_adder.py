@@ -20,60 +20,195 @@ def thread_safe_print(*args, **kwargs):
     with print_lock:
         print(*args, **kwargs)
 
-def create_section_batches(file_content, max_lines_per_batch=200):
-    """Create batches of file content for translation, respecting section boundaries"""
-    lines = file_content.split('\n')
-    
-    # Find all section headers
+
+def _find_markdown_section_starts(lines):
+    """Return ATX heading positions, ignoring heading-like lines in code fences."""
     section_starts = []
-    for i, line in enumerate(lines):
-        line = line.strip()
-        if line.startswith('#'):
-            match = re.match(r'^(#{1,10})\s+(.+)', line)
-            if match:
-                section_starts.append(i + 1)  # 1-based line numbers
-    
-    # If no sections found, just batch by line count
-    if not section_starts:
-        batches = []
-        for i in range(0, len(lines), max_lines_per_batch):
-            batch_lines = lines[i:i + max_lines_per_batch]
-            batches.append('\n'.join(batch_lines))
-        return batches
-    
-    # Create batches respecting section boundaries
-    batches = []
-    current_batch_start = 0
-    
-    for i, section_start in enumerate(section_starts):
-        section_start_idx = section_start - 1  # Convert to 0-based
-        
-        # Check if adding this section would exceed the line limit
-        if (section_start_idx - current_batch_start) > max_lines_per_batch:
-            # Close current batch at the previous section boundary
-            if current_batch_start < section_start_idx:
-                batch_lines = lines[current_batch_start:section_start_idx]
-                batches.append('\n'.join(batch_lines))
-                current_batch_start = section_start_idx
-        
-        # If this is the last section, or the next section would create a batch too large
-        if i == len(section_starts) - 1:
-            # Add remaining content as final batch
-            batch_lines = lines[current_batch_start:]
-            batches.append('\n'.join(batch_lines))
-        else:
-            next_section_start = section_starts[i + 1] - 1  # 0-based
-            if (next_section_start - current_batch_start) > max_lines_per_batch:
-                # Close current batch at current section boundary
-                batch_lines = lines[current_batch_start:section_start_idx]
-                if batch_lines:  # Only add non-empty batches
-                    batches.append('\n'.join(batch_lines))
-                current_batch_start = section_start_idx
-    
-    # Clean up any empty batches
-    batches = [batch for batch in batches if batch.strip()]
-    
-    return batches
+    fence_character = None
+    fence_length = 0
+
+    for index, line in enumerate(lines):
+        stripped = line.lstrip()
+        fence_match = re.match(r'^(`{3,}|~{3,})', stripped)
+        if fence_match:
+            marker = fence_match.group(1)
+            if fence_character is None:
+                fence_character = marker[0]
+                fence_length = len(marker)
+            elif marker[0] == fence_character and len(marker) >= fence_length:
+                fence_character = None
+                fence_length = 0
+            continue
+
+        if fence_character is not None:
+            continue
+
+        indentation = len(line) - len(stripped)
+        if indentation <= 3 and re.match(r'^#{1,6}\s+\S', stripped):
+            section_starts.append(index)
+
+    return section_starts
+
+
+def _find_safe_blank_line_boundaries(lines, start, end):
+    """Find paragraph boundaries outside fenced code within lines[start:end]."""
+    boundaries = []
+    fence_character = None
+    fence_length = 0
+
+    for index in range(start, end):
+        stripped = lines[index].lstrip()
+        fence_match = re.match(r'^(`{3,}|~{3,})', stripped)
+        if fence_match:
+            marker = fence_match.group(1)
+            if fence_character is None:
+                fence_character = marker[0]
+                fence_length = len(marker)
+            elif marker[0] == fence_character and len(marker) >= fence_length:
+                fence_character = None
+                fence_length = 0
+            continue
+
+        boundary = index + 1
+        if fence_character is None and not stripped and start < boundary < end:
+            boundaries.append(boundary)
+
+    return boundaries
+
+
+def _split_oversized_range_at_blank_lines(lines, start, end, max_lines):
+    """Split an oversized range at the nearest safe paragraph boundaries."""
+    if end - start <= max_lines:
+        return [(start, end)]
+
+    boundaries = _find_safe_blank_line_boundaries(lines, start, end)
+    if not boundaries:
+        return [(start, end)]
+
+    ranges = []
+    current_start = start
+    while end - current_start > max_lines:
+        target = current_start + max_lines
+        candidates = [boundary for boundary in boundaries if boundary > current_start]
+        if not candidates:
+            break
+        split_at = min(candidates, key=lambda boundary: abs(boundary - target))
+        ranges.append((current_start, split_at))
+        current_start = split_at
+
+    if current_start < end:
+        ranges.append((current_start, end))
+    return ranges
+
+
+def create_section_batches(file_content, max_lines_per_batch=200):
+    """Create batches of file content for translation, respecting section boundaries.
+
+    Prefer real Markdown section headings. If one section is itself oversized,
+    split it only at a blank line outside fenced code, never at an arbitrary line.
+    """
+    lines = file_content.split('\n')
+    total_lines = len(lines)
+    heading_indices = _find_markdown_section_starts(lines)
+
+    raw_batches = []
+    if heading_indices:
+        # The normal path closes batches only at real section headings.
+        batch_start = 0
+        for idx, heading_pos in enumerate(heading_indices):
+            if heading_pos <= batch_start:
+                continue
+            look_ahead_end = (
+                heading_indices[idx + 1]
+                if idx + 1 < len(heading_indices)
+                else total_lines
+            )
+            if look_ahead_end - batch_start > max_lines_per_batch:
+                raw_batches.append((batch_start, heading_pos))
+                batch_start = heading_pos
+
+        if batch_start < total_lines:
+            raw_batches.append((batch_start, total_lines))
+    elif file_content.strip():
+        raw_batches.append((0, total_lines))
+
+    safe_batches = []
+    for start, end in raw_batches:
+        safe_batches.extend(
+            _split_oversized_range_at_blank_lines(
+                lines,
+                start,
+                end,
+                max_lines_per_batch,
+            )
+        )
+
+    return [
+        '\n'.join(lines[start:end])
+        for start, end in safe_batches
+        if '\n'.join(lines[start:end]).strip()
+    ]
+
+
+def ensure_blank_lines_before_headings(content):
+    """Ensure every markdown heading (lines starting with #) is preceded by a blank line.
+
+    AI translations sometimes omit the blank line that Markdown best-practice
+    requires before a heading, especially at batch boundaries.  This function
+    adds one where missing while leaving already-correct spacing untouched.
+    """
+    if not content:
+        return content
+    content_lines = content.split('\n')
+    heading_indices = set(_find_markdown_section_starts(content_lines))
+    result_lines = []
+    for index, line in enumerate(content_lines):
+        if index in heading_indices and result_lines:
+            prev = result_lines[-1]
+            if prev.strip():
+                result_lines.append('')
+        result_lines.append(line)
+    return '\n'.join(result_lines)
+
+
+def _join_translated_batches(source_batches, translated_batches):
+    """Join translations without losing blank paragraph boundaries from source."""
+    if not translated_batches:
+        return ""
+
+    combined = translated_batches[0]
+    for index, translated_batch in enumerate(translated_batches[1:], start=1):
+        source_has_blank_boundary = source_batches[index - 1].endswith('\n')
+        trailing_newlines = len(combined) - len(combined.rstrip('\n'))
+        leading_newlines = len(translated_batch) - len(translated_batch.lstrip('\n'))
+        required_newlines = 2 if source_has_blank_boundary else 1
+        separator_length = max(
+            0,
+            required_newlines - trailing_newlines - leading_newlines,
+        )
+        combined += '\n' * separator_length + translated_batch
+
+    return combined
+
+
+def strip_ai_markdown_wrapper(text):
+    """Strip markdown code-fence wrappers the AI sometimes adds around its response."""
+    if not text:
+        return text
+    stripped = text.strip()
+    if stripped.startswith('```'):
+        first_nl = stripped.find('\n')
+        if first_nl == -1:
+            return stripped
+        header = stripped[:first_nl].strip().lstrip('`').strip()
+        if not header or header.lower() in ('markdown', 'md', 'text', 'txt'):
+            stripped = stripped[first_nl + 1:]
+            if stripped.rstrip().endswith('```'):
+                stripped = stripped.rstrip()
+                stripped = stripped[:-3].rstrip('\n')
+            return stripped
+    return text
+
 
 def preprocess_added_file_batch_for_heading_anchor_stability(batch_content, source_language, target_language, source_mode=""):
     """Add prompt-only stability tweaks for commit-based English -> non-English file additions."""
@@ -235,11 +370,14 @@ Glossary for terms in {source_language} and {target_language}:
             print(f"      📝 Input: {char_count:,} characters")
             print(f"      🔢 Estimated tokens: ~{estimated_tokens:,} (fallback: 4 chars/token approximation)")
     
+    source_line_count = len(batch_content.split('\n'))
+
     try:
         translated_content = ai_client.chat_completion(
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1
         )
+        translated_content = strip_ai_markdown_wrapper(translated_content)
         translated_content = restore_svgs(translated_content, svg_map)
         translated_content = rewrite_tidb_version_anchors_in_text(
             translated_content,
@@ -247,6 +385,15 @@ Glossary for terms in {source_language} and {target_language}:
             target_language,
             source_mode=source_mode,
         )
+
+        translated_line_count = len(translated_content.split('\n'))
+        if translated_line_count < source_line_count * 0.6:
+            thread_safe_print(
+                f"   ⚠️  Translated batch has significantly fewer lines "
+                f"({translated_line_count}) than source ({source_line_count}). "
+                f"The AI response may have been truncated."
+            )
+
         thread_safe_print(f"   ✅ Batch translation completed")
         return translated_content
         
@@ -325,9 +472,10 @@ def process_added_files(
             )
             translated_batches.append(translated_batch)
         
-        # Combine translated batches
-        translated_content = '\n'.join(translated_batches)
-        
+        # Combine translated batches while preserving source paragraph boundaries.
+        translated_content = _join_translated_batches(batches, translated_batches)
+        translated_content = ensure_blank_lines_before_headings(translated_content)
+
         # Write translated content to target file
         try:
             with open(target_file_path, 'w', encoding='utf-8') as f:

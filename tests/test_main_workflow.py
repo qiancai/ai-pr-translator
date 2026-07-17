@@ -1,4 +1,6 @@
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -15,6 +17,22 @@ import main_workflow_local
 
 
 class MainWorkflowImageOnlyPrTest(unittest.TestCase):
+    def test_unknown_provider_does_not_break_module_import(self):
+        env = os.environ.copy()
+        env["AI_PROVIDER"] = "azureopenai"
+        env["PYTHONPATH"] = str(SCRIPTS_DIR)
+
+        result = subprocess.run(
+            [sys.executable, "-c", "import main_workflow"],
+            cwd=SCRIPTS_DIR,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_local_workflow_infers_target_pr_url(self):
         docs_target = main_workflow_local._target_for_source_pr(
             "https://github.com/pingcap/docs/pull/22655"

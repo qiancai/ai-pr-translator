@@ -31,7 +31,7 @@ os.environ.setdefault(
 )
 
 # Import all modules
-from ai_client import UnifiedAIClient, thread_safe_print, print_lock, PROVIDER_MAX_TOKENS
+from ai_client import UnifiedAIClient, get_provider_max_tokens, thread_safe_print, print_lock
 from diff_analyzer import (
     analyze_source_changes,
     build_diff_text,
@@ -66,7 +66,6 @@ TERMS_PATH = os.getenv("TERMS_PATH", "")
 # Processing limit configuration
 MAX_NON_SYSTEM_SECTIONS_FOR_AI = 120
 SOURCE_TOKEN_LIMIT = 50000  # Maximum tokens for source new_content before skipping file processing
-AI_MAX_TOKENS = PROVIDER_MAX_TOKENS.get(AI_PROVIDER, 8192)
 
 # Special file configuration
 SPECIAL_FILES = ["TOC.md", "keywords.md"]
@@ -508,7 +507,7 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, so
             ai_client, 
             repo_config, 
             max_sections,
-            AI_MAX_TOKENS,
+            get_provider_max_tokens(AI_PROVIDER),
             source_mode=source_mode,
             source_hierarchy_provider=load_source_hierarchy_context,
         )

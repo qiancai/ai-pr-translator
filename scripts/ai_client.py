@@ -59,10 +59,10 @@ AZURE_OPENAI_MODEL_NAME   = os.getenv("AZURE_OPENAI_MODEL_NAME", "gpt-5.4")
 # ---------------------------------------------------------------------------
 # Provider-specific output-token limits
 # ---------------------------------------------------------------------------
-AI_MAX_TOKENS_DEEPSEEK = 8192
+AI_MAX_TOKENS_DEEPSEEK = 8192   # deepseek-chat API maximum
 AI_MAX_TOKENS_GEMINI   = 8192
-AI_MAX_TOKENS_OPENAI   = 16384
-AI_MAX_TOKENS_AZURE    = 16384
+AI_MAX_TOKENS_OPENAI   = 32768  # gpt-4.1 API maximum
+AI_MAX_TOKENS_AZURE    = 65536  # Conservative ceiling for gpt-5.4 (128K maximum)
 
 PROVIDER_MAX_TOKENS = {
     "deepseek": AI_MAX_TOKENS_DEEPSEEK,
@@ -70,6 +70,14 @@ PROVIDER_MAX_TOKENS = {
     "openai":   AI_MAX_TOKENS_OPENAI,
     "azure":    AI_MAX_TOKENS_AZURE,
 }
+
+
+def get_provider_max_tokens(provider):
+    """Return the configured output-token budget for a supported provider."""
+    try:
+        return PROVIDER_MAX_TOKENS[provider]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported AI provider: {provider}") from exc
 
 # ---------------------------------------------------------------------------
 # Gemini rate-limiting state
@@ -147,6 +155,13 @@ class UnifiedAIClient:
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
+            finish_reason = getattr(response.choices[0], "finish_reason", None)
+            if finish_reason == "length":
+                thread_safe_print(
+                    f"   ⚠️  AI response truncated (finish_reason='length'). "
+                    f"Output hit the {max_tokens}-token limit. "
+                    f"Consider reducing batch size."
+                )
             return response.choices[0].message.content.strip()
 
         elif self.provider == "azure":
@@ -178,7 +193,21 @@ class UnifiedAIClient:
             kwargs["instructions"] = instructions
 
         response = self.client.responses.create(**kwargs)
-        return response.output_text.strip()
+        status = getattr(response, "status", None)
+        if status == "incomplete":
+            incomplete_details = getattr(response, "incomplete_details", None)
+            reason = getattr(incomplete_details, "reason", "unknown") if incomplete_details else "unknown"
+            thread_safe_print(
+                f"   ⚠️  Azure AI response incomplete (reason='{reason}'). "
+                f"Output may have hit the {max_tokens}-token limit. "
+                f"Consider reducing batch size."
+            )
+        output_text = getattr(response, "output_text", None)
+        if not output_text:
+            raise RuntimeError(
+                f"Azure AI response did not include output text (status='{status or 'unknown'}')"
+            )
+        return output_text.strip()
 
     # -----------------------------------------------------------------------
     def _gemini_chat(self, messages):
