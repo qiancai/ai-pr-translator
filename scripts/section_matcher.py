@@ -1914,10 +1914,11 @@ def extract_target_section_content(target_line_num, target_lines):
         for i in range(start_line + 1, len(target_lines)):
             raw_line = target_lines[i]
             line = raw_line.strip()
-            if line.startswith('```') or line.startswith('~~~'):
+            fm = re.match(r'^(`{3,}|~{3,})', line)
+            if fm:
                 if not in_code_block:
                     in_code_block = True
-                    code_block_delimiter = line[:3]
+                    code_block_delimiter = fm.group(1)
                 elif line.startswith(code_block_delimiter):
                     in_code_block = False
                     code_block_delimiter = None
@@ -1932,10 +1933,11 @@ def extract_target_section_content(target_line_num, target_lines):
         for i in range(start_line + 1, len(target_lines)):
             raw_line = target_lines[i]
             line = raw_line.strip()
-            if line.startswith('```') or line.startswith('~~~'):
+            fm = re.match(r'^(`{3,}|~{3,})', line)
+            if fm:
                 if not in_code_block:
                     in_code_block = True
-                    code_block_delimiter = line[:3]
+                    code_block_delimiter = fm.group(1)
                 elif line.startswith(code_block_delimiter):
                     in_code_block = False
                     code_block_delimiter = None
@@ -1973,10 +1975,11 @@ def extract_section_direct_content(target_line_num, target_lines):
     for i in range(start_line + 1, len(target_lines)):
         raw_line = target_lines[i]
         line = raw_line.strip()
-        if line.startswith('```') or line.startswith('~~~'):
+        fm = re.match(r'^(`{3,}|~{3,})', line)
+        if fm:
             if not in_code_block:
                 in_code_block = True
-                code_block_delimiter = line[:3]
+                code_block_delimiter = fm.group(1)
             elif line.startswith(code_block_delimiter):
                 in_code_block = False
                 code_block_delimiter = None

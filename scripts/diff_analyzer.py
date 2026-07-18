@@ -653,6 +653,7 @@ def analyze_diff_operations(file):
     
     patch = file.patch
     if not patch:
+        print(f"   ⚠️  Patch is empty for {getattr(file, 'filename', '?')}; file may exceed GitHub's diff size limit and will not be processed.")
         return operations
     
     lines = patch.split('\n')
@@ -661,17 +662,21 @@ def analyze_diff_operations(file):
     
     # Parse diff and keep track of sequence order for better modification detection
     diff_sequence = []  # Track the order of operations in diff
+    in_hunk = False  # Track whether we've seen the first @@ hunk header
     
     for i, line in enumerate(lines):
         if line.startswith('@@'):
             # Parse the hunk header to get line numbers
             # Format: @@ -old_start,old_count +new_start,new_count @@
+            in_hunk = True
             match = re.search(r'-(\d+),?(\d+)?\s+\+(\d+),?(\d+)?', line)
             if match:
                 deleted_line = int(match.group(1))
                 current_line = int(match.group(3))
-        elif line.startswith('+') and not line.startswith('+++'):
-            # This is an added line
+        elif not in_hunk:
+            # Skip file-level headers (--- a/file, +++ b/file) before first hunk
+            continue
+        elif line.startswith('+'):
             added_entry = {
                 'line_number': current_line,
                 'content': line[1:],  # Remove the '+' prefix
@@ -681,8 +686,7 @@ def analyze_diff_operations(file):
             operations['added_lines'].append(added_entry)
             diff_sequence.append(('added', added_entry))
             current_line += 1
-        elif line.startswith('-') and not line.startswith('---'):
-            # This is a deleted line
+        elif line.startswith('-'):
             deleted_entry = {
                 'line_number': deleted_line,
                 'head_line_number': current_line,
@@ -1248,14 +1252,13 @@ def build_hierarchy_dict(file_content):
         line = line.strip()
         
         # Check for code block delimiters
-        if line.startswith('```') or line.startswith('~~~'):
+        fence_marker = get_fence_marker(line)
+        if fence_marker:
             if not in_code_block:
-                # Entering a code block
                 in_code_block = True
-                code_block_delimiter = line[:3]  # Store the delimiter type
+                code_block_delimiter = fence_marker
                 continue
             elif line.startswith(code_block_delimiter):
-                # Exiting a code block
                 in_code_block = False
                 code_block_delimiter = None
                 continue
@@ -1680,10 +1683,11 @@ def extract_section_content(lines, start_line, hierarchy_dict):
             raw_line = lines[i]
             line = raw_line.strip()
 
-            if line.startswith('```') or line.startswith('~~~'):
+            fm = get_fence_marker(line)
+            if fm:
                 if not in_code_block:
                     in_code_block = True
-                    code_block_delimiter = line[:3]
+                    code_block_delimiter = fm
                 elif line.startswith(code_block_delimiter):
                     in_code_block = False
                     code_block_delimiter = None
@@ -1708,10 +1712,11 @@ def extract_section_content(lines, start_line, hierarchy_dict):
             raw_line = lines[i]
             line = raw_line.strip()
 
-            if line.startswith('```') or line.startswith('~~~'):
+            fm = get_fence_marker(line)
+            if fm:
                 if not in_code_block:
                     in_code_block = True
-                    code_block_delimiter = line[:3]
+                    code_block_delimiter = fm
                 elif line.startswith(code_block_delimiter):
                     in_code_block = False
                     code_block_delimiter = None
@@ -1755,10 +1760,11 @@ def extract_section_direct_content(lines, start_line):
         raw_line = lines[i]
         line = raw_line.strip()
 
-        if line.startswith('```') or line.startswith('~~~'):
+        fm = get_fence_marker(line)
+        if fm:
             if not in_code_block:
                 in_code_block = True
-                code_block_delimiter = line[:3]
+                code_block_delimiter = fm
             elif line.startswith(code_block_delimiter):
                 in_code_block = False
                 code_block_delimiter = None
@@ -3319,14 +3325,13 @@ def analyze_source_changes(
             line = line.strip()
             
             # Check for code block delimiters
-            if line.startswith('```') or line.startswith('~~~'):
+            fence_marker = get_fence_marker(line)
+            if fence_marker:
                 if not in_code_block:
-                    # Entering a code block
                     in_code_block = True
-                    code_block_delimiter = line[:3]
+                    code_block_delimiter = fence_marker
                     continue
                 elif line.startswith(code_block_delimiter):
-                    # Exiting a code block
                     in_code_block = False
                     code_block_delimiter = None
                     continue
@@ -3615,7 +3620,7 @@ def analyze_source_changes(
         temp_dir = os.path.join(script_dir, "temp_output")
         os.makedirs(temp_dir, exist_ok=True)
         
-        file_prefix = file.filename.replace('/', '-').replace('.md', '')
+        file_prefix = (file.filename[:-3] if file.filename.endswith('.md') else file.filename).replace('/', '--')
         output_file = os.path.join(temp_dir, f"{file_prefix}-source-diff-dict.json")
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(source_diff_dict, f, ensure_ascii=False, indent=2)

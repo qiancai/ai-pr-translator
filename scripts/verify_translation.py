@@ -243,8 +243,11 @@ def _git_numstat(repo_path, base, head):
             continue
         add_str, del_str, filename = parts[0], parts[1], parts[2]
         if "=>" in filename:
-            filename = filename.split("=>")[-1].strip().rstrip("}")
-            filename = filename.lstrip()
+            m = re.match(r'^(.*?)\{.* => (.*?)\}(.*)$', filename)
+            if m:
+                filename = (m.group(1) + m.group(2) + m.group(3)).strip()
+            else:
+                filename = filename.split("=>")[-1].strip()
         additions = int(add_str) if add_str != "-" else 0
         deletions = int(del_str) if del_str != "-" else 0
         stats[filename] = {

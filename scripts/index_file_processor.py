@@ -238,11 +238,16 @@ def plan_synced_index_lines(
     planned_lines = []
     lines_to_translate = []
 
+    fm_lengths_match = len(base_fm_lines) == len(head_fm_lines)
+
     for line_idx, source_line in enumerate(source_head_lines):
         if head_fm_end >= 0 and line_idx <= head_fm_end:
-            base_fm_line = base_fm_lines[line_idx] if line_idx < len(base_fm_lines) else None
-            if base_fm_line == source_line and target_fm_end >= 0 and line_idx < len(target_fm_lines):
-                planned_lines.append(target_fm_lines[line_idx])
+            if fm_lengths_match:
+                base_fm_line = base_fm_lines[line_idx] if line_idx < len(base_fm_lines) else None
+                if base_fm_line == source_line and target_fm_end >= 0 and line_idx < len(target_fm_lines):
+                    planned_lines.append(target_fm_lines[line_idx])
+                else:
+                    planned_lines.append(source_line)
             else:
                 planned_lines.append(source_line)
             continue
@@ -428,9 +433,7 @@ def process_index_file_by_source_snapshot(
             f"   ℹ️  Target file does not exist; will translate from scratch: {file_path}"
         )
 
-    if not target_content.strip():
-        target_content = source_base_content or ""
-    else:
+    if target_content.strip():
         target_content = localize_docs_absolute_links(
             target_content,
             repo_config.get("target_language"),

@@ -44,7 +44,7 @@ from diff_analyzer import (
 from image_processor import process_all_images
 from file_adder import process_added_files
 from file_deleter import process_deleted_files
-from file_updater import process_files_in_batches, process_added_sections, process_modified_sections, process_deleted_sections
+from file_updater import process_files_in_batches, process_added_sections, process_modified_sections
 from toc_processor import process_toc_file
 from keword_processor import process_keyword_file
 from section_matcher import match_source_diff_to_target
@@ -437,7 +437,7 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, so
         
         # Load source-diff-dict.json with file prefix
         temp_dir = ensure_temp_output_dir()
-        file_prefix = source_file_path.replace('/', '-').replace('.md', '')
+        file_prefix = (source_file_path[:-3] if source_file_path.endswith('.md') else source_file_path).replace('/', '--')
         source_diff_dict_file = os.path.join(temp_dir, f"{file_prefix}-source-diff-dict.json")
         if os.path.exists(source_diff_dict_file):
             with open(source_diff_dict_file, 'r', encoding='utf-8') as f:
@@ -519,7 +519,7 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, so
         thread_safe_print(f"   ✅ Matched {len(enhanced_sections)} sections")
         
         # Save the match result for reference
-        match_file = os.path.join(temp_dir, f"{source_file_path.replace('/', '-').replace('.md', '')}-match_source_diff_to_target.json")
+        match_file = os.path.join(temp_dir, f"{(source_file_path[:-3] if source_file_path.endswith('.md') else source_file_path).replace('/', '--')}-match_source_diff_to_target.json")
         with open(match_file, 'w', encoding='utf-8') as f:
             json.dump(enhanced_sections, f, ensure_ascii=False, indent=2)
         thread_safe_print(f"   💾 Saved match result to: {match_file}")
@@ -879,7 +879,7 @@ def main():
         thread_safe_print(f"   TARGET_PR_URL: {TARGET_PR_URL}")
         thread_safe_print(f"   GITHUB_TOKEN: {'Set' if GITHUB_TOKEN else 'Not set'}")
         thread_safe_print(f"   TARGET_REPO_PATH: {TARGET_REPO_PATH}")
-        return
+        sys.exit(1)
     
     thread_safe_print(f"🔧 Auto PR Sync Tool (GitHub Workflow Version)")
     thread_safe_print(f"📍 Source PR URL: {SOURCE_PR_URL}")
@@ -907,7 +907,7 @@ def main():
         thread_safe_print(f"📁 Target Path: {workflow_repo_config['target_local_path']}")
     except ValueError as e:
         thread_safe_print(f"❌ {sanitize_exception_message(e)}")
-        return
+        sys.exit(1)
     
     # Initialize clients
     auth = Auth.Token(GITHUB_TOKEN)
@@ -919,7 +919,7 @@ def main():
         thread_safe_print(f"🤖 AI Provider: {AI_PROVIDER.upper()} ({ai_client.model})")
     except Exception as e:
         thread_safe_print(f"❌ Failed to initialize AI client: {sanitize_exception_message(e)}")
-        return
+        sys.exit(1)
     
     # Load glossary and create matcher for term-aware translation
     terms_path = TERMS_PATH
@@ -939,7 +939,7 @@ def main():
         source_context = build_pr_diff_context(SOURCE_PR_URL, github_client, repo_configs)
     except Exception as e:
         thread_safe_print(f"❌ Could not build source diff context: {sanitize_exception_message(e)}")
-        return
+        sys.exit(1)
     repo_config = source_context["repo_config"]
     pr_diff = build_diff_text(source_context["changed_files"])
     thread_safe_print(f"📋 Source diff: {source_context['source_description']}")
@@ -1011,7 +1011,9 @@ def main():
     # Step 3.1: Process deleted files (file-level deletions)
     if deleted_files:
         thread_safe_print(f"\n🗑️  Step 3.1: Processing {len(deleted_files)} deleted files...")
-        process_deleted_files(deleted_files, github_client, repo_config)
+        delete_success = process_deleted_files(deleted_files, github_client, repo_config)
+        if not delete_success:
+            thread_safe_print(f"   ⚠️  Some file deletions failed")
         thread_safe_print(f"   ✅ Deleted files processed")
         git_add_changes(TARGET_REPO_PATH)
     
@@ -1112,7 +1114,7 @@ def main():
                 reason = result["error"] or (result["result"] or {}).get("reason") or "Keyword processor returned failure"
                 thread_safe_print(f"   ❌ Failed to process keyword file {result['file_path']}: {reason}")
             thread_safe_print("   ❌ Keyword files processing failed, exiting workflow")
-            return
+            sys.exit(1)
         thread_safe_print(f"   ✅ Keyword files processed")
         git_add_successful_task_changes(keyword_results, TARGET_REPO_PATH)
     
@@ -1138,7 +1140,7 @@ def main():
                 make_file_task(
                     source_file_path,
                     run_modified_file,
-                    resource_key=source_file_path.replace('/', '-').replace('.md', ''),
+                    resource_key=(source_file_path[:-3] if source_file_path.endswith('.md') else source_file_path).replace('/', '--'),
                 )
             )
 
@@ -1184,4 +1186,10 @@ def main():
     thread_safe_print(f"🎉 Workflow completed successfully!")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:
+        thread_safe_print(f"❌ Unhandled exception: {sanitize_exception_message(e)}")
+        sys.exit(1)

@@ -218,16 +218,23 @@ def reconcile_version_mark_only_change(
 
     translated_inner = _deterministic_version_mark_inner(change)
     if translated_inner is None:
-        translated_inner = translate_file_batch(
-            change["head_inner"],
-            ai_client,
-            source_language,
-            target_language,
-            glossary_matcher=glossary_matcher,
-            source_mode=source_mode,
-            context_reference=head_content,
-            prior_translation_reference=change["target_inner"],
-        ).strip()
+        try:
+            translated_inner = translate_file_batch(
+                change["head_inner"],
+                ai_client,
+                source_language,
+                target_language,
+                glossary_matcher=glossary_matcher,
+                source_mode=source_mode,
+                context_reference=head_content,
+                prior_translation_reference=change["target_inner"],
+            ).strip()
+        except Exception as exc:
+            thread_safe_print(
+                f"   ⚠️  Reconciler: version-mark span translation failed "
+                f"({exc.__class__.__name__}); falling back to normal section translation"
+            )
+            return None
         # The model receives inner text, not markup. If it nevertheless emits a
         # span or changes a single-line marker into multiple lines, let the
         # caller use the normal guarded path instead of creating invalid HTML.

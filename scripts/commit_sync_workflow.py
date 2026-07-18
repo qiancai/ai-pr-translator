@@ -1585,7 +1585,9 @@ def process_translation_group(
 
     if deleted_files:
         thread_safe_print(f"\n🗑️  Processing {len(deleted_files)} deleted files...")
-        process_deleted_files(deleted_files, github_client, repo_config)
+        delete_success = process_deleted_files(deleted_files, github_client, repo_config)
+        if not delete_success:
+            thread_safe_print(f"   ⚠️  Some file deletions failed")
         git_add_changes(TARGET_REPO_PATH)
 
     if added_files:

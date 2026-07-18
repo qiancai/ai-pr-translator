@@ -257,15 +257,15 @@ class UnifiedAIClient:
                 thread_safe_print("   ✅ Gemini response received")
                 return response.text.strip()
 
-            thread_safe_print("   ⚠️  Gemini response was empty or blocked")
-            return "No response from Gemini"
-
         except Exception as e:
             thread_safe_print(f"   ❌ Gemini API error: {sanitize_exception_message(e)}")
             thread_safe_print(
                 "   💡 Consider switching to DeepSeek: AI_PROVIDER = 'deepseek'"
             )
             raise
+
+        thread_safe_print("   ⚠️  Gemini response was empty or blocked")
+        raise RuntimeError("Gemini returned an empty or blocked response")
 
     # -----------------------------------------------------------------------
     @staticmethod

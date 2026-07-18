@@ -9,7 +9,7 @@ import json
 import threading
 from github import Github
 from openai import OpenAI
-from log_sanitizer import sanitize_exception_message
+from log_sanitizer import sanitize_exception_message, safe_target_path
 from product_specific_handler import rewrite_tidb_version_anchors_in_text
 from svg_preprocessor import strip_svgs, restore_svgs
 
@@ -372,34 +372,29 @@ Glossary for terms in {source_language} and {target_language}:
     
     source_line_count = len(batch_content.split('\n'))
 
-    try:
-        translated_content = ai_client.chat_completion(
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1
-        )
-        translated_content = strip_ai_markdown_wrapper(translated_content)
-        translated_content = restore_svgs(translated_content, svg_map)
-        translated_content = rewrite_tidb_version_anchors_in_text(
-            translated_content,
-            source_language,
-            target_language,
-            source_mode=source_mode,
+    translated_content = ai_client.chat_completion(
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.1
+    )
+    translated_content = strip_ai_markdown_wrapper(translated_content)
+    translated_content = restore_svgs(translated_content, svg_map)
+    translated_content = rewrite_tidb_version_anchors_in_text(
+        translated_content,
+        source_language,
+        target_language,
+        source_mode=source_mode,
+    )
+
+    translated_line_count = len(translated_content.split('\n'))
+    if translated_line_count < source_line_count * 0.6:
+        thread_safe_print(
+            f"   ⚠️  Translated batch has significantly fewer lines "
+            f"({translated_line_count}) than source ({source_line_count}). "
+            f"The AI response may have been truncated."
         )
 
-        translated_line_count = len(translated_content.split('\n'))
-        if translated_line_count < source_line_count * 0.6:
-            thread_safe_print(
-                f"   ⚠️  Translated batch has significantly fewer lines "
-                f"({translated_line_count}) than source ({source_line_count}). "
-                f"The AI response may have been truncated."
-            )
-
-        thread_safe_print(f"   ✅ Batch translation completed")
-        return translated_content
-        
-    except Exception as e:
-        thread_safe_print(f"   ❌ Batch translation failed: {sanitize_exception_message(e)}")
-        return batch_content  # Return original content if translation fails
+    thread_safe_print(f"   ✅ Batch translation completed")
+    return translated_content
 
 def process_added_files(
     added_files,
@@ -434,7 +429,14 @@ def process_added_files(
         thread_safe_print(f"\n📝 Processing new file: {file_path}")
         
         # Create target file path
-        target_file_path = os.path.join(target_local_path, file_path)
+        try:
+            target_file_path = safe_target_path(target_local_path, file_path)
+        except ValueError as e:
+            reason = sanitize_exception_message(e)
+            thread_safe_print(f"   ❌ {reason}")
+            failure_reasons[file_path] = reason
+            all_success = False
+            continue
         target_dir = os.path.dirname(target_file_path)
         
         # Create directory if it doesn't exist
@@ -460,17 +462,29 @@ def process_added_files(
         
         # Translate each batch
         translated_batches = []
+        translation_failed = False
         for i, batch in enumerate(batches):
             thread_safe_print(f"   🔄 Processing batch {i+1}/{len(batches)}")
-            translated_batch = translate_file_batch(
-                batch, 
-                ai_client, 
-                source_language, 
-                target_language,
-                glossary_matcher=glossary_matcher,
-                source_mode=source_mode,
-            )
+            try:
+                translated_batch = translate_file_batch(
+                    batch, 
+                    ai_client, 
+                    source_language, 
+                    target_language,
+                    glossary_matcher=glossary_matcher,
+                    source_mode=source_mode,
+                )
+            except Exception as e:
+                reason = f"Translation failed for {file_path} batch {i+1}: {sanitize_exception_message(e)}"
+                thread_safe_print(f"   ❌ {reason}")
+                failure_reasons[file_path] = reason
+                all_success = False
+                translation_failed = True
+                break
             translated_batches.append(translated_batch)
+
+        if translation_failed:
+            continue
         
         # Combine translated batches while preserving source paragraph boundaries.
         translated_content = _join_translated_batches(batches, translated_batches)

@@ -12,7 +12,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from github import Github
 from openai import OpenAI
-from log_sanitizer import sanitize_exception_message
+from log_sanitizer import sanitize_exception_message, safe_target_path
 from product_specific_handler import rewrite_tidb_version_anchors_in_sections
 from special_file_utils import source_scope_includes_folder
 from svg_preprocessor import (
@@ -1451,7 +1451,7 @@ def replace_toplevel_section_content(lines, target_line_num, new_content):
 
 def update_local_document(file_path, updated_sections, hierarchy_dict, target_local_path):
     """Update local document using hierarchy-based section identification (from update-target-doc-v2.py)"""
-    local_path = os.path.join(target_local_path, file_path)
+    local_path = safe_target_path(target_local_path, file_path)
     
     if not os.path.exists(local_path):
         print(f"   ❌ Local file not found: {local_path}")
@@ -1487,7 +1487,7 @@ def update_local_document(file_path, updated_sections, hierarchy_dict, target_lo
                 replacement_plan.append({
                     'type': 'frontmatter',
                     'start': 0,
-                    'end': first_header_idx if first_header_idx else len(lines),
+                    'end': first_header_idx if first_header_idx is not None else len(lines),
                     'new_content': new_content,
                     'line_num': line_num
                 })
@@ -1607,10 +1607,11 @@ def find_section_boundaries(lines, hierarchy_dict):
             raw_line = lines[j]
             line = raw_line.strip()
 
-            if line.startswith('```') or line.startswith('~~~'):
+            fence_match = re.match(r'^(`{3,}|~{3,})', line)
+            if fence_match:
                 if not in_code_block:
                     in_code_block = True
-                    code_block_delimiter = line[:3]
+                    code_block_delimiter = fence_match.group(1)
                 elif line.startswith(code_block_delimiter):
                     in_code_block = False
                     code_block_delimiter = None
@@ -1638,7 +1639,7 @@ def insert_sections_into_document(file_path, translated_sections, target_inserti
         thread_safe_print(f"   ⚠️  No sections or insertion points provided")
         return False
     
-    local_path = os.path.join(target_local_path, file_path)
+    local_path = safe_target_path(target_local_path, file_path)
     
     if not os.path.exists(local_path):
         thread_safe_print(f"   ❌ Local file not found: {local_path}")
@@ -1774,39 +1775,6 @@ def process_modified_sections(modified_sections, pr_diff, source_context_or_pr_u
             sanitized = sanitize_exception_message(e)
             thread_safe_print(f"   ❌ Error processing {file_path}: {sanitized}")
             results.append((file_path, False, f"Error processing {file_path}: {sanitized}"))
-    
-    return results
-
-def process_deleted_sections(deleted_sections, source_context_or_pr_url, github_client, ai_client, repo_config, max_non_system_sections=120):
-    """Process deleted sections with full data structure support"""
-    results = []
-    
-    for file_path, source_sections in deleted_sections.items():
-        thread_safe_print(f"\n🗑️  Processing deleted sections in {file_path}")
-        
-        try:
-            # Call process_single_file_deletion with the complete data structure
-            success, message = process_single_file_deletion(
-                file_path, 
-                source_sections, 
-                source_context_or_pr_url, 
-                github_client, 
-                ai_client, 
-                repo_config, 
-                max_non_system_sections
-            )
-            
-            if success:
-                thread_safe_print(f"   ✅ Successfully processed deletions in {file_path}")
-                results.append((file_path, True, message))
-            else:
-                thread_safe_print(f"   ❌ Failed to process deletions in {file_path}: {message}")
-                results.append((file_path, False, message))
-                
-        except Exception as e:
-            sanitized = sanitize_exception_message(e)
-            thread_safe_print(f"   ❌ Error processing deletions in {file_path}: {sanitized}")
-            results.append((file_path, False, f"Error processing deletions in {file_path}: {sanitized}"))
     
     return results
 
@@ -2913,9 +2881,7 @@ def update_target_document_sections(all_sections, target_file_path):
                     # Bottom modified: find and replace existing content at document end
                     thread_safe_print(f"   🔄 Bottom modified section: replacing existing content at document end")
                     
-                    # Get the old content to search for
-                    source_operation_data = section_data.get('source_operation_data', {})
-                    old_content = source_operation_data.get('old_content', '').strip()
+                    old_content = (section_data.get('source_old_content') or '').strip()
                     
                     if old_content:
                         # Search backwards from end to find the matching section
@@ -3218,10 +3184,11 @@ def find_section_end_for_update(lines, start_line, target_hierarchy, end_marker=
                 raw_line = lines[i]
                 line = raw_line.strip()
 
-                if line.startswith('```') or line.startswith('~~~'):
+                fm = re.match(r'^(`{3,}|~{3,})', line)
+                if fm:
                     if not in_code_block:
                         in_code_block = True
-                        code_block_delimiter = line[:3]
+                        code_block_delimiter = fm.group(1)
                     elif line.startswith(code_block_delimiter):
                         in_code_block = False
                         code_block_delimiter = None
@@ -3235,10 +3202,11 @@ def find_section_end_for_update(lines, start_line, target_hierarchy, end_marker=
                 raw_line = lines[i]
                 line = raw_line.strip()
 
-                if line.startswith('```') or line.startswith('~~~'):
+                fm = re.match(r'^(`{3,}|~{3,})', line)
+                if fm:
                     if not in_code_block:
                         in_code_block = True
-                        code_block_delimiter = line[:3]
+                        code_block_delimiter = fm.group(1)
                     elif line.startswith(code_block_delimiter):
                         in_code_block = False
                         code_block_delimiter = None
@@ -3254,10 +3222,11 @@ def find_section_end_for_update(lines, start_line, target_hierarchy, end_marker=
                 raw_line = lines[i]
                 line = raw_line.strip()
 
-                if line.startswith('```') or line.startswith('~~~'):
+                fm = re.match(r'^(`{3,}|~{3,})', line)
+                if fm:
                     if not in_code_block:
                         in_code_block = True
-                        code_block_delimiter = line[:3]
+                        code_block_delimiter = fm.group(1)
                     elif line.startswith(code_block_delimiter):
                         in_code_block = False
                         code_block_delimiter = None

@@ -67,3 +67,16 @@ def sanitize_exception_message(exc):
     if exc is None:
         return ""
     return exc.__class__.__name__
+
+
+def safe_target_path(base_dir, relative_path):
+    """Join base_dir and relative_path, raising ValueError on path traversal.
+
+    Uses os.path.realpath to resolve symlinks, avoiding false positives on
+    systems where e.g. /var is a symlink to /private/var (macOS).
+    """
+    real_base = os.path.realpath(base_dir)
+    joined = os.path.realpath(os.path.join(base_dir, relative_path))
+    if not joined.startswith(real_base + os.sep) and joined != real_base:
+        raise ValueError(f"Path traversal detected: {relative_path!r}")
+    return joined
