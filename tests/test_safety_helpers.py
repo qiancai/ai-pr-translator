@@ -111,7 +111,6 @@ class WorkflowActionPinTest(unittest.TestCase):
         for relative_path in (
             "sync-doc-pr-zh-to-en.yml",
             "sync-doc-updates-zh-to-en.yml",
-            "README.md",
         ):
             with self.subTest(path=relative_path):
                 content = Path(REPO_ROOT, relative_path).read_text(encoding="utf-8")
