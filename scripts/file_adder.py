@@ -9,12 +9,23 @@ import json
 import threading
 from github import Github
 from openai import OpenAI
+from file_io import atomic_write_text
 from log_sanitizer import sanitize_exception_message, safe_target_path
+from workflow_outcome import FileOutcomes
 from product_specific_handler import rewrite_tidb_version_anchors_in_text
 from svg_preprocessor import strip_svgs, restore_svgs
 
 # Thread-safe printing
 print_lock = threading.Lock()
+
+
+class TranslatedBatchText(str):
+    """Translated batch text with non-fatal completeness warnings."""
+
+    def __new__(cls, value, partial_reasons=None):
+        obj = super().__new__(cls, value or "")
+        obj.partial_reasons = list(partial_reasons or [])
+        return obj
 
 def thread_safe_print(*args, **kwargs):
     with print_lock:
@@ -372,10 +383,17 @@ Glossary for terms in {source_language} and {target_language}:
     
     source_line_count = len(batch_content.split('\n'))
 
-    translated_content = ai_client.chat_completion(
+    ai_response = ai_client.chat_completion(
         messages=[{"role": "user", "content": prompt}],
         temperature=0.1
     )
+    partial_reasons = []
+    if getattr(ai_response, "completion_status", "complete") == "incomplete":
+        partial_reasons.append(
+            "AI response incomplete: "
+            + (getattr(ai_response, "completion_reason", "") or "unknown reason")
+        )
+    translated_content = ai_response
     translated_content = strip_ai_markdown_wrapper(translated_content)
     translated_content = restore_svgs(translated_content, svg_map)
     translated_content = rewrite_tidb_version_anchors_in_text(
@@ -392,9 +410,12 @@ Glossary for terms in {source_language} and {target_language}:
             f"({translated_line_count}) than source ({source_line_count}). "
             f"The AI response may have been truncated."
         )
+        partial_reasons.append(
+            f"Translated batch has {translated_line_count} lines versus {source_line_count} source lines"
+        )
 
     thread_safe_print(f"   ✅ Batch translation completed")
-    return translated_content
+    return TranslatedBatchText(translated_content, partial_reasons)
 
 def process_added_files(
     added_files,
@@ -404,6 +425,7 @@ def process_added_files(
     repo_config,
     glossary_matcher=None,
     return_details=False,
+    return_outcomes=False,
     overwrite_existing=False,
 ):
     """Process newly added files by translating and creating them in target repository.
@@ -413,11 +435,14 @@ def process_added_files(
     """
     if not added_files:
         thread_safe_print("\n📄 No new files to process")
+        if return_outcomes:
+            return FileOutcomes()
         return (True, {}) if return_details else True
     
     thread_safe_print(f"\n📄 Processing {len(added_files)} newly added files...")
     all_success = True
     failure_reasons = {}
+    outcomes = FileOutcomes()
     
     target_local_path = repo_config['target_local_path']
     source_language = repo_config['source_language']
@@ -436,13 +461,25 @@ def process_added_files(
             thread_safe_print(f"   ❌ {reason}")
             failure_reasons[file_path] = reason
             all_success = False
+            outcomes.add(file_path, "failed", reason)
             continue
         target_dir = os.path.dirname(target_file_path)
         
         # Create directory if it doesn't exist
         if not os.path.exists(target_dir):
-            os.makedirs(target_dir, exist_ok=True)
-            thread_safe_print(f"   📁 Created directory: {target_dir}")
+            try:
+                os.makedirs(target_dir, exist_ok=True)
+                thread_safe_print(f"   📁 Created directory: {target_dir}")
+            except Exception as e:
+                reason = (
+                    f"Error creating target directory {target_dir}: "
+                    f"{sanitize_exception_message(e)}"
+                )
+                thread_safe_print(f"   ❌ {reason}")
+                failure_reasons[file_path] = reason
+                all_success = False
+                outcomes.add(file_path, "failed", reason)
+                continue
         
         # Check if file already exists
         target_file_exists = os.path.exists(target_file_path)
@@ -454,6 +491,7 @@ def process_added_files(
                 thread_safe_print(f"   ⚠️  {reason}")
                 failure_reasons[file_path] = reason
                 all_success = False
+                outcomes.add(file_path, "failed", reason)
                 continue
 
         # Create section batches for translation
@@ -462,6 +500,7 @@ def process_added_files(
         
         # Translate each batch
         translated_batches = []
+        file_partial_reasons = []
         translation_failed = False
         for i, batch in enumerate(batches):
             thread_safe_print(f"   🔄 Processing batch {i+1}/{len(batches)}")
@@ -479,9 +518,13 @@ def process_added_files(
                 thread_safe_print(f"   ❌ {reason}")
                 failure_reasons[file_path] = reason
                 all_success = False
+                outcomes.add(file_path, "failed", reason)
                 translation_failed = True
                 break
             translated_batches.append(translated_batch)
+            file_partial_reasons.extend(
+                getattr(translated_batch, "partial_reasons", [])
+            )
 
         if translation_failed:
             continue
@@ -492,11 +535,18 @@ def process_added_files(
 
         # Write translated content to target file
         try:
-            with open(target_file_path, 'w', encoding='utf-8') as f:
-                f.write(translated_content)
+            atomic_write_text(target_file_path, translated_content)
             
             action = "Updated" if overwrite_existing and target_file_exists else "Created"
             thread_safe_print(f"   ✅ {action} translated file: {target_file_path}")
+            if file_partial_reasons:
+                outcomes.add(
+                    file_path,
+                    "partial",
+                    "; ".join(dict.fromkeys(file_partial_reasons)),
+                )
+            else:
+                outcomes.add(file_path, "success")
             
         except Exception as e:
             reason = f"Error creating file {target_file_path}: {sanitize_exception_message(e)}"
@@ -505,6 +555,9 @@ def process_added_files(
             )
             failure_reasons[file_path] = reason
             all_success = False
+            outcomes.add(file_path, "failed", reason)
     
     thread_safe_print(f"\n✅ Completed processing all new files")
+    if return_outcomes:
+        return outcomes
     return (all_success, failure_reasons) if return_details else all_success

@@ -5,3 +5,6 @@ gh-util.user.js
 .DS_Store
 research.md
 scripts/temp_output/
+.env
+.env.*
+!.env.example

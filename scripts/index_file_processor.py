@@ -16,7 +16,8 @@ import os
 import re
 import threading
 
-from log_sanitizer import sanitize_exception_message
+from file_io import atomic_write_text
+from log_sanitizer import sanitize_exception_message, safe_target_path
 
 print_lock = threading.Lock()
 
@@ -473,13 +474,13 @@ def process_index_file_by_source_snapshot(
             thread_safe_print(f"      ... and {len(missing) - 10} more")
         return False
 
-    with open(target_file_path, "w", encoding="utf-8") as f:
-        f.write(
-            localize_docs_absolute_links(
-                "\n".join(planned_lines),
-                repo_config.get("target_language"),
-            )
+    atomic_write_text(
+        target_file_path,
+        localize_docs_absolute_links(
+            "\n".join(planned_lines),
+            repo_config.get("target_language"),
         )
+    )
 
     thread_safe_print(
         f"   ✅ _index.md file synced from source snapshot: {file_path}"
@@ -504,7 +505,7 @@ def process_index_file(
 
     try:
         target_local_path = repo_config["target_local_path"]
-        target_file_path = os.path.join(target_local_path, file_path)
+        target_file_path = safe_target_path(target_local_path, file_path)
 
         if index_data.get("source_base_content") is not None and index_data.get(
             "source_head_content"

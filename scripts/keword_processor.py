@@ -13,7 +13,8 @@ import re
 import json
 import difflib
 import threading
-from log_sanitizer import sanitize_exception_message
+from file_io import atomic_write_text
+from log_sanitizer import sanitize_exception_message, safe_target_path
 
 print_lock = threading.Lock()
 
@@ -471,7 +472,7 @@ def process_keyword_file(file_path, keyword_data, source_context_or_pr_url, gith
 
     try:
         target_local_path = repo_config['target_local_path']
-        target_file_path = os.path.join(target_local_path, file_path)
+        target_file_path = safe_target_path(target_local_path, file_path)
 
         if not os.path.exists(target_file_path):
             thread_safe_print(f"   Target file not found: {target_file_path}")
@@ -509,8 +510,7 @@ def process_keyword_file(file_path, keyword_data, source_context_or_pr_url, gith
             tabs_region=tabs_region,
         )
 
-        with open(target_file_path, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(updated_lines))
+        atomic_write_text(target_file_path, '\n'.join(updated_lines))
 
         thread_safe_print(f"   Keyword file updated with AI letter blocks: {file_path}")
         return True

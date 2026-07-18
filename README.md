@@ -53,9 +53,9 @@ An intelligent documentation translator that automatically synchronizes incremen
 
 ## Prerequisites
 
-- Python 3.7+
+- Python 3.9+
 - GitHub Personal Access Token with repo access
-- API keys for your chosen AI provider (DeepSeek or Gemini)
+- API credentials for your chosen provider (DeepSeek, Gemini, OpenAI, or Azure OpenAI)
 
 ## Installation
 
@@ -91,18 +91,26 @@ export GITHUB_TOKEN="your_github_token"
 export TARGET_REPO_PATH="/path/to/target/repo"
 
 # AI Provider (choose one)
-export AI_PROVIDER="deepseek"  # or "gemini"
+export AI_PROVIDER="deepseek"  # deepseek, gemini, openai, or azure
 export DEEPSEEK_API_TOKEN="your_deepseek_token"  # if using DeepSeek
 # OR
 export GEMINI_API_TOKEN="your_gemini_token"  # if using Gemini
+# OR
+export OPENAI_API_TOKEN="your_openai_token"  # if using OpenAI
+# OR
+export AZURE_OPENAI_KEY="your_azure_openai_key"
+export OPENAI_BASE_URL="https://your-resource.openai.azure.com/openai/v1/"
 
 # Optional: Glossary for consistent term translation
 export TERMS_PATH="/path/to/terms.md"  # auto-detected from TARGET_REPO_PATH if not set
 
 # Optional: Token limits
 export MAX_NON_SYSTEM_SECTIONS_FOR_AI=120
-export SOURCE_TOKEN_LIMIT=5000
-export AI_MAX_TOKENS=20000
+export SOURCE_TOKEN_LIMIT=50000
+export DEEPSEEK_MAX_OUTPUT_TOKENS=8192
+export GEMINI_MAX_OUTPUT_TOKENS=8192
+export OPENAI_MAX_OUTPUT_TOKENS=32768
+export AZURE_MAX_OUTPUT_TOKENS=65536
 
 # Optional: limit PR analysis to explicit source files
 export SOURCE_FILES="docs/guide.md,docs/faq.md"
@@ -144,11 +152,13 @@ export SOURCE_FILES="ai/foo.md,ai/bar.md"
 export SOURCE_FILES_TRANSLATION_MODE="incremental"
 
 # AI Provider and glossary
-export AI_PROVIDER="deepseek"  # or "gemini"
+export AI_PROVIDER="deepseek"  # deepseek, gemini, openai, or azure
 export TERMS_PATH="/path/to/terms.md"
 ```
 
-`commit_sync_workflow.py` uses the explicit `SOURCE_BASE_REF -> SOURCE_HEAD_REF` compare range passed in by the caller. For scheduled commit-based runs, target files that contain `<!--Corresponding EN commit: ...-->` and do not match `SOURCE_BASE_REF` are translated separately from that per-file commit to `SOURCE_HEAD_REF`. Manual runs add or update this marker on successfully translated Markdown files; scheduled runs remove existing markers from successfully translated Markdown files so those files return to the global cursor. The caller workflow should keep `latest_translation_commit.json` as the scheduled global cursor and should not advance it for manual `workflow_dispatch` runs.
+`commit_sync_workflow.py` uses the explicit `SOURCE_BASE_REF -> SOURCE_HEAD_REF` compare range passed in by the caller. For scheduled commit-based runs, target files that contain `<!--Corresponding EN commit: ...-->` and do not match `SOURCE_BASE_REF` are translated separately from that per-file commit to `SOURCE_HEAD_REF`. Manual runs add or update this marker on fully translated Markdown files; scheduled runs remove existing markers from fully translated Markdown files so those files return to the global cursor. Partial output is intentionally preserved and can be pushed, but its per-file cursor is not advanced. At the end of a scheduled run, the script atomically updates the global SHA and stores incomplete files with their original source refs in the `pending` object in `latest_translation_commit.json`, so later runs retry the missed range. An unexpected process failure occurs before this atomic finalization, and the caller workflow must refuse to advance or push that run.
+
+The example workflows currently follow the `main` branch of `qiancai/ai-pr-translator`, so translator updates are picked up automatically. This is an intentional convenience tradeoff: changes to `main` take effect without a separate workflow configuration update.
 
 ## Usage
 
@@ -191,10 +201,10 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.9'
       
@@ -298,13 +308,18 @@ graph TD
 
 ### Token limit management
 
-Control costs by setting limits:
+Control work size and provider-specific output budgets with environment variables:
 
-```python
-MAX_NON_SYSTEM_SECTIONS_FOR_AI = 120  # Max sections per file
-SOURCE_TOKEN_LIMIT = 5000              # Max tokens for source content
-AI_MAX_TOKENS = 20000                  # Max tokens per AI request
+```bash
+export MAX_NON_SYSTEM_SECTIONS_FOR_AI=120 # Max non-system sections per file
+export SOURCE_TOKEN_LIMIT=50000            # Source diff limit for regular modified files
+export DEEPSEEK_MAX_OUTPUT_TOKENS=8192
+export GEMINI_MAX_OUTPUT_TOKENS=8192
+export OPENAI_MAX_OUTPUT_TOKENS=32768
+export AZURE_MAX_OUTPUT_TOKENS=65536
 ```
+
+Each output budget is clamped to the provider ceiling built into the client. `SOURCE_TOKEN_LIMIT` applies to the regular modified-file translation path; special-file processors have their own batching behavior.
 
 ### Special file configuration
 

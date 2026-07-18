@@ -31,6 +31,7 @@ env:
 
   # ─── ai-pr-translator configuration ───
   AI_TRANSLATOR_REPO: qiancai/ai-pr-translator
+  # Intentionally follow main so automation picks up translator updates immediately.
   AI_TRANSLATOR_REF: main
 
   # ─── Translation direction ───
@@ -47,13 +48,13 @@ jobs:
 
     steps:
       - name: Checkout target branch
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           ref: ${{ env.TARGET_BRANCH }}
           path: docs-target
 
       - name: Checkout source branch
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ env.SOURCE_BRANCH }}
@@ -62,7 +63,7 @@ jobs:
           persist-credentials: false
 
       - name: Checkout terms branch
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ env.TERMS_BRANCH }}
@@ -70,7 +71,7 @@ jobs:
           persist-credentials: false
 
       - name: Checkout ai-pr-translator
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: ${{ env.AI_TRANSLATOR_REPO }}
           ref: ${{ env.AI_TRANSLATOR_REF }}
@@ -78,7 +79,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.9"
           cache: pip
@@ -132,6 +133,7 @@ jobs:
           BASE_REF: ${{ steps.commits.outputs.base_ref }}
           HEAD_REF: ${{ steps.commits.outputs.head_ref }}
           DOCS_SOURCE_PATH: ${{ github.workspace }}/docs-source
+          TARGET_CURSOR_PATH: ${{ github.workspace }}/docs-target/latest_translation_commit.json
         run: |
           set -euo pipefail
 
@@ -144,9 +146,32 @@ jobs:
 
           CHANGED_FILES=$(git -C "$DOCS_SOURCE_PATH" diff --name-only "${BASE_REF}..${HEAD_REF}" -- '*.md' 2>/dev/null || true)
 
+          PENDING_FILES=""
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+            PENDING_FILES=$(python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          data = json.loads(
+              Path(os.environ["TARGET_CURSOR_PATH"]).read_text(encoding="utf-8")
+          )
+          pending = data.get("pending")
+          if isinstance(pending, dict):
+              print(",".join(sorted(path for path in pending if isinstance(path, str))))
+          PY
+            )
+          fi
+
           if [[ -z "$CHANGED_FILES" ]]; then
-            echo "has_source_changes=false" >> "${GITHUB_OUTPUT}"
-            echo "No source markdown changes found between ${BASE_REF} and ${HEAD_REF}."
+            if [[ -n "$PENDING_FILES" ]]; then
+              echo "files=${PENDING_FILES}" >> "${GITHUB_OUTPUT}"
+              echo "has_source_changes=true" >> "${GITHUB_OUTPUT}"
+              echo "No new global changes; retrying pending files: ${PENDING_FILES}"
+            else
+              echo "has_source_changes=false" >> "${GITHUB_OUTPUT}"
+              echo "No source markdown changes found between ${BASE_REF} and ${HEAD_REF}."
+            fi
           else
             FILES_CSV=$(echo "$CHANGED_FILES" | paste -sd ',' -)
             echo "files=${FILES_CSV}" >> "${GITHUB_OUTPUT}"
@@ -209,15 +234,29 @@ jobs:
             } >> "${GITHUB_OUTPUT}"
           fi
 
+          if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
+            python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          cursor_path = Path("latest_translation_commit.json")
+          data = json.loads(cursor_path.read_text(encoding="utf-8"))
+          expected_target = os.environ["SOURCE_BRANCH"]
+          expected_sha = os.environ["HEAD_REF"]
+          if data.get("target") != expected_target or data.get("sha") != expected_sha:
+              raise SystemExit(
+                  "Commit sync did not finalize latest_translation_commit.json; "
+                  "refusing to advance or push a partial run after an unexpected failure."
+              )
+          PY
+          else
+            echo "Skipping latest_translation_commit.json verification for ${GITHUB_EVENT_NAME} run."
+          fi
+
           if [ -z "$(git status --porcelain)" ]; then
             echo "has_changes=false" >> "${GITHUB_OUTPUT}"
             exit 0
-          fi
-
-          if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
-            python -c 'import json, os; from pathlib import Path; Path("latest_translation_commit.json").write_text(json.dumps({"target": os.environ["SOURCE_BRANCH"], "sha": os.environ["HEAD_REF"]}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")'
-          else
-            echo "Skipping latest_translation_commit.json update for ${GITHUB_EVENT_NAME} run."
           fi
 
           echo "has_changes=true" >> "${GITHUB_OUTPUT}"
@@ -232,7 +271,7 @@ jobs:
 
       - name: Create PR
         if: steps.changes.outputs.has_changes == 'true'
-        uses: peter-evans/create-pull-request@v8
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8
         with:
           path: docs-target
           token: ${{ github.token }}

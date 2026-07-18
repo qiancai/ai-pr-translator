@@ -33,22 +33,23 @@ jobs:
 
     steps:
       - name: Checkout current repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           persist-credentials: false
           fetch-depth: 0
 
       - name: Checkout ai-pr-translator repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: "qiancai/ai-pr-translator"
-          ref: "main"
+          # Intentionally follow main so automation picks up translator updates immediately.
+          ref: main
           path: "ai-pr-translator"
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.9'
 
@@ -244,12 +245,18 @@ jobs:
           TARGET_OWNER: ${{ steps.extract_info.outputs.target_owner }}
           TARGET_REPO: ${{ steps.extract_info.outputs.target_repo }}
           TARGET_PR: ${{ steps.extract_info.outputs.target_pr }}
+          FAILURE_REPORT: ${{ github.workspace }}/ai-pr-translator/scripts/temp_output/translation-failures.md
         run: |
           BODY=$(printf '%s\n\n%s\n%s\n\n%s' \
             "**Auto-sync completed successfully**" \
             "**Source PR**: ${SOURCE_PR_URL}" \
             "**Target PR**: ${TARGET_PR_URL}" \
             "Documentation has been updated based on source PR changes.")
+          if [[ -s "$FAILURE_REPORT" ]]; then
+            BODY=$(printf '%s\n\n%s\n\n%s' "$BODY" \
+              "**Partial or incomplete work**" \
+              "$(cat "$FAILURE_REPORT")")
+          fi
           PAYLOAD=$(jq -n --arg body "$BODY" '{body: $body}')
           printf '%s' "$PAYLOAD" | gh api --method POST \
             "repos/${TARGET_OWNER}/${TARGET_REPO}/issues/${TARGET_PR}/comments" \
@@ -265,12 +272,18 @@ jobs:
           TARGET_OWNER: ${{ steps.extract_info.outputs.target_owner }}
           TARGET_REPO: ${{ steps.extract_info.outputs.target_repo }}
           TARGET_PR: ${{ steps.extract_info.outputs.target_pr }}
+          FAILURE_REPORT: ${{ github.workspace }}/ai-pr-translator/scripts/temp_output/translation-failures.md
         run: |
           BODY=$(printf '%s\n\n%s\n%s\n\n%s' \
             "**Auto-sync failed**" \
             "**Source PR**: ${SOURCE_PR_URL}" \
             "**Target PR**: ${TARGET_PR_URL}" \
             "Translated changes were not pushed to the target branch. Please check the workflow logs for details.")
+          if [[ -s "$FAILURE_REPORT" ]]; then
+            BODY=$(printf '%s\n\n%s\n\n%s' "$BODY" \
+              "**Translation report**" \
+              "$(cat "$FAILURE_REPORT")")
+          fi
           PAYLOAD=$(jq -n --arg body "$BODY" '{body: $body}')
           printf '%s' "$PAYLOAD" | gh api --method POST \
             "repos/${TARGET_OWNER}/${TARGET_REPO}/issues/${TARGET_PR}/comments" \

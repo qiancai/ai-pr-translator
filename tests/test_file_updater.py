@@ -24,6 +24,7 @@ from file_updater import (
     process_single_file,
     update_target_document_from_match_data,
 )
+from ai_client import CompletionText
 from product_specific_handler import (
     rewrite_tidb_version_anchors_in_sections,
     rewrite_tidb_version_anchors_in_text,
@@ -31,6 +32,96 @@ from product_specific_handler import (
 
 
 class FileUpdaterRegressionTest(unittest.TestCase):
+    def test_incomplete_response_with_missing_key_remains_useful_partial_result(self):
+        class FakeAIClient:
+            def chat_completion(self, messages, temperature=0.1):
+                return CompletionText(
+                    json.dumps({"modified_1": "updated one"}),
+                    status="incomplete",
+                    reason="max_output_tokens",
+                )
+
+        prefix = "incomplete-missing-key-unit"
+        self._cleanup_chunk_test_outputs(prefix)
+        try:
+            result = get_updated_sections_from_ai(
+                "File: guide.md\n@@ -1,2 +1,2 @@\n-old\n+new",
+                {"modified_1": "old one", "modified_2": "old two"},
+                {"modified_1": "new one", "modified_2": "new two"},
+                FakeAIClient(),
+                "English",
+                "Chinese",
+                f"{prefix}.md",
+            )
+
+            self.assertIsInstance(result, TranslationResult)
+            self.assertIn("modified_1", result)
+            self.assertNotIn("modified_2", result)
+            self.assertTrue(
+                any("max_output_tokens" in reason for reason in result.partial_reasons)
+            )
+            self.assertTrue(
+                any("modified_2" in reason for reason in result.partial_reasons)
+            )
+        finally:
+            self._cleanup_chunk_test_outputs(prefix)
+
+    def test_unexpected_key_is_ignored_without_discarding_valid_sections(self):
+        class FakeAIClient:
+            def chat_completion(self, messages, temperature=0.1):
+                return json.dumps(
+                    {
+                        "modified_1": "updated one",
+                        "hallucinated_999": "must be ignored",
+                    }
+                )
+
+        prefix = "unexpected-key-unit"
+        self._cleanup_chunk_test_outputs(prefix)
+        try:
+            result = get_updated_sections_from_ai(
+                "File: guide.md\n@@ -1,1 +1,1 @@\n-old\n+new",
+                {"modified_1": "old one"},
+                {"modified_1": "new one"},
+                FakeAIClient(),
+                "English",
+                "Chinese",
+                f"{prefix}.md",
+            )
+
+            self.assertIn("modified_1", result)
+            self.assertNotIn("hallucinated_999", result)
+            self.assertTrue(
+                any("hallucinated_999" in reason for reason in result.partial_reasons)
+            )
+            self.assertFalse(result.failures)
+        finally:
+            self._cleanup_chunk_test_outputs(prefix)
+
+    def test_only_unexpected_keys_is_a_total_failure(self):
+        class FakeAIClient:
+            def chat_completion(self, messages, temperature=0.1):
+                return json.dumps({"hallucinated_999": "invalid"})
+
+        prefix = "only-unexpected-key-unit"
+        self._cleanup_chunk_test_outputs(prefix)
+        try:
+            result = get_updated_sections_from_ai(
+                "File: guide.md\n@@ -1,1 +1,1 @@\n-old\n+new",
+                {"modified_1": "old one"},
+                {"modified_1": "new one"},
+                FakeAIClient(),
+                "English",
+                "Chinese",
+                f"{prefix}.md",
+            )
+
+            self.assertFalse(result)
+            self.assertTrue(result.failures)
+            self.assertIn("no expected section keys", result.failures[0])
+        finally:
+            self._cleanup_chunk_test_outputs(prefix)
+
     def _cleanup_chunk_test_outputs(self, prefix):
         temp_dir = SCRIPTS_DIR / "temp_output"
         for path in temp_dir.glob(f"{prefix}_*"):
@@ -1081,7 +1172,7 @@ class FileUpdaterRegressionTest(unittest.TestCase):
         finally:
             self._cleanup_chunk_test_outputs(prefix)
 
-    def test_chunk_failure_is_attached_to_translation_result(self):
+    def test_chunk_failure_with_useful_output_is_attached_as_partial_result(self):
         class FakeAIClient:
             def __init__(self):
                 self.prompts = []
@@ -1111,9 +1202,15 @@ class FileUpdaterRegressionTest(unittest.TestCase):
 
             self.assertIsInstance(result, TranslationResult)
             self.assertEqual(len(result), 20)
-            self.assertEqual(len(result.failures), 1)
-            self.assertIn("failed to translate chunk 2/2", result.failures[0])
-            self.assertIn("tidb_chunk_test_021", result.failures[0])
+            self.assertFalse(result.failures)
+            self.assertTrue(result.partial_reasons)
+            self.assertTrue(
+                any(
+                    "failed to translate chunk 2/2" in reason
+                    and "tidb_chunk_test_021" in reason
+                    for reason in result.partial_reasons
+                )
+            )
         finally:
             self._cleanup_chunk_test_outputs(prefix)
 

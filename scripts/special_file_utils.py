@@ -35,6 +35,14 @@ def _normalize_rel_path(path):
     return (path or "").strip().lstrip("/")
 
 
+def path_resource_key(file_path, strip_markdown_extension=True):
+    """Return a collision-free, readable key for a repository-relative path."""
+    value = str(file_path or "").replace("\\", "/")
+    if strip_markdown_extension and value.endswith(".md"):
+        value = value[:-3]
+    return value.replace("%", "%25").replace("--", "%2D%2D").replace("/", "--")
+
+
 def is_toc_file_name(filename, ignore_files=None):
     """Return True for TOC files that need TOC-specific processing."""
     normalized_filename = _normalize_rel_path(filename)

@@ -75,8 +75,30 @@ def safe_target_path(base_dir, relative_path):
     Uses os.path.realpath to resolve symlinks, avoiding false positives on
     systems where e.g. /var is a symlink to /private/var (macOS).
     """
+    relative_path = str(relative_path or "")
+    normalized_parts = relative_path.replace("\\", "/").split("/")
+    if os.path.isabs(relative_path) or ".git" in normalized_parts:
+        raise ValueError(f"Unsafe target path: {relative_path!r}")
+
+    lexical_base = os.path.abspath(base_dir)
+    lexical_joined = os.path.abspath(os.path.join(lexical_base, relative_path))
+    try:
+        within_lexical_base = os.path.commonpath([lexical_base, lexical_joined]) == lexical_base
+    except ValueError:
+        within_lexical_base = False
+    if not within_lexical_base:
+        raise ValueError(f"Path traversal detected: {relative_path!r}")
+
+    current = lexical_base
+    for part in os.path.relpath(lexical_joined, lexical_base).split(os.sep):
+        if part in {"", "."}:
+            continue
+        current = os.path.join(current, part)
+        if os.path.islink(current):
+            raise ValueError(f"Symlink target paths are not allowed: {relative_path!r}")
+
     real_base = os.path.realpath(base_dir)
-    joined = os.path.realpath(os.path.join(base_dir, relative_path))
+    joined = os.path.realpath(lexical_joined)
     if not joined.startswith(real_base + os.sep) and joined != real_base:
         raise ValueError(f"Path traversal detected: {relative_path!r}")
     return joined

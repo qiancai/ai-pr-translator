@@ -8,6 +8,7 @@ parallel entrypoint for translation based on an explicit commit compare range.
 import json
 import os
 import re
+import tempfile
 
 from github import Auth, Github
 
@@ -61,10 +62,11 @@ from diff_analyzer import (
 from file_adder import process_added_files
 from structural_reconciler import reconcile_restructured_file
 from file_deleter import process_deleted_files
+from file_io import atomic_write_text
 from glossary import create_glossary_matcher, load_glossary
 from image_processor import process_all_images
 from keword_processor import process_keyword_file
-from log_sanitizer import sanitize_exception_message
+from log_sanitizer import sanitize_exception_message, safe_target_path
 from parallel_file_processor import (
     make_file_task,
     make_task_result,
@@ -80,12 +82,15 @@ from main_workflow import (
     extract_file_diff_from_pr,
     git_add_changes,
     git_add_successful_task_changes,
+    normalize_added_file_outcomes,
     process_regular_modified_file,
 )
 from index_file_processor import process_index_file
 from toc_processor import process_toc_file
 from translation_structure_validator import validate_markdown_heading_structures
 from workflow_ignore_config import load_workflow_ignore_config
+from workflow_outcome import FileOutcomes, RunReport
+from special_file_utils import path_resource_key
 
 WORKFLOW_IGNORE_CONFIG = load_workflow_ignore_config()
 COMMIT_BASED_MODE_IGNORE_FILES = WORKFLOW_IGNORE_CONFIG["COMMIT_BASED_MODE_IGNORE_FILES"]
@@ -117,116 +122,14 @@ CORRESPONDING_EN_COMMIT_TEMPLATE = "<!--Corresponding EN commit: {sha}-->"
 RUN_TYPE_MANUAL_ALIASES = {"manual", "workflow_dispatch"}
 RUN_TYPE_SCHEDULED_ALIASES = {"schedule", "scheduled"}
 PER_FILE_MARKER_GROUP_WARNING_THRESHOLD = 5
+RETRY_LEDGER_FILE = "latest_translation_commit.json"
 
 
-class TranslationStats:
-    """Track per-file translation outcomes without stopping later files."""
-
-    def __init__(self):
-        self.total = 0
-        self.succeeded = []
-        self.failed = []
-        self.skipped = []
-        self.structure_errors = []
-
-    def mark_success(self, file_path):
-        self.total += 1
-        self.succeeded.append(file_path)
-
-    def mark_failure(self, file_path, reason):
-        self.total += 1
-        self.failed.append((file_path, reason))
-
-    def mark_skipped(self, file_path, reason):
-        self.skipped.append((file_path, reason))
-
-    def mark_structure_error(self, issue):
-        self.structure_errors.append(issue)
+class TranslationStats(RunReport):
+    """Backward-compatible name for the shared run report."""
 
     def print_summary(self):
-        thread_safe_print("\n📚 Translation attempt summary:")
-        thread_safe_print(f"   📄 Files attempted for translation: {self.total}")
-        thread_safe_print(f"   ✅ Successfully translated: {len(self.succeeded)}")
-        thread_safe_print(f"   ❌ Failed to translate: {len(self.failed)}")
-        thread_safe_print(f"   ⚠️  Document structure mismatches: {len(self.structure_errors)}")
-
-        if self.failed:
-            thread_safe_print("   ❌ Failed files:")
-            for file_path, reason in self.failed:
-                thread_safe_print(f"      - {file_path}: {reason}")
-
-        if self.skipped:
-            thread_safe_print(f"   ⏭️  Skipped files: {len(self.skipped)}")
-            for file_path, reason in self.skipped:
-                thread_safe_print(f"      - {file_path}: {reason}")
-
-    def write_failure_report(self, output_dir):
-        """Write per-file failures for workflow PR descriptions."""
-        os.makedirs(output_dir, exist_ok=True)
-        markdown_path = os.path.join(output_dir, "translation-failures.md")
-        json_path = os.path.join(output_dir, "translation-failures.json")
-        structure_json_path = os.path.join(output_dir, "translation-structure-errors.json")
-
-        if not self.failed and not self.structure_errors:
-            for path in (markdown_path, json_path, structure_json_path):
-                if os.path.exists(path):
-                    os.remove(path)
-            return
-
-        with open(markdown_path, "w", encoding="utf-8") as f:
-            if self.failed:
-                f.write("### Translation failures\n\n")
-                f.write(
-                    "The following files were not translated automatically and must be handled manually before merging.\n\n"
-                )
-                for file_path, reason in self.failed:
-                    f.write(f"- `{file_path}`: {reason}\n")
-                if self.structure_errors:
-                    f.write("\n")
-
-            if self.structure_errors:
-                f.write("### Docs with document structure mismatches after translation\n\n")
-                f.write(
-                    "The following files were translated successfully, but their Markdown heading or CustomContent structure does not match the source HEAD file.\n\n"
-                )
-                for issue in self.structure_errors:
-                    f.write(f"- `{issue.file_path}`: {issue.reason}\n")
-                    if issue.source_compact:
-                        f.write(f"  - Source: `{issue.source_compact}`\n")
-                    if issue.target_compact:
-                        f.write(f"  - Target: `{issue.target_compact}`\n")
-                    if issue.first_difference:
-                        f.write(f"  - First difference: {issue.first_difference}\n")
-
-        if self.failed:
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    [
-                        {
-                            "file_path": file_path,
-                            "reason": reason,
-                        }
-                        for file_path, reason in self.failed
-                    ],
-                    f,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-                f.write("\n")
-        elif os.path.exists(json_path):
-            os.remove(json_path)
-
-        if self.structure_errors:
-            with open(structure_json_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    [issue.to_dict() for issue in self.structure_errors],
-                    f,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-                f.write("\n")
-        elif os.path.exists(structure_json_path):
-            os.remove(structure_json_path)
+        super().print_summary(printer=thread_safe_print)
 
 
 def _record_translation_task_result(task_result, translation_stats):
@@ -243,6 +146,10 @@ def _record_translation_task_result(task_result, translation_stats):
     if status == "success":
         thread_safe_print(f"   ✅ Successfully processed {file_path}")
         translation_stats.mark_success(file_path)
+        return True
+    if status == "partial":
+        thread_safe_print(f"   ⚠️  Partially processed {file_path}: {reason}")
+        translation_stats.mark_partial(file_path, reason)
         return True
     if status == "skipped":
         thread_safe_print(f"   ⏭️  Skipped {file_path}: {reason}")
@@ -305,21 +212,21 @@ def _process_commit_modified_file(
                     "No translatable content remains after RelatedResources filtering",
                 )
 
-        success, failure_reasons = process_added_files(
+        outcomes = process_added_files(
             {source_file_path: source_content},
             diff_context,
             github_client,
             ai_client,
             repo_config,
             glossary_matcher=glossary_matcher,
-            return_details=True,
+            return_outcomes=True,
         )
-        if success:
-            return make_task_result("success")
-        return make_task_result(
-            "failure",
-            failure_reasons.get(source_file_path, "Added-file fallback returned failure"),
+        outcomes = normalize_added_file_outcomes(outcomes, source_file_path)
+        outcome = outcomes.get(
+            source_file_path,
+            {"status": "failed", "reason": "Missing added-file fallback outcome"},
         )
+        return make_task_result(outcome["status"], outcome.get("reason", ""))
 
     ignore_files = repo_config.get("ignore_files", COMMIT_BASED_MODE_IGNORE_FILES)
     file_type = determine_file_processing_type(source_file_path, file_sections, SPECIAL_FILES, ignore_files)
@@ -379,7 +286,7 @@ def _process_commit_modified_file(
         return_details=True,
     )
     if success:
-        return make_task_result("success")
+        return make_task_result("partial" if failure_reason else "success", failure_reason)
     return make_task_result(
         "failure",
         failure_reason or "Regular modified file processor returned failure",
@@ -471,10 +378,9 @@ def get_safe_target_file_path(target_repo_path, source_file_path):
     if not target_repo_path or not source_file_path:
         return None
 
-    target_root = os.path.realpath(target_repo_path)
-    normalized_source_path = source_file_path.lstrip("/").replace("\\", "/")
-    target_file_path = os.path.realpath(os.path.join(target_root, normalized_source_path))
-    if target_file_path != target_root and not target_file_path.startswith(target_root + os.sep):
+    try:
+        target_file_path = safe_target_path(target_repo_path, source_file_path)
+    except ValueError:
         return None
     return target_file_path
 
@@ -486,6 +392,109 @@ def read_target_file_content(target_repo_path, source_file_path):
 
     with open(target_file_path, "r", encoding="utf-8") as f:
         return f.read()
+
+
+def load_retry_cursor_groups(target_repo_path):
+    """Load persisted failed/partial file cursors grouped by source ref."""
+    ledger_path = get_safe_target_file_path(target_repo_path, RETRY_LEDGER_FILE)
+    if not ledger_path or not os.path.exists(ledger_path):
+        return {}, set()
+    try:
+        with open(ledger_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        thread_safe_print(
+            f"   ⚠️  Could not read retry cursor ledger: {sanitize_exception_message(e)}"
+        )
+        return {}, set()
+
+    groups = {}
+    paths = set()
+    pending = data.get("pending") or {}
+    if not isinstance(pending, dict):
+        return {}, set()
+    for file_path, source_ref in pending.items():
+        if not isinstance(file_path, str) or not isinstance(source_ref, str):
+            continue
+        if not re.fullmatch(r"[0-9a-fA-F]{7,64}", source_ref.strip()):
+            continue
+        groups.setdefault(source_ref.strip(), set()).add(file_path)
+        paths.add(file_path)
+    return groups, paths
+
+
+def update_retry_cursor_ledger(
+    target_repo_path,
+    translation_stats,
+    completed_file_paths,
+    source_branch=None,
+    source_head_ref=None,
+):
+    """Atomically finalize the global cursor and any per-file retry cursors."""
+    ledger_path = get_safe_target_file_path(target_repo_path, RETRY_LEDGER_FILE)
+    if not ledger_path:
+        translation_stats.mark_failure(
+            RETRY_LEDGER_FILE,
+            "Failed to update retry cursor ledger: unsafe target path",
+        )
+        return False
+    temp_path = ""
+    try:
+        if os.path.exists(ledger_path):
+            with open(ledger_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        else:
+            if not source_branch or not source_head_ref:
+                raise ValueError(
+                    "cannot initialize a missing retry cursor ledger without "
+                    "source_branch and source_head_ref"
+                )
+            thread_safe_print(
+                f"   ℹ️  Initializing missing retry cursor ledger: {ledger_path}"
+            )
+            data = {}
+        pending = data.get("pending")
+        if not isinstance(pending, dict):
+            pending = {}
+        for file_path in completed_file_paths:
+            pending.pop(file_path, None)
+        pending.update(translation_stats.retry_refs)
+        if source_branch is not None or source_head_ref is not None:
+            if not source_branch or not source_head_ref:
+                raise ValueError(
+                    "source_branch and source_head_ref must be provided together"
+                )
+            data["target"] = source_branch
+            data["sha"] = source_head_ref
+        if pending:
+            data["pending"] = dict(sorted(pending.items()))
+        else:
+            data.pop("pending", None)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=os.path.dirname(ledger_path),
+            prefix=".latest_translation_commit.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            temp_path = f.name
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(temp_path, ledger_path)
+        temp_path = ""
+        return True
+    except Exception as e:
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        translation_stats.mark_failure(
+            RETRY_LEDGER_FILE,
+            f"Failed to update retry cursor ledger: {sanitize_exception_message(e)}",
+        )
+        return False
 
 
 def validate_successful_translation_structures(
@@ -531,6 +540,10 @@ def validate_successful_translation_structures(
     for issue in issues:
         thread_safe_print(f"      - {issue.file_path}: {issue.reason}")
         translation_stats.mark_structure_error(issue)
+        translation_stats.set_retry_ref(
+            issue.file_path,
+            diff_context.get("base_ref", "") if isinstance(diff_context, dict) else "",
+        )
 
     return issues
 
@@ -634,8 +647,7 @@ def update_corresponding_en_commit_for_files(
                 )
             if not changed:
                 continue
-            with open(target_file_path, "w", encoding="utf-8") as f:
-                f.write(updated_content)
+            atomic_write_text(target_file_path, updated_content)
             updated_files.append(file_path)
         except Exception as e:
             failures[file_path] = sanitize_exception_message(e)
@@ -1186,7 +1198,9 @@ def should_process_modified_file_as_added(source_file_path, repo_config, github_
     """Return True when a modified source file has no writable target baseline."""
     target_local_path = repo_config.get("target_local_path")
     if target_local_path:
-        target_file_path = os.path.join(target_local_path, source_file_path)
+        target_file_path = get_safe_target_file_path(target_local_path, source_file_path)
+        if not target_file_path:
+            raise ValueError(f"Unsafe target file path: {source_file_path!r}")
         if os.path.exists(target_file_path):
             return False
         return True
@@ -1378,8 +1392,7 @@ def reconcile_restructured_files(
             continue
 
         try:
-            with open(target_file_path, "w", encoding="utf-8") as f:
-                f.write(reconciled)
+            atomic_write_text(target_file_path, reconciled)
         except Exception as e:
             mark_reconciliation_failure(
                 f"failed to write {target_file_path}: "
@@ -1419,9 +1432,25 @@ def process_translation_group(
     commit_ignore_files,
     translation_stats,
 ):
-    """Process one commit-sync translation group that shares the same base ref."""
+    """Process one commit-sync translation group that shares the same base ref.
+
+    Processing is intentionally best-effort across independent files. Successful
+    files remain eligible for staging and push even when other files fail; every
+    failed file must instead be recorded in TranslationStats so the generated
+    failure report provides the follow-up queue.
+    """
     thread_safe_print(f"\n🔁 Translation group: {group_label}")
     successful_file_paths = set()
+    partial_start = len(translation_stats.partial)
+    failed_start = len(translation_stats.failed)
+
+    def finalize(result):
+        translation_stats.set_retry_refs_for_new_issues(
+            partial_start,
+            failed_start,
+            diff_context.get("base_ref", "") if isinstance(diff_context, dict) else "",
+        )
+        return result
 
     if source_files_translation_mode == "full":
         thread_safe_print("📊 Compare diff: skipped for full translation mode")
@@ -1444,7 +1473,7 @@ def process_translation_group(
     else:
         if not filtered_changed_files:
             thread_safe_print("ℹ️  No matching source changes found for this translation group.")
-            return {
+            return finalize({
                 "attempted": False,
                 "successful_file_paths": successful_file_paths,
                 "counts": {
@@ -1458,7 +1487,7 @@ def process_translation_group(
                     "modified_images": 0,
                     "deleted_images": 0,
                 },
-            }
+            })
 
         thread_safe_print(f"📊 Filtered changed files: {len(filtered_changed_files)}")
         if pr_diff:
@@ -1484,7 +1513,7 @@ def process_translation_group(
                 group_label,
                 f"Source diff analysis failed: {sanitize_exception_message(e)}",
             )
-            return {
+            return finalize({
                 "attempted": True,
                 "successful_file_paths": successful_file_paths,
                 "counts": {
@@ -1497,7 +1526,7 @@ def process_translation_group(
                     "modified_images": 0,
                     "deleted_images": 0,
                 },
-            }
+            })
 
     full_translation_file_paths = set()
     if source_files_translation_mode == "full":
@@ -1585,8 +1614,11 @@ def process_translation_group(
 
     if deleted_files:
         thread_safe_print(f"\n🗑️  Processing {len(deleted_files)} deleted files...")
-        delete_success = process_deleted_files(deleted_files, github_client, repo_config)
-        if not delete_success:
+        delete_outcomes = process_deleted_files(
+            deleted_files, github_client, repo_config, return_outcomes=True
+        )
+        translation_stats.record_outcomes(delete_outcomes)
+        if not delete_outcomes.all_succeeded:
             thread_safe_print(f"   ⚠️  Some file deletions failed")
         git_add_changes(TARGET_REPO_PATH)
 
@@ -1595,22 +1627,22 @@ def process_translation_group(
         added_tasks = []
         for file_path, file_content in added_files.items():
             def run_added_file(path=file_path, content=file_content):
-                success, failure_reasons = process_added_files(
+                outcomes = process_added_files(
                     {path: content},
                     diff_context,
                     github_client,
                     ai_client,
                     repo_config,
                     glossary_matcher=glossary_matcher,
-                    return_details=True,
+                    return_outcomes=True,
                     overwrite_existing=path in full_translation_file_paths,
                 )
-                if success:
-                    return make_task_result("success")
-                return make_task_result(
-                    "failure",
-                    failure_reasons.get(path, "Added file processor returned failure"),
+                outcomes = normalize_added_file_outcomes(outcomes, path)
+                outcome = outcomes.get(
+                    path,
+                    {"status": "failed", "reason": "Missing added-file outcome"},
                 )
+                return make_task_result(outcome["status"], outcome.get("reason", ""))
 
             added_tasks.append(make_file_task(file_path, run_added_file))
 
@@ -1726,7 +1758,7 @@ def process_translation_group(
                 make_file_task(
                     source_file_path,
                     run_modified_file,
-                    resource_key=source_file_path.replace("/", "-").replace(".md", ""),
+                    resource_key=path_resource_key(source_file_path),
                 )
             )
 
@@ -1738,7 +1770,7 @@ def process_translation_group(
 
     if added_images or modified_images or deleted_images:
         thread_safe_print("\n🖼️  Processing images...")
-        process_all_images(
+        image_outcomes = process_all_images(
             added_images,
             modified_images,
             deleted_images,
@@ -1746,6 +1778,7 @@ def process_translation_group(
             github_client,
             repo_config,
         )
+        translation_stats.record_outcomes(image_outcomes)
         git_add_changes(TARGET_REPO_PATH)
 
     validate_successful_translation_structures(
@@ -1767,11 +1800,11 @@ def process_translation_group(
         "deleted_images": len(deleted_images),
     }
     print_group_summary(group_label, counts)
-    return {
+    return finalize({
         "attempted": True,
         "successful_file_paths": successful_file_paths,
         "counts": counts,
-    }
+    })
 
 
 def main():
@@ -1949,6 +1982,19 @@ def main():
                 TARGET_REPO_PATH,
                 base_ref,
             )
+            retry_groups, retry_file_paths = load_retry_cursor_groups(TARGET_REPO_PATH)
+            if retry_file_paths:
+                filtered_changed_files = [
+                    file
+                    for file in filtered_changed_files
+                    if not retry_file_paths.intersection(changed_file_candidate_paths(file))
+                ]
+                for retry_ref, file_paths in retry_groups.items():
+                    marker_groups.setdefault(retry_ref, set()).update(file_paths)
+                thread_safe_print(
+                    "\n♻️  Retrying files from persisted per-file cursors: "
+                    + ", ".join(sorted(retry_file_paths))
+                )
         elif run_type == "manual" and SOURCE_FILES.strip():
             filtered_changed_files, marker_groups, marker_file_paths = split_manual_source_files_by_corresponding_en_commit(
                 filtered_changed_files,
@@ -1993,7 +2039,6 @@ def main():
             add_counts(total_counts, group_result["counts"])
         elif not marker_groups:
             thread_safe_print("ℹ️  No matching source changes found after folder/file filtering.")
-            return 0
 
         for marker_ref, file_paths in sorted(marker_groups.items()):
             if commits_match(marker_ref, head_ref):
@@ -2012,10 +2057,10 @@ def main():
                     repo_configs,
                 )
             except Exception as e:
-                translation_stats.mark_failure(
-                    ",".join(sorted(file_paths)),
-                    f"Failed to build per-file cursor diff context: {sanitize_exception_message(e)}",
-                )
+                reason = f"Failed to build per-file cursor diff context: {sanitize_exception_message(e)}"
+                for file_path in sorted(file_paths):
+                    translation_stats.mark_failure(file_path, reason)
+                    translation_stats.set_retry_ref(file_path, marker_ref)
                 continue
 
             marker_source_files = ",".join(sorted(file_paths))
@@ -2073,6 +2118,17 @@ def main():
     else:
         marker_update_paths = set()
 
+    # A partial translation is useful enough to stage and push, but it is not a
+    # completed cursor checkpoint.  Keeping its old marker prevents a future
+    # run from silently treating an incomplete response as fully synchronized.
+    incomplete_translation_paths = {
+        path for path, _ in translation_stats.partial + translation_stats.failed
+    }
+    incomplete_translation_paths.update(
+        issue.file_path for issue in translation_stats.structure_errors
+    )
+    marker_update_paths -= incomplete_translation_paths
+
     if marker_update_paths:
         updated_marker_files, marker_failures = update_corresponding_en_commit_for_files(
             marker_update_paths,
@@ -2099,6 +2155,19 @@ def main():
                 f"Failed to update Corresponding EN commit marker: {reason}",
             )
 
+    if run_type == "scheduled":
+        completed_paths = (
+            set(translation_stats.succeeded) | marker_aligned_file_paths
+        ) - incomplete_translation_paths
+        if update_retry_cursor_ledger(
+            TARGET_REPO_PATH,
+            translation_stats,
+            completed_paths,
+            source_branch=SOURCE_BRANCH,
+            source_head_ref=SOURCE_HEAD_REF.strip(),
+        ):
+            git_add_changes(TARGET_REPO_PATH)
+
     thread_safe_print("\n" + "=" * 80)
     thread_safe_print("📊 Final Summary:")
     thread_safe_print("=" * 80)
@@ -2114,13 +2183,20 @@ def main():
     translation_stats.print_summary()
     translation_stats.write_failure_report(os.path.join(os.path.dirname(__file__), "temp_output"))
     thread_safe_print("=" * 80)
-    if translation_stats.failed:
-        thread_safe_print("⚠️  The commit-based sync workflow completed with per-file translation failures.")
+    if translation_stats.partial or translation_stats.failed:
+        thread_safe_print(
+            "⚠️  The commit-based sync workflow preserved useful per-file output "
+            "and recorded incomplete work in the failure report."
+        )
     if translation_stats.structure_errors:
         thread_safe_print("⚠️  The commit-based sync workflow completed with document structure mismatches.")
     if translation_stats.failed and FAIL_ON_TRANSLATION_ERROR:
         return 1
-    if not translation_stats.failed and not translation_stats.structure_errors:
+    if (
+        not translation_stats.partial
+        and not translation_stats.failed
+        and not translation_stats.structure_errors
+    ):
         thread_safe_print("🎉 The commit-based sync workflow completed successfully!")
     return 0
 

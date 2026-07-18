@@ -57,21 +57,60 @@ from parallel_file_processor import (
     run_file_tasks,
     should_parallelize_file_processing,
 )
-from special_file_utils import is_index_file_name, is_toc_file_name
+from special_file_utils import is_index_file_name, is_toc_file_name, path_resource_key
 from workflow_ignore_config import load_workflow_ignore_config
+from workflow_outcome import RunReport
 
 # Glossary terms path (optional, defaults to resources/terms.md in the docs repo)
 TERMS_PATH = os.getenv("TERMS_PATH", "")
 
 # Processing limit configuration
-MAX_NON_SYSTEM_SECTIONS_FOR_AI = 120
-SOURCE_TOKEN_LIMIT = 50000  # Maximum tokens for source new_content before skipping file processing
+def positive_int_env(name, default):
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+MAX_NON_SYSTEM_SECTIONS_FOR_AI = positive_int_env(
+    "MAX_NON_SYSTEM_SECTIONS_FOR_AI", 120
+)
+SOURCE_TOKEN_LIMIT = positive_int_env(
+    "SOURCE_TOKEN_LIMIT", 50000
+)  # Applies to regular modified-file source sections.
 
 # Special file configuration
 SPECIAL_FILES = ["TOC.md", "keywords.md"]
 WORKFLOW_IGNORE_CONFIG = load_workflow_ignore_config()
 PR_MODE_IGNORE_FILES = WORKFLOW_IGNORE_CONFIG["PR_MODE_IGNORE_FILES"]
 PR_MODE_IGNORE_FOLDERS = WORKFLOW_IGNORE_CONFIG["PR_MODE_IGNORE_FOLDERS"]
+
+
+def normalize_added_file_outcomes(result, file_path):
+    """Adapt legacy bool/tuple mocks and callers to the per-file outcome contract."""
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, tuple):
+        success = bool(result[0])
+        failures = result[1] if len(result) > 1 and isinstance(result[1], dict) else {}
+        return {
+            file_path: {
+                "status": "success" if success else "failed",
+                "reason": failures.get(file_path, "") if not success else "",
+            }
+        }
+    return {
+        file_path: {
+            "status": "success" if result else "failed",
+            "reason": "" if result else "Added file processor returned failure",
+        }
+    }
 
 # Repository configuration for workflow
 def get_workflow_repo_configs():
@@ -156,7 +195,9 @@ def git_add_changes(target_repo_path):
 def git_add_successful_task_changes(task_results, target_repo_path):
     """Stage successful task writes after a parallel batch has finished."""
     has_success = any(
-        result["ok"] and result["result"] and result["result"].get("status") == "success"
+        result["ok"]
+        and result["result"]
+        and result["result"].get("status") in {"success", "partial"}
         for result in task_results
     )
     if not has_success:
@@ -437,7 +478,7 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, so
         
         # Load source-diff-dict.json with file prefix
         temp_dir = ensure_temp_output_dir()
-        file_prefix = (source_file_path[:-3] if source_file_path.endswith('.md') else source_file_path).replace('/', '--')
+        file_prefix = path_resource_key(source_file_path)
         source_diff_dict_file = os.path.join(temp_dir, f"{file_prefix}-source-diff-dict.json")
         if os.path.exists(source_diff_dict_file):
             with open(source_diff_dict_file, 'r', encoding='utf-8') as f:
@@ -519,7 +560,7 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, so
         thread_safe_print(f"   ✅ Matched {len(enhanced_sections)} sections")
         
         # Save the match result for reference
-        match_file = os.path.join(temp_dir, f"{(source_file_path[:-3] if source_file_path.endswith('.md') else source_file_path).replace('/', '--')}-match_source_diff_to_target.json")
+        match_file = os.path.join(temp_dir, f"{path_resource_key(source_file_path)}-match_source_diff_to_target.json")
         with open(match_file, 'w', encoding='utf-8') as f:
             json.dump(enhanced_sections, f, ensure_ascii=False, indent=2)
         thread_safe_print(f"   💾 Saved match result to: {match_file}")
@@ -672,7 +713,8 @@ def process_regular_modified_file(source_file_path, file_sections, file_diff, so
         success = update_target_document_from_match_data(match_file, repo_config['target_local_path'], source_file_path)
         if success:
             thread_safe_print(f"   🎉 Target document successfully updated!")
-            return finish(True)
+            partial_reasons = getattr(ai_updated_sections, "partial_reasons", [])
+            return finish(True, "; ".join(partial_reasons))
         else:
             thread_safe_print(f"   ❌ Failed to update target document")
             return finish(False, f"Failed to update target document for {source_file_path}")
@@ -729,7 +771,7 @@ def _process_single_modified_file_for_pr(
         return_details=True,
     )
     if success:
-        return make_task_result("success")
+        return make_task_result("partial" if failure_reason else "success", failure_reason)
     return make_task_result(
         "failure",
         failure_reason or "Regular modified file processor returned failure",
@@ -891,6 +933,8 @@ def main():
     
     # Clean and prepare temp_output directory
     clean_temp_output_dir()
+    temp_output_dir = ensure_temp_output_dir()
+    run_report = RunReport()
     
     # Get repository configuration using workflow config
     try:
@@ -1005,14 +1049,22 @@ def main():
     if parallel_file_processing:
         thread_safe_print(f"⚡ Diff has {diff_file_count} files; file-level translation will use parallel chunks.")
     
-    # Step 3: Process different types of files based on operation type
+    # Step 3: Process different types of files based on operation type.
+    #
+    # Best-effort behavior is intentional here: file-level failures must not
+    # discard successful translations from the same run. For example, if 95 of
+    # 100 independent files succeed, those 95 files should remain eligible for
+    # staging and push while the failed files are logged for follow-up.
     thread_safe_print(f"\n📋 Step 3: Processing files based on operation type...")
     
     # Step 3.1: Process deleted files (file-level deletions)
     if deleted_files:
         thread_safe_print(f"\n🗑️  Step 3.1: Processing {len(deleted_files)} deleted files...")
-        delete_success = process_deleted_files(deleted_files, github_client, repo_config)
-        if not delete_success:
+        delete_outcomes = process_deleted_files(
+            deleted_files, github_client, repo_config, return_outcomes=True
+        )
+        run_report.record_outcomes(delete_outcomes)
+        if not delete_outcomes.all_succeeded:
             thread_safe_print(f"   ⚠️  Some file deletions failed")
         thread_safe_print(f"   ✅ Deleted files processed")
         git_add_changes(TARGET_REPO_PATH)
@@ -1024,18 +1076,19 @@ def main():
         added_tasks = []
         for file_path, file_content in added_files.items():
             def run_added_file(path=file_path, content=file_content):
-                success = process_added_files(
+                outcomes = process_added_files(
                     {path: content},
                     source_context,
                     github_client,
                     ai_client,
                     repo_config,
                     glossary_matcher=glossary_matcher,
+                    return_outcomes=True,
                     overwrite_existing=path in restructured_files,
                 )
-                if success:
-                    return make_task_result("success")
-                return make_task_result("failure", "Added file processor returned failure")
+                outcomes = normalize_added_file_outcomes(outcomes, path)
+                outcome = outcomes.get(path, {"status": "failed", "reason": "Missing added-file outcome"})
+                return make_task_result(outcome["status"], outcome.get("reason", ""))
 
             added_tasks.append(make_file_task(file_path, run_added_file))
 
@@ -1045,9 +1098,15 @@ def main():
             task_result = result["result"] or {}
             if result["ok"] and task_result.get("status") == "success":
                 thread_safe_print(f"   ✅ Successfully processed added file {file_path}")
+                run_report.mark_success(file_path)
+            elif result["ok"] and task_result.get("status") == "partial":
+                reason = task_result.get("reason", "Incomplete added-file translation")
+                thread_safe_print(f"   ⚠️  Partially processed added file {file_path}: {reason}")
+                run_report.mark_partial(file_path, reason)
             else:
                 reason = result["error"] or task_result.get("reason") or "Added file processor returned failure"
                 thread_safe_print(f"   ❌ Failed to process added file {file_path}: {reason}")
+                run_report.mark_failure(file_path, reason)
         git_add_successful_task_changes(added_results, TARGET_REPO_PATH)
         thread_safe_print(f"   ✅ Added files processed")
     
@@ -1081,9 +1140,11 @@ def main():
             task_result = result["result"] or {}
             if result["ok"] and task_result.get("status") == "success":
                 thread_safe_print(f"   ✅ Successfully processed TOC file {file_path}")
+                run_report.mark_success(file_path)
             else:
                 reason = result["error"] or task_result.get("reason") or "TOC processor returned failure"
                 thread_safe_print(f"   ❌ Failed to process TOC file {file_path}: {reason}")
+                run_report.mark_failure(file_path, reason)
         thread_safe_print(f"   ✅ Special files processed")
         git_add_successful_task_changes(toc_results, TARGET_REPO_PATH)
     
@@ -1110,11 +1171,15 @@ def main():
         if not keyword_success:
             for result in keyword_results:
                 if result["ok"] and result["result"] and result["result"].get("status") == "success":
+                    run_report.mark_success(result["file_path"])
                     continue
                 reason = result["error"] or (result["result"] or {}).get("reason") or "Keyword processor returned failure"
                 thread_safe_print(f"   ❌ Failed to process keyword file {result['file_path']}: {reason}")
-            thread_safe_print("   ❌ Keyword files processing failed, exiting workflow")
-            sys.exit(1)
+                run_report.mark_failure(result["file_path"], reason)
+            thread_safe_print("   ⚠️  Some keyword files failed; preserving successful file results")
+        else:
+            for result in keyword_results:
+                run_report.mark_success(result["file_path"])
         thread_safe_print(f"   ✅ Keyword files processed")
         git_add_successful_task_changes(keyword_results, TARGET_REPO_PATH)
     
@@ -1140,7 +1205,7 @@ def main():
                 make_file_task(
                     source_file_path,
                     run_modified_file,
-                    resource_key=(source_file_path[:-3] if source_file_path.endswith('.md') else source_file_path).replace('/', '--'),
+                    resource_key=path_resource_key(source_file_path),
                 )
             )
 
@@ -1149,6 +1214,7 @@ def main():
             source_file_path = result["file_path"]
             if not result["ok"]:
                 thread_safe_print(f"   ❌ Failed to process {source_file_path}: {result['error']}")
+                run_report.mark_failure(source_file_path, result["error"])
                 continue
 
             task_result = result["result"] or {}
@@ -1156,17 +1222,31 @@ def main():
             reason = task_result.get("reason", "")
             if status == "success":
                 thread_safe_print(f"   ✅ Successfully processed {source_file_path}")
+                run_report.mark_success(source_file_path)
+            elif status == "partial":
+                thread_safe_print(f"   ⚠️  Partially processed {source_file_path}: {reason}")
+                run_report.mark_partial(source_file_path, reason)
             elif status == "skipped":
                 thread_safe_print(f"   ⏭️  Skipped {source_file_path}: {reason}")
+                run_report.mark_skipped(source_file_path, reason)
             else:
                 thread_safe_print(f"   ❌ Failed to process {source_file_path}: {reason}")
+                run_report.mark_failure(source_file_path, reason)
 
         git_add_successful_task_changes(modified_results, TARGET_REPO_PATH)
     
     # Step 3.5: Process images (added, modified, deleted)
     if added_images or modified_images or deleted_images:
         thread_safe_print(f"\n🖼️  Step 3.5: Processing images...")
-        process_all_images(added_images, modified_images, deleted_images, source_context, github_client, repo_config)
+        image_outcomes = process_all_images(
+            added_images,
+            modified_images,
+            deleted_images,
+            source_context,
+            github_client,
+            repo_config,
+        )
+        run_report.record_outcomes(image_outcomes)
         thread_safe_print(f"   ✅ Images processed")
         git_add_changes(TARGET_REPO_PATH)
     
@@ -1182,8 +1262,16 @@ def main():
     thread_safe_print(f"   🖼️  Added images: {len(added_images)} processed")
     thread_safe_print(f"   🖼️  Modified images: {len(modified_images)} processed")
     thread_safe_print(f"   🖼️  Deleted images: {len(deleted_images)} processed")
+    run_report.print_summary(printer=thread_safe_print)
+    run_report.write_failure_report(temp_output_dir)
     thread_safe_print(f"="*80)
-    thread_safe_print(f"🎉 Workflow completed successfully!")
+    if run_report.partial or run_report.failed or run_report.structure_errors:
+        thread_safe_print(
+            "⚠️  Workflow preserved useful translated output and recorded "
+            "incomplete work in translation-failures.md."
+        )
+    else:
+        thread_safe_print("🎉 Workflow completed successfully!")
 
 if __name__ == "__main__":
     try:

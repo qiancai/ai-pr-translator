@@ -9,7 +9,8 @@ import json
 import threading
 from github import Github
 from openai import OpenAI
-from log_sanitizer import sanitize_exception_message
+from file_io import atomic_write_text
+from log_sanitizer import sanitize_exception_message, safe_target_path
 
 # Thread-safe printing
 print_lock = threading.Lock()
@@ -1035,8 +1036,7 @@ def process_toc_file_by_source_snapshot(file_path, toc_data, ai_client, repo_con
             thread_safe_print(f"      ... and {len(missing_translations) - 10} more")
         return False
 
-    with open(target_file_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(planned_lines))
+    atomic_write_text(target_file_path, "\n".join(planned_lines))
 
     thread_safe_print(f"   ✅ TOC file synced from source snapshot: {file_path}")
     return True
@@ -1052,7 +1052,7 @@ def process_toc_file(file_path, toc_data, source_context_or_pr_url, github_clien
     
     try:
         target_local_path = repo_config['target_local_path']
-        target_file_path = os.path.join(target_local_path, file_path)
+        target_file_path = safe_target_path(target_local_path, file_path)
 
         if toc_data.get("source_base_content") and toc_data.get("source_head_content"):
             return process_toc_file_by_source_snapshot(
@@ -1193,8 +1193,7 @@ def process_toc_file(file_path, toc_data, source_context_or_pr_url, github_clien
         
         # Write updated content back to file
         updated_content = '\n'.join(target_lines)
-        with open(target_file_path, 'w', encoding='utf-8') as f:
-            f.write(updated_content)
+        atomic_write_text(target_file_path, updated_content)
         
         thread_safe_print(f"   ✅ TOC file updated: {file_path}")
         return True

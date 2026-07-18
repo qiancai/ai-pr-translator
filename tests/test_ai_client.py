@@ -2,11 +2,13 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+import ai_client as ai_client_module
 from ai_client import (
     AI_MAX_TOKENS_AZURE,
     AI_MAX_TOKENS_DEEPSEEK,
@@ -49,6 +51,27 @@ class _RecordingChatCompletionsClient:
 
 
 class AIClientTokenLimitTest(unittest.TestCase):
+    def test_provider_specific_environment_budget_is_used_and_clamped(self):
+        with mock.patch.dict(
+            ai_client_module.os.environ,
+            {
+                "OPENAI_MAX_OUTPUT_TOKENS": "1234",
+                "DEEPSEEK_MAX_OUTPUT_TOKENS": "999999",
+            },
+            clear=False,
+        ):
+            self.assertEqual(get_provider_max_tokens("openai"), 1234)
+            self.assertEqual(get_provider_max_tokens("deepseek"), 8192)
+
+    def test_invalid_provider_specific_environment_budget_is_rejected(self):
+        with mock.patch.dict(
+            ai_client_module.os.environ,
+            {"GEMINI_MAX_OUTPUT_TOKENS": "0"},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(ValueError, "positive integer"):
+                get_provider_max_tokens("gemini")
+
     def test_azure_gpt_uses_65536_token_limit(self):
         responses = _RecordingResponsesClient()
         ai_client = object.__new__(UnifiedAIClient)
@@ -69,6 +92,8 @@ class AIClientTokenLimitTest(unittest.TestCase):
             responses.kwargs["max_output_tokens"],
             AI_MAX_TOKENS_DEEPSEEK,
         )
+        self.assertEqual(result.completion_status, "complete")
+        self.assertEqual(result.completion_reason, "")
 
     def test_provider_limits_do_not_fall_back_to_deepseek(self):
         self.assertEqual(get_provider_max_tokens("azure"), 65_536)
@@ -110,6 +135,61 @@ class AIClientTokenLimitTest(unittest.TestCase):
             ai_client.chat_completion(
                 [{"role": "user", "content": "Translate this document."}]
             )
+
+    def test_gemini_receives_temperature_and_output_budget(self):
+        recording_models = SimpleNamespace(kwargs=None)
+
+        def generate_content(**kwargs):
+            recording_models.kwargs = kwargs
+            return SimpleNamespace(
+                text=" translated ",
+                candidates=[SimpleNamespace(finish_reason="STOP")],
+            )
+
+        recording_models.generate_content = generate_content
+        ai_client = object.__new__(UnifiedAIClient)
+        ai_client.provider = "gemini"
+        ai_client.model = "gemini-test"
+        ai_client.max_tokens = 4096
+        ai_client.client = SimpleNamespace(models=recording_models)
+
+        with mock.patch.object(ai_client_module, "_GEMINI_NEW_SDK", True), mock.patch.object(
+            ai_client_module, "_gemini_call_count", 0
+        ), mock.patch.object(ai_client_module, "_gemini_cooldown_until", 0.0):
+            result = ai_client.chat_completion(
+                [{"role": "user", "content": "Translate"}],
+                temperature=0.25,
+                max_tokens=2048,
+            )
+
+        self.assertEqual(result, "translated")
+        self.assertEqual(
+            recording_models.kwargs["config"],
+            {"temperature": 0.25, "max_output_tokens": 2048},
+        )
+
+    def test_gemini_max_tokens_finish_reason_is_incomplete_metadata(self):
+        models = SimpleNamespace(
+            generate_content=lambda **kwargs: SimpleNamespace(
+                text="partial",
+                candidates=[SimpleNamespace(finish_reason="MAX_TOKENS")],
+            )
+        )
+        ai_client = object.__new__(UnifiedAIClient)
+        ai_client.provider = "gemini"
+        ai_client.model = "gemini-test"
+        ai_client.max_tokens = 1024
+        ai_client.client = SimpleNamespace(models=models)
+
+        with mock.patch.object(ai_client_module, "_GEMINI_NEW_SDK", True), mock.patch.object(
+            ai_client_module, "_gemini_call_count", 0
+        ), mock.patch.object(ai_client_module, "_gemini_cooldown_until", 0.0):
+            result = ai_client.chat_completion(
+                [{"role": "user", "content": "Translate"}]
+            )
+
+        self.assertEqual(result.completion_status, "incomplete")
+        self.assertEqual(result.completion_reason, "MAX_TOKENS")
 
 
 if __name__ == "__main__":

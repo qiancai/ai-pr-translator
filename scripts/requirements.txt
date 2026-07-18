@@ -1,5 +1,5 @@
-PyGithub>=1.55.0
-openai>=1.0.0
-tiktoken>=0.4.0
-google-generativeai>=0.3.0
-markdown-it-py>=3.0.0
+PyGithub==2.3.0
+openai==1.69.0
+tiktoken==0.11.0
+google-generativeai==0.8.5
+markdown-it-py==3.0.0

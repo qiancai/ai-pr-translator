@@ -1074,7 +1074,7 @@ class DiffAnalyzerContextTest(unittest.TestCase):
         self.assertEqual(source_diff_dict["modified_3"]["original_hierarchy"], "bottom-modified-3")
         self.assertEqual(source_diff_dict["modified_3"]["matching_hierarchy"], "## Section")
 
-    def test_crlf_wrapper_before_added_heading_does_not_modify_previous_section(self):
+    def test_crlf_wrapper_before_added_heading_routes_to_structural_reconciliation(self):
         file_path = "tidb-cloud/architecture-concepts.md"
         output_file = self.temp_output_dir / "tidb-cloud-architecture-concepts-source-diff-dict.json"
         if output_file.exists():
@@ -1143,19 +1143,13 @@ class DiffAnalyzerContextTest(unittest.TestCase):
             repo_configs=self.repo_configs,
         )
 
-        added_sections, modified_sections = result[0], result[1]
-        self.assertIn(file_path, added_sections)
-        self.assertIn(file_path, modified_sections)
-        self.assertEqual(
-            {"11": "## Request units and capacity in {{{ .premium }}} {#request-units-and-capacity-in-premium}"},
-            modified_sections[file_path]["sections"],
-        )
-
-        source_diff = json.loads(output_file.read_text(encoding="utf-8"))
-        self.assertEqual(["added_11"], list(source_diff.keys()))
-        new_content = source_diff["added_11"]["new_content"]
-        self.assertLess(new_content.index("<CustomContent"), new_content.index("## Request units"))
-        self.assertIn("</CustomContent>", new_content)
+        added_sections, modified_sections, _, added_files = result[:4]
+        restructured_files = result[10]
+        self.assertNotIn(file_path, added_sections)
+        self.assertNotIn(file_path, modified_sections)
+        self.assertEqual(added_files[file_path], head_content)
+        self.assertIn(file_path, restructured_files)
+        self.assertFalse(output_file.exists())
 
     def test_regular_paragraph_before_added_heading_still_modifies_previous_section(self):
         file_path = "guide.md"
@@ -1198,7 +1192,7 @@ class DiffAnalyzerContextTest(unittest.TestCase):
         self.assertIn("added_9", source_diff)
         self.assertIn("New paragraph.", source_diff["modified_3"]["new_content"])
 
-    def test_deleted_mdx_wrapper_between_headings_is_preserved_as_structural_changes(self):
+    def test_deleted_mdx_wrapper_routes_to_structural_reconciliation(self):
         file_path = "guide.md"
         base_content = "\n".join(
             [
@@ -1296,7 +1290,7 @@ class DiffAnalyzerContextTest(unittest.TestCase):
             self.repo_configs,
         )
 
-        analyze_source_changes(
+        result = analyze_source_changes(
             context,
             github,
             special_files=["TOC.md", "keywords.md"],
@@ -1304,15 +1298,14 @@ class DiffAnalyzerContextTest(unittest.TestCase):
             repo_configs=self.repo_configs,
         )
 
-        source_diff = json.loads(self.generated_file.read_text(encoding="utf-8"))
-        self.assertIn("modified_5", source_diff)
-        self.assertIn("modified_13", source_diff)
-        self.assertNotIn("modified_9", source_diff)
-
-        self.assertIn('<CustomContent plan="essential">', source_diff["modified_5"]["old_content"])
-        self.assertNotIn('<CustomContent plan="essential">', source_diff["modified_5"]["new_content"])
-        self.assertIn("</CustomContent>", source_diff["modified_13"]["old_content"])
-        self.assertNotIn("</CustomContent>", source_diff["modified_13"]["new_content"])
+        added_sections, modified_sections, deleted_sections, added_files = result[:4]
+        restructured_files = result[10]
+        self.assertNotIn(file_path, added_sections)
+        self.assertNotIn(file_path, modified_sections)
+        self.assertNotIn(file_path, deleted_sections)
+        self.assertEqual(added_files[file_path], head_content)
+        self.assertIn(file_path, restructured_files)
+        self.assertFalse(self.generated_file.exists())
 
     def test_deleted_line_uses_head_position_for_section_mapping(self):
         file_path = "guide.md"

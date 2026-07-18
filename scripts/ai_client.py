@@ -71,13 +71,45 @@ PROVIDER_MAX_TOKENS = {
     "azure":    AI_MAX_TOKENS_AZURE,
 }
 
+PROVIDER_MAX_TOKENS_ENV = {
+    "deepseek": "DEEPSEEK_MAX_OUTPUT_TOKENS",
+    "gemini": "GEMINI_MAX_OUTPUT_TOKENS",
+    "openai": "OPENAI_MAX_OUTPUT_TOKENS",
+    "azure": "AZURE_MAX_OUTPUT_TOKENS",
+}
+
+
+class CompletionText(str):
+    """String-compatible AI output carrying completion metadata."""
+
+    def __new__(cls, value, status="complete", reason=""):
+        obj = super().__new__(cls, value or "")
+        obj.completion_status = status
+        obj.completion_reason = reason
+        return obj
+
+
+def _configured_provider_max_tokens(provider, hard_limit):
+    env_name = PROVIDER_MAX_TOKENS_ENV[provider]
+    raw_value = os.getenv(env_name, "").strip()
+    if not raw_value:
+        return hard_limit
+    try:
+        configured = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{env_name} must be a positive integer") from exc
+    if configured <= 0:
+        raise ValueError(f"{env_name} must be a positive integer")
+    return min(configured, hard_limit)
+
 
 def get_provider_max_tokens(provider):
     """Return the configured output-token budget for a supported provider."""
     try:
-        return PROVIDER_MAX_TOKENS[provider]
+        hard_limit = PROVIDER_MAX_TOKENS[provider]
     except KeyError as exc:
         raise ValueError(f"Unsupported AI provider: {provider}") from exc
+    return _configured_provider_max_tokens(provider, hard_limit)
 
 # ---------------------------------------------------------------------------
 # Gemini rate-limiting state
@@ -102,7 +134,7 @@ class UnifiedAIClient:
             from openai import OpenAI
             self.client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
             self.model = DEEPSEEK_MODEL_NAME
-            self.max_tokens = AI_MAX_TOKENS_DEEPSEEK
+            self.max_tokens = get_provider_max_tokens(provider)
 
         elif provider == "gemini":
             if not GEMINI_AVAILABLE:
@@ -118,7 +150,7 @@ class UnifiedAIClient:
                 genai.configure(api_key=GEMINI_API_KEY)
                 self.client = None
             self.model = GEMINI_MODEL_NAME
-            self.max_tokens = AI_MAX_TOKENS_GEMINI
+            self.max_tokens = get_provider_max_tokens(provider)
 
         elif provider == "openai":
             from openai import OpenAI
@@ -126,7 +158,7 @@ class UnifiedAIClient:
                 raise ValueError("OPENAI_API_TOKEN environment variable must be set")
             self.client = OpenAI(api_key=OPENAI_API_KEY)
             self.model = OPENAI_MODEL_NAME
-            self.max_tokens = AI_MAX_TOKENS_OPENAI
+            self.max_tokens = get_provider_max_tokens(provider)
 
         elif provider == "azure":
             from openai import OpenAI
@@ -136,7 +168,7 @@ class UnifiedAIClient:
                 raise ValueError("OPENAI_BASE_URL environment variable must be set")
             self.client = OpenAI(api_key=AZURE_OPENAI_KEY, base_url=AZURE_OPENAI_BASE_URL)
             self.model = AZURE_OPENAI_MODEL_NAME
-            self.max_tokens = AI_MAX_TOKENS_AZURE
+            self.max_tokens = get_provider_max_tokens(provider)
 
         else:
             raise ValueError(f"Unsupported AI provider: {provider}")
@@ -162,13 +194,19 @@ class UnifiedAIClient:
                     f"Output hit the {max_tokens}-token limit. "
                     f"Consider reducing batch size."
                 )
-            return response.choices[0].message.content.strip()
+            status = "incomplete" if finish_reason == "length" else "complete"
+            reason = "max_output_tokens" if finish_reason == "length" else ""
+            return CompletionText(
+                response.choices[0].message.content.strip(),
+                status=status,
+                reason=reason,
+            )
 
         elif self.provider == "azure":
             return self._azure_chat(messages, temperature, max_tokens)
 
         elif self.provider == "gemini":
-            return self._gemini_chat(messages)
+            return self._gemini_chat(messages, temperature, max_tokens)
 
     # -----------------------------------------------------------------------
     def _azure_chat(self, messages, temperature, max_tokens):
@@ -194,6 +232,7 @@ class UnifiedAIClient:
 
         response = self.client.responses.create(**kwargs)
         status = getattr(response, "status", None)
+        reason = ""
         if status == "incomplete":
             incomplete_details = getattr(response, "incomplete_details", None)
             reason = getattr(incomplete_details, "reason", "unknown") if incomplete_details else "unknown"
@@ -207,10 +246,14 @@ class UnifiedAIClient:
             raise RuntimeError(
                 f"Azure AI response did not include output text (status='{status or 'unknown'}')"
             )
-        return output_text.strip()
+        return CompletionText(
+            output_text.strip(),
+            status="incomplete" if status == "incomplete" else "complete",
+            reason=reason,
+        )
 
     # -----------------------------------------------------------------------
-    def _gemini_chat(self, messages):
+    def _gemini_chat(self, messages, temperature, max_tokens):
         global _gemini_call_count, _gemini_cooldown_until
         try:
             while True:
@@ -247,15 +290,40 @@ class UnifiedAIClient:
 
             if _GEMINI_NEW_SDK:
                 response = self.client.models.generate_content(
-                    model=self.model, contents=prompt
+                    model=self.model,
+                    contents=prompt,
+                    config={
+                        "temperature": temperature,
+                        "max_output_tokens": max_tokens,
+                    },
                 )
             else:
                 model = genai.GenerativeModel(self.model)
-                response = model.generate_content(prompt)
+                response = model.generate_content(
+                    prompt,
+                    generation_config={
+                        "temperature": temperature,
+                        "max_output_tokens": max_tokens,
+                    },
+                )
 
             if response and response.text:
                 thread_safe_print("   ✅ Gemini response received")
-                return response.text.strip()
+                finish_reason = ""
+                candidates = getattr(response, "candidates", None) or []
+                if candidates:
+                    finish_reason = str(getattr(candidates[0], "finish_reason", "") or "")
+                normalized_reason = finish_reason.lower()
+                incomplete = "max_token" in normalized_reason or normalized_reason.endswith("length")
+                if incomplete:
+                    thread_safe_print(
+                        f"   ⚠️  Gemini AI response incomplete (reason='{finish_reason}')."
+                    )
+                return CompletionText(
+                    response.text.strip(),
+                    status="incomplete" if incomplete else "complete",
+                    reason=finish_reason or ("max_output_tokens" if incomplete else ""),
+                )
 
         except Exception as e:
             thread_safe_print(f"   ❌ Gemini API error: {sanitize_exception_message(e)}")

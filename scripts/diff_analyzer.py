@@ -16,9 +16,9 @@ import threading
 from typing import Optional
 from urllib.parse import urlparse
 from github import Github
-from log_sanitizer import sanitize_exception_message
+from log_sanitizer import sanitize_exception_message, safe_target_path
 from section_matcher import clean_title_for_matching
-from special_file_utils import find_heading_line_indices, is_index_file_name, is_learning_path_index_content, is_toc_file_name
+from special_file_utils import find_heading_line_indices, is_index_file_name, is_learning_path_index_content, is_toc_file_name, path_resource_key
 from translation_structure_validator import (
     custom_content_tag_signature,
     extract_custom_content_tags,
@@ -472,7 +472,7 @@ def get_target_file_content(
 ):
     """Read target file content from local checkout, target ref, or default branch."""
     if prefer_local_target_for_read and target_local_path:
-        local_file_path = os.path.join(target_local_path, file_path)
+        local_file_path = safe_target_path(target_local_path, file_path)
         if os.path.exists(local_file_path):
             try:
                 with open(local_file_path, 'r', encoding='utf-8') as f:
@@ -3620,7 +3620,7 @@ def analyze_source_changes(
         temp_dir = os.path.join(script_dir, "temp_output")
         os.makedirs(temp_dir, exist_ok=True)
         
-        file_prefix = (file.filename[:-3] if file.filename.endswith('.md') else file.filename).replace('/', '--')
+        file_prefix = path_resource_key(file.filename)
         output_file = os.path.join(temp_dir, f"{file_prefix}-source-diff-dict.json")
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(source_diff_dict, f, ensure_ascii=False, indent=2)

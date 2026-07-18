@@ -62,6 +62,9 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
             commit_sync_workflow_local.os.environ,
             {
                 "GITHUB_TOKEN": "token",
+                "AZURE_OPENAI_KEY": "",
+                "AZURE_OPENAI_BASE_URL": "",
+                "OPENAI_BASE_URL": "",
                 "TRANS_KEY": "trans-key",
                 "TRANS_URL": "https://trans.example/v1",
             },
@@ -184,6 +187,88 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
                     "outside-link/escaped.md",
                 )
             )
+
+    def test_retry_cursor_ledger_preserves_incomplete_range_and_clears_success(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ledger = Path(tmpdir, workflow.RETRY_LEDGER_FILE)
+            ledger.write_text(
+                json.dumps(
+                    {
+                        "target": "main",
+                        "sha": "abcdef1234567890",
+                        "pending": {"done.md": "1111111", "old.md": "2222222"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stats = workflow.TranslationStats()
+            stats.mark_partial("partial.md", "AI output incomplete")
+            stats.set_retry_ref("partial.md", "3333333")
+
+            self.assertTrue(
+                workflow.update_retry_cursor_ledger(
+                    tmpdir,
+                    stats,
+                    {"done.md"},
+                    source_branch="release-8.5",
+                    source_head_ref="4444444",
+                )
+            )
+            updated = json.loads(ledger.read_text(encoding="utf-8"))
+            self.assertEqual(updated["target"], "release-8.5")
+            self.assertEqual(updated["sha"], "4444444")
+            self.assertEqual(
+                updated["pending"],
+                {"old.md": "2222222", "partial.md": "3333333"},
+            )
+            groups, paths = workflow.load_retry_cursor_groups(tmpdir)
+            self.assertEqual(groups["3333333"], {"partial.md"})
+            self.assertEqual(paths, {"old.md", "partial.md"})
+
+    def test_retry_cursor_ledger_is_initialized_when_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stats = workflow.TranslationStats()
+            stats.mark_failure("failed.md", "AI unavailable")
+            stats.set_retry_ref("failed.md", "1111111")
+
+            self.assertTrue(
+                workflow.update_retry_cursor_ledger(
+                    tmpdir,
+                    stats,
+                    set(),
+                    source_branch="main",
+                    source_head_ref="2222222",
+                )
+            )
+            ledger = json.loads(
+                Path(tmpdir, workflow.RETRY_LEDGER_FILE).read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(ledger["target"], "main")
+        self.assertEqual(ledger["sha"], "2222222")
+        self.assertEqual(ledger["pending"], {"failed.md": "1111111"})
+
+    def test_unsafe_modified_target_path_is_explicitly_rejected(self):
+        with mock.patch.object(workflow, "get_safe_target_file_path", return_value=None):
+            with self.assertRaisesRegex(ValueError, "Unsafe target file path"):
+                workflow.should_process_modified_file_as_added(
+                    "../escaped.md",
+                    {"target_local_path": "/tmp/target"},
+                    object(),
+                )
+
+    def test_partial_task_is_staged_but_not_counted_as_complete(self):
+        stats = workflow.TranslationStats()
+        result = {
+            "file_path": "guide.md",
+            "ok": True,
+            "result": {"status": "partial", "reason": "AI response incomplete"},
+            "error": None,
+        }
+
+        self.assertTrue(workflow._record_translation_task_result(result, stats))
+        self.assertEqual(stats.succeeded, [])
+        self.assertEqual(stats.partial, [("guide.md", "AI response incomplete")])
 
     def test_upsert_corresponding_en_commit_adds_marker_after_h1(self):
         content = "---\ntitle: 系统变量\n---\n\n# 系统变量\n\nBody\n"
@@ -1951,6 +2036,20 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
 
         self.assertIn("### Translation failures", report)
         self.assertIn("- `cloud.md`: Matcher failed", report)
+
+    def test_translation_stats_writes_partial_output_to_failure_report(self):
+        stats = workflow.TranslationStats()
+        stats.mark_partial("partial.md", "AI response incomplete")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stats.write_failure_report(tmpdir)
+            report = Path(tmpdir, "translation-failures.md").read_text(encoding="utf-8")
+            records = json.loads(
+                Path(tmpdir, "translation-failures.json").read_text(encoding="utf-8")
+            )
+
+        self.assertIn("### Partial or incomplete translations", report)
+        self.assertEqual(records[0]["status"], "partial")
 
     def test_translation_stats_writes_structure_report_without_translation_failures(self):
         stats = workflow.TranslationStats()

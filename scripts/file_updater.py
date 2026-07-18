@@ -12,9 +12,10 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from github import Github
 from openai import OpenAI
+from file_io import atomic_write_text
 from log_sanitizer import sanitize_exception_message, safe_target_path
 from product_specific_handler import rewrite_tidb_version_anchors_in_sections
-from special_file_utils import source_scope_includes_folder
+from special_file_utils import path_resource_key, source_scope_includes_folder
 from svg_preprocessor import (
     strip_svgs,
     restore_svgs,
@@ -47,8 +48,7 @@ def write_text_lines_preserve_newlines(file_path, lines):
         lines,
         preserve_final_newline=file_ends_with_newline(file_path),
     )
-    with open(file_path, 'w', encoding='utf-8', newline='') as f:
-        f.writelines(lines)
+    atomic_write_text(file_path, "".join(lines), newline="")
 
 def file_ends_with_newline(file_path):
     """Return whether the existing file ends with a newline byte."""
@@ -113,11 +113,12 @@ TRANSLATION_CHUNK_CHAR_LIMIT = int(os.getenv("TRANSLATION_CHUNK_CHAR_LIMIT", "40
 
 
 class TranslationResult(dict):
-    """Dictionary of translated sections with non-fatal chunk failures attached."""
+    """Translated sections with fatal and non-fatal completeness metadata."""
 
-    def __init__(self, initial=None, failures=None):
+    def __init__(self, initial=None, failures=None, partial_reasons=None):
         super().__init__(initial or {})
         self.failures = list(failures or [])
+        self.partial_reasons = list(partial_reasons or [])
 
 
 def has_explicit_heading_anchor(heading_line):
@@ -635,7 +636,7 @@ def estimate_translation_tokens(text):
 def get_target_file_prefix_for_debug(target_file_name, target_sections):
     """Build the temp_output file prefix used by prompt/result debug files."""
     if target_file_name:
-        return target_file_name.replace('/', '_').replace('.md', '')
+        return path_resource_key(target_file_name)
 
     if target_sections:
         first_key = next(iter(target_sections.keys()), "")
@@ -872,7 +873,15 @@ def _prepare_translation_prompt(
 
     glossary_prompt_section = ""
     glossary_instruction = ""
-    if glossary_matcher:
+    # A chunk with no overlapping hunk contains only a "File:" header.  Do
+    # not invoke the glossary matcher for that empty slice; doing so adds cost
+    # and can accidentally select terms unrelated to this chunk.
+    has_changed_diff_line = any(
+        (line.startswith("+") and not line.startswith("+++"))
+        or (line.startswith("-") and not line.startswith("---"))
+        for line in (prompt_pr_diff or "").splitlines()
+    )
+    if glossary_matcher and has_changed_diff_line:
         from glossary import filter_terms_for_content, format_terms_for_prompt
         matched_terms = filter_terms_for_content(
             glossary_matcher,
@@ -936,7 +945,7 @@ Instructions:
         - Code examples, SQL queries, configuration values, doc variables/placeholders such as {DOC_VARIABLE_EXAMPLE}, and Mermaid diagram code blocks (```mermaid ... ```). Preserve doc variables exactly as they appear, including triple braces and when they appear inside HTML attributes or tab labels.
         - Explicit heading anchors such as {{#example-test}} in the section titles.
         - Technical terms like "TiDB", "TiKV", "PD", API names, etc.
-        - HTML/MDX component tags, including tag names, attributes, and closing tags, such as <CustomContent plan="premium"> and </CustomContent>.
+        - Preserve HTML/MDX component tags exactly, including tag names, attributes, and closing tags, such as <CustomContent plan="premium"> and </CustomContent>.
         - File paths, URLs, and command line examples
         - Variable names and system configuration parameters
         - Some text wrapped in ** (such as **Create Resource** on the **My TiDB** page) are UI button or label names, keep them in English if the context of that paragraph indicates that it is UI text.
@@ -955,7 +964,7 @@ Instructions:
 
 Input:
 
-1. Latest source sections in {source_language}:
+{source_sections_heading}
 {formatted_source_sections}
 
 Note: These sections are provided only to understand the final source context. Do not use them to introduce any target-language changes unless the exact source lines are changed in the Git diff.
@@ -984,7 +993,10 @@ def _execute_ai_translation(
     formatted_source_preview = ""
     formatted_target_preview = ""
     try:
-        src_json = json.loads(prompt.split("1. Latest source sections in")[1].split("\n2. GitHub PR changes (Git Diff):")[0].strip().rsplit("\n", 1)[0])
+        source_block = prompt.split("1. Source sections in", 1)[1].split(
+            "\n2. GitHub PR changes (Git Diff):", 1
+        )[0]
+        src_json = json.loads(source_block.split("\n", 1)[1].strip())
         formatted_source_preview = json.dumps(src_json, ensure_ascii=False, indent=2)[:500]
     except Exception:
         formatted_source_preview = "(preview unavailable)"
@@ -1034,6 +1046,26 @@ def _execute_ai_translation(
         verbose_thread_safe_print(f"   📋 AI response (first 500 chars): {(ai_response or '')[:500]}...")
 
         result = parse_updated_sections(ai_response)
+        if not isinstance(result, dict):
+            return TranslationResult(failures=["AI response did not contain a valid JSON object"])
+        expected_keys = set(target_sections)
+        returned_keys = set(result)
+        extra_keys = sorted(returned_keys - expected_keys)
+        partial_reasons = []
+        if extra_keys:
+            result = {
+                key: value for key, value in result.items() if key in expected_keys
+            }
+            if not result:
+                return TranslationResult(
+                    failures=[
+                        "AI response contained no expected section keys; unexpected keys: "
+                        + ", ".join(extra_keys)
+                    ]
+                )
+            partial_reasons.append(
+                "AI response ignored unexpected section keys: " + ", ".join(extra_keys)
+            )
         result = rewrite_tidb_version_anchors_in_sections(
             result,
             source_language,
@@ -1041,6 +1073,17 @@ def _execute_ai_translation(
             source_mode=source_mode,
         )
         result = enforce_minimal_target_updates(target_sections, result, pr_diff)
+        if getattr(ai_response, "completion_status", "complete") == "incomplete":
+            partial_reasons.append(
+                "AI response incomplete: "
+                + (getattr(ai_response, "completion_reason", "") or "unknown reason")
+            )
+        missing_keys = sorted(expected_keys - set(result))
+        if missing_keys:
+            partial_reasons.append(
+                "AI response missing section keys: " + ", ".join(missing_keys)
+            )
+        result = TranslationResult(result, partial_reasons=partial_reasons)
         thread_safe_print(f"   📊 Parsed {len(result)} sections from AI response")
 
         ai_results_file = os.path.join(
@@ -1054,7 +1097,9 @@ def _execute_ai_translation(
 
     except Exception as e:
         thread_safe_print(f"   ❌ AI translation failed: {sanitize_exception_message(e)}")
-        return {}
+        return TranslationResult(
+            failures=[f"AI translation failed: {sanitize_exception_message(e)}"]
+        )
 
 
 def get_updated_sections_from_ai_chunked(
@@ -1078,7 +1123,14 @@ def get_updated_sections_from_ai_chunked(
     """
     target_file_prefix = get_target_file_prefix_for_debug(target_file_name, target_sections)
     routing_sections = chunk_routing_sections or source_sections
-    chunk_max_sections = get_translation_chunk_max_sections(target_file_name)
+    # The diff header is the authoritative source path.  Debug/test prefixes
+    # can differ from it, and using those prefixes would select the wrong
+    # per-document chunk policy.
+    diff_file_match = re.search(r"^File:\s*(.+?)\s*$", pr_diff or "", re.MULTILINE)
+    chunk_policy_file = (
+        diff_file_match.group(1) if diff_file_match else target_file_name
+    )
+    chunk_max_sections = get_translation_chunk_max_sections(chunk_policy_file)
     chunks = build_translation_chunks(
         routing_sections,
         target_sections,
@@ -1156,6 +1208,7 @@ def get_updated_sections_from_ai_chunked(
     # ------------------------------------------------------------------
     merged_result = TranslationResult()
     failures = []
+    partial_reasons = []
 
     for cp in prepared:
         chunk_index = cp["index"]
@@ -1177,6 +1230,7 @@ def get_updated_sections_from_ai_chunked(
         )
 
         if not chunk_result:
+            failures.extend(getattr(chunk_result, "failures", []))
             failures.append(
                 f"failed to translate chunk {chunk_index}/{total_chunks} "
                 f"(sections: {cp['section_summary']})"
@@ -1184,25 +1238,31 @@ def get_updated_sections_from_ai_chunked(
             continue
 
         merged_result.update(chunk_result)
+        partial_reasons.extend(getattr(chunk_result, "partial_reasons", []))
         missing_keys = [key for key in cp["keys"] if key not in chunk_result]
         if missing_keys:
             missing_summary = summarize_chunk_sections(missing_keys, routing_sections)
-            failures.append(
+            partial_reasons.append(
                 f"failed to translate chunk {chunk_index}/{total_chunks} "
                 f"(missing sections: {missing_summary})"
             )
 
-    merged_result.failures = failures
+    if merged_result:
+        partial_reasons.extend(failures)
+        merged_result.partial_reasons = list(dict.fromkeys(partial_reasons))
+    else:
+        merged_result.failures = list(dict.fromkeys(failures))
 
     ai_results_file = os.path.join(temp_dir, f"{target_file_prefix}_updated_sections_from_ai.json")
     with open(ai_results_file, 'w', encoding='utf-8') as f:
         json.dump(merged_result, f, ensure_ascii=False, indent=2)
     thread_safe_print(f"   💾 Merged AI chunk results saved to {ai_results_file}")
 
-    if failures:
-        thread_safe_print(f"   ⚠️  Chunk translation completed with {len(failures)} failure(s)")
-        for failure in failures:
-            thread_safe_print(f"      ❌ {failure}")
+    reported_reasons = merged_result.partial_reasons or merged_result.failures
+    if reported_reasons:
+        thread_safe_print(f"   ⚠️  Chunk translation completed with {len(reported_reasons)} issue(s)")
+        for reason in reported_reasons:
+            thread_safe_print(f"      ❌ {reason}")
 
     return merged_result
 
@@ -1245,8 +1305,11 @@ def get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_di
             return result
         restored = restore_svgs_in_dict(result, svg_map)
         if hasattr(result, "failures"):
-            restored_obj = TranslationResult(restored)
-            restored_obj.failures = result.failures
+            restored_obj = TranslationResult(
+                restored,
+                failures=result.failures,
+                partial_reasons=getattr(result, "partial_reasons", []),
+            )
             return restored_obj
         return restored
 
@@ -1562,8 +1625,7 @@ def update_local_document(file_path, updated_sections, hierarchy_dict, target_lo
             print(f"      ✅ Updated {replacement['type']} section: {replacement.get('line_num', 'frontmatter')}")
         
         # Save updated document
-        with open(local_path, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(lines))
+        atomic_write_text(local_path, '\n'.join(lines))
         
         print(f"   ✅ Updated {len(replacements_made)} sections")
         for replacement in replacements_made:
@@ -1729,8 +1791,7 @@ def insert_sections_into_document(file_path, translated_sections, target_inserti
             })
         
         # Save updated document
-        with open(local_path, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(lines))
+        atomic_write_text(local_path, '\n'.join(lines))
         
         thread_safe_print(f"   ✅ Successfully inserted {len(insertions_made)} section groups")
         for insertion in insertions_made:
@@ -1897,7 +1958,7 @@ def process_single_file_deletion(file_path, source_sections, source_context_or_p
 
 def delete_sections_from_document(file_path, sections_to_delete, target_local_path):
     """Delete specified sections from the local document"""
-    target_file_path = os.path.join(target_local_path, file_path)
+    target_file_path = safe_target_path(target_local_path, file_path)
     
     if not os.path.exists(target_file_path):
         thread_safe_print(f"   ❌ Target file not found: {target_file_path}")
@@ -2158,14 +2219,13 @@ def process_single_file(file_path, source_sections, pr_diff, source_context_or_p
             filtered_target_hierarchy = filter_non_system_sections(target_hierarchy)
             
             # Check if filtered target hierarchy exceeds the maximum allowed for AI mapping
-            MAX_NON_SYSTEM_SECTIONS_FOR_AI = 120
-            if len(filtered_target_hierarchy) > MAX_NON_SYSTEM_SECTIONS_FOR_AI:
-                thread_safe_print(f"   [{thread_id}] ❌ Too many non-system sections ({len(filtered_target_hierarchy)} > {MAX_NON_SYSTEM_SECTIONS_FOR_AI})")
+            if len(filtered_target_hierarchy) > max_non_system_sections:
+                thread_safe_print(f"   [{thread_id}] ❌ Too many non-system sections ({len(filtered_target_hierarchy)} > {max_non_system_sections})")
                 thread_safe_print(f"   [{thread_id}] ⚠️  Skipping AI mapping for regular sections to avoid complexity")
                 
                 # If no system sections were matched either, return error
                 if not target_affected:
-                    error_message = f"File {file_path} has too many non-system sections ({len(filtered_target_hierarchy)} > {MAX_NON_SYSTEM_SECTIONS_FOR_AI}) and no system variable sections were matched"
+                    error_message = f"File {file_path} has too many non-system sections ({len(filtered_target_hierarchy)} > {max_non_system_sections}) and no system variable sections were matched"
                     return False, error_message
                 
                 # Continue with only system variable matches if available
@@ -2712,7 +2772,7 @@ def update_target_document_from_match_data(match_file_path, target_local_path, t
     else:
         thread_safe_print(f"   📂 Using provided target file name: {target_file_name}")
     
-    target_file_path = os.path.join(target_local_path, target_file_name)
+    target_file_path = safe_target_path(target_local_path, target_file_name)
     thread_safe_print(f"\n📄 Target file path: {target_file_path}")
     
     # Update target document

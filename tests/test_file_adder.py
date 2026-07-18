@@ -18,9 +18,39 @@ from file_adder import (
     strip_ai_markdown_wrapper,
     translate_file_batch,
 )
+from ai_client import CompletionText
 
 
 class FileAdderRegressionTest(unittest.TestCase):
+    def test_incomplete_added_file_response_is_written_and_reported_as_partial(self):
+        class FakeAIClient:
+            def chat_completion(self, messages, temperature=0.1):
+                return CompletionText(
+                    "# 已翻译\n\n有用的部分输出\n",
+                    status="incomplete",
+                    reason="max_output_tokens",
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outcomes = process_added_files(
+                {"guide.md": "# Guide\n\nUseful source content\n"},
+                {"mode": "commit"},
+                object(),
+                FakeAIClient(),
+                {
+                    "target_local_path": tmpdir,
+                    "source_language": "English",
+                    "target_language": "Chinese",
+                },
+                return_outcomes=True,
+            )
+
+            self.assertEqual(outcomes["guide.md"]["status"], "partial")
+            self.assertIn("max_output_tokens", outcomes["guide.md"]["reason"])
+            self.assertIn(
+                "有用的部分输出",
+                Path(tmpdir, "guide.md").read_text(encoding="utf-8"),
+            )
     def test_preprocess_added_file_batch_adds_anchors_for_non_top_level_headings(self):
         batch = "\n".join(
             [
