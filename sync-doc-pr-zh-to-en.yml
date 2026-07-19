@@ -39,13 +39,13 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Checkout ai-pr-translator repository
+      - name: Checkout ai-markdown-translator repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
-          repository: "qiancai/ai-pr-translator"
+          repository: "qiancai/ai-markdown-translator"
           # Intentionally follow main so automation picks up translator updates immediately.
           ref: main
-          path: "ai-pr-translator"
+          path: "ai-markdown-translator"
           persist-credentials: false
 
       - name: Set up Python
@@ -54,7 +54,7 @@ jobs:
           python-version: '3.9'
 
       - name: Install dependencies
-        run: pip install -r ai-pr-translator/scripts/requirements.txt
+        run: pip install -r ai-markdown-translator/scripts/requirements.txt
 
       - name: Extract PR information
         id: extract_info
@@ -162,7 +162,7 @@ jobs:
           AI_PROVIDER: ${{ github.event.inputs.ai_provider }}
           TARGET_REPO_PATH: ${{ github.workspace }}/target_repo
         run: |
-          cd ai-pr-translator/scripts
+          cd ai-markdown-translator/scripts
           if python main_workflow.py; then
             echo "sync_success=true" >> "$GITHUB_OUTPUT"
             echo "✅ Sync script completed successfully"
@@ -245,7 +245,7 @@ jobs:
           TARGET_OWNER: ${{ steps.extract_info.outputs.target_owner }}
           TARGET_REPO: ${{ steps.extract_info.outputs.target_repo }}
           TARGET_PR: ${{ steps.extract_info.outputs.target_pr }}
-          FAILURE_REPORT: ${{ github.workspace }}/ai-pr-translator/scripts/temp_output/translation-failures.md
+          FAILURE_REPORT: ${{ github.workspace }}/ai-markdown-translator/scripts/temp_output/translation-failures.md
         run: |
           BODY=$(printf '%s\n\n%s\n%s\n\n%s' \
             "**Auto-sync completed successfully**" \
@@ -272,7 +272,7 @@ jobs:
           TARGET_OWNER: ${{ steps.extract_info.outputs.target_owner }}
           TARGET_REPO: ${{ steps.extract_info.outputs.target_repo }}
           TARGET_PR: ${{ steps.extract_info.outputs.target_pr }}
-          FAILURE_REPORT: ${{ github.workspace }}/ai-pr-translator/scripts/temp_output/translation-failures.md
+          FAILURE_REPORT: ${{ github.workspace }}/ai-markdown-translator/scripts/temp_output/translation-failures.md
         run: |
           BODY=$(printf '%s\n\n%s\n%s\n\n%s' \
             "**Auto-sync failed**" \

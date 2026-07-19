@@ -1,4 +1,4 @@
-# AI PR Translator
+# AI Markdown Translator
 
 An intelligent documentation translator that automatically synchronizes incremental Markdown documentation updates from a source language repository to a target language repository using AI-powered alignment and translation. It supports both pull request diff sync and commit diff sync, making it suitable for contributor-driven PR updates as well as scheduled translation workflows.
 
@@ -80,8 +80,8 @@ For repositories with many Markdown files, run commit-based synchronization on a
 1. Clone the repository:
 
     ```bash
-    git clone https://github.com/yourusername/ai-pr-translator.git
-    cd ai-pr-translator
+    git clone https://github.com/qiancai/ai-markdown-translator.git
+    cd ai-markdown-translator
     ```
 
 2. Install dependencies:
@@ -198,7 +198,7 @@ export FAIL_ON_TRANSLATION_ERROR=true
 
 Both Python entry points modify the target checkout and stage successful changes by default. They do not create commits, push branches, post comments, or create pull requests; those operations belong to the caller workflow. Set `SKIP_GIT_ADD=true` when you want to inspect unstaged changes locally.
 
-The example workflows currently follow the `main` branch of `qiancai/ai-pr-translator`, so translator updates are picked up automatically. This is an intentional convenience tradeoff: changes to `main` take effect without a separate workflow configuration update.
+The example workflows currently follow the `main` branch of `qiancai/ai-markdown-translator`, so translator updates are picked up automatically. This is an intentional convenience tradeoff: changes to `main` take effect without a separate workflow configuration update.
 
 ## Usage
 
@@ -240,7 +240,7 @@ Configure `GITHUB_TOKEN` and the secret for each provider you expose in the work
 
 #### Scheduled commit-based sync
 
-Use [`sync-doc-updates-zh-to-en.yml`](sync-doc-updates-zh-to-en.yml) as the scheduled/manual commit-sync template. Customize its repository, branch, language, glossary, and provider settings before copying it into `.github/workflows/`. The bundled template currently uses Azure OpenAI and follows `qiancai/ai-pr-translator@main`.
+Use [`sync-doc-updates-zh-to-en.yml`](sync-doc-updates-zh-to-en.yml) as the scheduled/manual commit-sync template. Customize its repository, branch, language, glossary, and provider settings before copying it into `.github/workflows/`. The bundled template currently uses Azure OpenAI and follows `qiancai/ai-markdown-translator@main`.
 
 The target branch must already contain a cursor file like this:
 
