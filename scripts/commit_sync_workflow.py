@@ -516,14 +516,31 @@ def validate_successful_translation_structures(
         f"\n🔎 Validating document structure for {len(markdown_file_paths)} translated Markdown file(s)..."
     )
 
-    issues = validate_markdown_heading_structures(
-        markdown_file_paths,
-        source_content_loader=lambda file_path: get_source_ref_content(
+    should_filter_related_resources = (
+        isinstance(diff_context, dict)
+        and diff_context.get("mode") == "commit"
+        and should_ignore_resource_card_section(diff_context.get("repo_config"))
+    )
+
+    def load_source_for_structure_validation(file_path):
+        source_content = get_source_ref_content(
             file_path,
             diff_context,
             github_client,
             "head_ref",
-        ),
+        )
+        if should_filter_related_resources and source_content:
+            source_content, _ = remove_related_resources_resource_card_sections(
+                source_content
+            )
+        return source_content
+
+    issues = validate_markdown_heading_structures(
+        markdown_file_paths,
+        # Validate the same canonical source view that commit-mode translation
+        # uses. Otherwise an intentionally skipped RelatedResources section is
+        # incorrectly reported as a missing target heading.
+        source_content_loader=load_source_for_structure_validation,
         target_content_loader=lambda file_path: read_target_file_content(
             TARGET_REPO_PATH,
             file_path,

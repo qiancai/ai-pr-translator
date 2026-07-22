@@ -52,6 +52,7 @@ from translation_structure_validator import (
 
 
 _CUSTOM_CONTENT_LINE_RE = re.compile(r"^</?CustomContent\b[^<>]*>$")
+_CUSTOM_CONTENT_TAG_RE = re.compile(r"</?CustomContent\b[^<>]*>")
 _FENCE_RE = re.compile(r"^(```|~~~)")
 _SPAN_TAG_RE = re.compile(
     r"<(?P<closing>/)?span\b(?P<attrs>[^>]*)>",
@@ -339,13 +340,18 @@ def _strip_trailing_newlines(block):
 
 def _block_is_heading(block):
     """Return True when a block's first non-blank line is a markdown heading."""
+    return _heading_line_from_block(block) is not None
+
+
+def _heading_line_from_block(block):
+    """Return the first non-blank line when it is a Markdown heading."""
     for line in block.splitlines():
         if line.strip():
             # Keep section splitting identical to structure validation:
             # CommonMark permits up to three leading spaces and ATX headings
             # have at most six levels.
-            return HEADING_RE.match(line) is not None
-    return False
+            return line if HEADING_RE.match(line) else None
+    return None
 
 
 def _build_section_context(blocks):
@@ -385,8 +391,9 @@ def _build_prior_translation_lookup(base_blocks, target_blocks):
     for index, (base_block, sid) in enumerate(zip(base_blocks, base_section_ids)):
         section_target_parts.setdefault(sid, []).append(target_blocks[index])
         if sid not in section_heading:
+            heading_line = _heading_line_from_block(base_block)
             section_heading[sid] = (
-                _normalize_for_match(base_block) if _block_is_heading(base_block) else None
+                _normalize_for_match(heading_line) if heading_line else None
             )
 
     by_heading = {}
@@ -418,24 +425,106 @@ def _is_non_translatable_block(block):
 
 
 def _split_into_heading_sections(content):
-    """Split content into flat heading-led sections while preserving bytes."""
+    """Split content into flat heading-led sections while preserving bytes.
+
+    Headings are line-oriented Markdown syntax and do not require a preceding
+    blank line. Deriving section boundaries from blank-line blocks therefore
+    misses valid headings that immediately follow block quotes or other text.
+    Use the same fence-aware heading scan as structure validation, then retain
+    block granularity inside each resulting section for translation reuse.
+    """
+    if not content:
+        return []
+
+    lines = content.splitlines(keepends=True)
+    heading_starts = [
+        line_number - 1
+        for line_number, line in iter_markdown_content_lines(content)
+        if HEADING_RE.match(line)
+    ]
+    if not heading_starts:
+        return [split_into_blocks(content)]
+
+    section_starts = list(heading_starts)
+    if heading_starts[0] > 0:
+        section_starts.insert(0, 0)
+
     sections = []
-    current = []
-    for block in split_into_blocks(content):
-        if _block_is_heading(block) and current:
-            sections.append(current)
-            current = []
-        current.append(block)
-    if current:
-        sections.append(current)
+    for index, start in enumerate(section_starts):
+        end = (
+            section_starts[index + 1]
+            if index + 1 < len(section_starts)
+            else len(lines)
+        )
+        sections.append(split_into_blocks("".join(lines[start:end])))
     return sections
+
+
+def _protect_custom_content_tags(content):
+    """Replace CustomContent tags with unique immutable placeholders."""
+    matches = list(_CUSTOM_CONTENT_TAG_RE.finditer(content or ""))
+    if not matches:
+        return content, [], [], ""
+
+    nonce = 0
+    prefix = f"{{{{{{ .__ai_custom_content_tag_{nonce}_"
+    while prefix in content:
+        nonce += 1
+        prefix = f"{{{{{{ .__ai_custom_content_tag_{nonce}_"
+
+    pieces = []
+    tags = []
+    placeholders = []
+    cursor = 0
+    for index, match in enumerate(matches):
+        # This deliberately looks like a TiDB doc variable because the shared
+        # translation prompt already requires those placeholders to be copied
+        # exactly. The synthetic variable is always restored before output.
+        placeholder = prefix + f"{index:04d}" + " }}}"
+        pieces.extend((content[cursor : match.start()], placeholder))
+        tags.append(match.group(0))
+        placeholders.append(placeholder)
+        cursor = match.end()
+    pieces.append(content[cursor:])
+    return "".join(pieces), tags, placeholders, prefix
+
+
+def _translate_preserving_custom_content(content, *args, **kwargs):
+    """Translate text while keeping every CustomContent tag byte-for-byte.
+
+    CustomContent is document structure, not natural language. It must never be
+    entrusted to the model, including when a tag appears inline with prose.
+    Placeholders preserve sentence-level translation context while allowing the
+    original tags to be restored deterministically afterward.
+    """
+    protected, tags, placeholders, prefix = _protect_custom_content_tags(content)
+    translated = translate_file_batch(protected, *args, **kwargs)
+    if translated is None:
+        # Preserve the translation failure as-is. Reporting a placeholder
+        # mutation here would hide the actual API/client failure from callers.
+        return None
+    if not tags:
+        return translated
+
+    placeholder_re = re.compile(re.escape(prefix) + r"\d+ \}\}\}")
+    if placeholder_re.findall(translated) != placeholders:
+        thread_safe_print(
+            "   ❌ Reconciler: AI output changed protected CustomContent placeholders"
+        )
+        return None
+
+    restored = translated
+    for placeholder, tag in zip(placeholders, tags):
+        restored = restored.replace(placeholder, tag, 1)
+    return restored
 
 
 def _section_heading_key(section):
     """Return a source-language heading key, or None for a preamble section."""
     for block in section:
-        if _block_is_heading(block):
-            return _normalize_for_match(block)
+        heading_line = _heading_line_from_block(block)
+        if heading_line:
+            return _normalize_for_match(heading_line)
     return None
 
 
@@ -447,27 +536,33 @@ def _section_heading_match_key(section):
     collapse into one duplicate-heading group.
     """
     for block in section:
-        if not _block_is_heading(block):
+        heading_line = _heading_line_from_block(block)
+        if not heading_line:
             continue
-        span = _find_version_mark_span(block)
+        span = _find_version_mark_span(heading_line)
         if span:
             normalized_inner = _VERSION_RE.sub(
                 _VERSION_MARK_PLACEHOLDER, span["inner"]
             )
-            block = _replace_span_inner(block, span, normalized_inner)
-        return _normalize_for_match(block)
+            heading_line = _replace_span_inner(
+                heading_line, span, normalized_inner
+            )
+        return _normalize_for_match(heading_line)
     return None
 
 
 def _section_heading_span_key(section):
     """Return a heading key ignoring all version-mark inner text."""
     for block in section:
-        if not _block_is_heading(block):
+        heading_line = _heading_line_from_block(block)
+        if not heading_line:
             continue
-        span = _find_version_mark_span(block)
+        span = _find_version_mark_span(heading_line)
         if span:
-            block = _replace_span_inner(block, span, _VERSION_MARK_PLACEHOLDER)
-        return _normalize_for_match(block)
+            heading_line = _replace_span_inner(
+                heading_line, span, _VERSION_MARK_PLACEHOLDER
+            )
+        return _normalize_for_match(heading_line)
     return None
 
 
@@ -519,9 +614,12 @@ def _repair_and_validate_translated_structure(source_content, translated_content
             )
         repaired = "".join(lines)
 
-    issue = compare_heading_structure(
-        "section", source_content, repaired
-    ) or compare_custom_content_structure("section", source_content, repaired)
+    # A heading-bounded section is not an independent CustomContent tree: an
+    # opening tag may intentionally precede the heading while its closing tag
+    # appears inside this section (or vice versa). Never require CustomContent
+    # balance per section. The complete reconciled document is validated after
+    # all sections are joined, which is the only scope where balance is valid.
+    issue = compare_heading_structure("section", source_content, repaired)
     if issue:
         return None
     return repaired
@@ -571,7 +669,7 @@ def _translate_section_blocks(
         # a translator may legitimately merge or split them. Limit the fallback
         # to this section and provide its existing translation for minimal-edit
         # wording, but do not duplicate section_source as read-only context.
-        translated = translate_file_batch(
+        translated = _translate_preserving_custom_content(
             section_source,
             ai_client,
             source_language,
@@ -580,6 +678,8 @@ def _translate_section_blocks(
             source_mode=source_mode,
             prior_translation_reference=prior_translation,
         )
+        if translated is None:
+            return None
         repaired = _repair_and_validate_translated_structure(
             section_source, translated
         )
@@ -633,7 +733,7 @@ def _translate_section_blocks(
         while end < len(decisions) and decisions[end][0] == "translate":
             end += 1
         run_source = "".join(head_blocks[index:end])
-        translated = translate_file_batch(
+        translated = _translate_preserving_custom_content(
             run_source,
             ai_client,
             source_language,
@@ -643,6 +743,8 @@ def _translate_section_blocks(
             context_reference=section_source,
             prior_translation_reference=prior_translation,
         )
+        if translated is None:
+            return None
         translated = _repair_and_validate_translated_structure(
             run_source, translated
         )
@@ -665,8 +767,12 @@ def _section_similarity_text(section):
     """Return normalized section body text used to disambiguate duplicate headings."""
     if not section:
         return ""
-    start = 1 if _block_is_heading(section[0]) else 0
-    return _normalize_for_match("".join(section[start:]))
+    section_text = "".join(section)
+    lines = section_text.splitlines(keepends=True)
+    for line_number, line in iter_markdown_content_lines(section_text):
+        if HEADING_RE.match(line):
+            return _normalize_for_match("".join(lines[line_number:]))
+    return _normalize_for_match(section_text)
 
 
 def _match_head_sections_to_base(base_sections, head_sections):
@@ -941,8 +1047,9 @@ def reconcile_restructured_file(
     head_section_heading = {}
     for block, sid in zip(head_blocks, section_ids):
         if sid not in head_section_heading:
+            heading_line = _heading_line_from_block(block)
             head_section_heading[sid] = (
-                _normalize_for_match(block) if _block_is_heading(block) else None
+                _normalize_for_match(heading_line) if heading_line else None
             )
     prior_by_heading, prior_preamble = _build_prior_translation_lookup(
         base_blocks, target_blocks
@@ -1004,7 +1111,7 @@ def reconcile_restructured_file(
             end += 1
 
         run_source = "".join(head_blocks[index:end])
-        translated = translate_file_batch(
+        translated = _translate_preserving_custom_content(
             run_source,
             ai_client,
             source_language,
@@ -1014,6 +1121,8 @@ def reconcile_restructured_file(
             context_reference=section_source.get(section_id),
             prior_translation_reference=prior_translation_for(section_id),
         )
+        if translated is None:
+            return None
         output_blocks.append(
             _strip_trailing_newlines(translated) + _trailing_newlines(run_source)
         )
@@ -1035,9 +1144,10 @@ def reconcile_restructured_file(
         source_file_path, head_source, reconciled
     ) or compare_heading_structure(source_file_path, head_source, reconciled)
     if issue:
+        detail = f": {issue.first_difference}" if issue.first_difference else ""
         thread_safe_print(
             f"   ⚠️  Reconciler: output failed structure self-check "
-            f"({issue.reason}); reconciliation declined"
+            f"({issue.reason}{detail}); reconciliation declined"
         )
         return None
 

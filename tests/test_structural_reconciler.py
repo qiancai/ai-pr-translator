@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
@@ -8,7 +9,9 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from structural_reconciler import (
     _deterministic_version_mark_inner,
+    _section_similarity_text,
     _split_into_heading_sections,
+    _translate_preserving_custom_content,
     reconcile_restructured_file,
     reconcile_version_mark_only_change,
     split_into_blocks,
@@ -85,6 +88,21 @@ class SplitBlocksTest(unittest.TestCase):
 
         self.assertEqual(len(_split_into_heading_sections(indented)), 2)
         self.assertEqual(len(_split_into_heading_sections(too_deep)), 1)
+
+    def test_section_splitting_does_not_require_blank_line_before_heading(self):
+        content = "# Title\n\n> A note.\n#### Steps\n\nbody\n"
+
+        sections = _split_into_heading_sections(content)
+
+        self.assertEqual(2, len(sections))
+        self.assertTrue("".join(sections[1]).startswith("#### Steps\n"))
+
+    def test_preamble_similarity_ignores_heading_syntax_inside_fence(self):
+        content = "```text\n# code comment\n```\n\nPreamble body.\n"
+
+        similarity_text = _section_similarity_text(split_into_blocks(content))
+
+        self.assertEqual(content.rstrip("\n"), similarity_text)
 
 
 class ReconcilePureMoveTest(unittest.TestCase):
@@ -182,6 +200,108 @@ class ReconcileWrappingTest(unittest.TestCase):
         )
         # The brand-new section is translated and carries a source-derived anchor.
         self.assertIn("{#view-the-grafana-panel}", out)
+
+    def test_cross_section_wrapper_is_valid_with_block_count_drift(self):
+        base = (
+            "# Title\n\nIntro.\n\n"
+            "## A\n\nA one.\n\nA two.\n\n"
+            "## C\n\nC stable.\n"
+        )
+        head = (
+            "# Title\n\nIntro.\n\n"
+            "## A\n\nA one.\n\nA two.\n\n"
+            '<CustomContent plan="byoc">\n\n'
+            "## B\n\nB new.\n\n"
+            "</CustomContent>\n\n"
+            "## C\n\nC stable.\n"
+        )
+        # Merging the two translated A paragraphs forces heading-section
+        # alignment, the path that previously rejected the cross-section tags.
+        target = (
+            "# 标题\n\n简介。\n\n"
+            "## 甲\n\n甲一。\n甲二。\n\n"
+            "## 丙\n\n丙保持不变。\n"
+        )
+        ai = MockAI()
+
+        out = reconcile_restructured_file(
+            "cross-section.md", head, base, target, ai, REPO_CONFIG,
+            source_mode="commit",
+        )
+
+        self.assertIsNotNone(out)
+        self.assertEqual(_tags(head), _tags(out))
+        self.assertIn("## B", out)
+        self.assertIn("## 丙\n\n丙保持不变。", out)
+        self.assertFalse(any("<CustomContent" in content for content in ai.contents()))
+
+    def test_inline_custom_content_tags_are_hidden_from_ai_and_restored(self):
+        base = "# Title\n\nPremium instances are supported.\n"
+        head = (
+            "# Title\n\nPremium "
+            '<CustomContent plan="byoc">and BYOC </CustomContent>'
+            "instances are supported.\n"
+        )
+        target = "# 标题\n\n支持 Premium 实例。\n"
+
+        class TagManglingAI(MockAI):
+            def chat_completion(self, messages, temperature=0.1):
+                self.calls.append(messages)
+                content = self._content_portion(messages[0]["content"])
+                return content.replace("</CustomContent>", "")
+
+        ai = TagManglingAI()
+        out = reconcile_restructured_file(
+            "inline-tags.md", head, base, target, ai, REPO_CONFIG,
+            source_mode="commit",
+        )
+
+        self.assertIsNotNone(out)
+        self.assertEqual(_tags(head), _tags(out))
+        self.assertFalse(any("CustomContent" in content for content in ai.contents()))
+
+    def test_changed_custom_content_placeholder_declines_safely(self):
+        base = "# Title\n\nPremium instances are supported.\n"
+        head = (
+            "# Title\n\nPremium "
+            '<CustomContent plan="byoc">and BYOC </CustomContent>'
+            "instances are supported.\n"
+        )
+        target = "# 标题\n\n支持 Premium 实例。\n"
+
+        class PlaceholderDroppingAI(MockAI):
+            def chat_completion(self, messages, temperature=0.1):
+                self.calls.append(messages)
+                content = self._content_portion(messages[0]["content"])
+                start = content.index("{{{ .__ai_custom_content_tag_")
+                end = content.index("}}}", start) + 3
+                return content[:start] + content[end:]
+
+        out = reconcile_restructured_file(
+            "dropped-placeholder.md", head, base, target,
+            PlaceholderDroppingAI(), REPO_CONFIG, source_mode="commit",
+        )
+
+        self.assertIsNone(out)
+
+    def test_translation_failure_is_not_reported_as_placeholder_mutation(self):
+        content = '<CustomContent plan="byoc">text</CustomContent>\n'
+
+        with patch(
+            "structural_reconciler.translate_file_batch", return_value=None
+        ):
+            with patch(
+                "structural_reconciler.thread_safe_print"
+            ) as print_mock:
+                translated = _translate_preserving_custom_content(content, MockAI())
+
+        self.assertIsNone(translated)
+        self.assertFalse(
+            any(
+                "changed protected CustomContent placeholders" in str(call)
+                for call in print_mock.call_args_list
+            )
+        )
 
 
 class ReconcileCodeBlockTest(unittest.TestCase):
@@ -600,6 +720,27 @@ class ReconcileFallbackTest(unittest.TestCase):
 
 
 class ReconcileBlockDriftBySectionTest(unittest.TestCase):
+    def test_heading_after_blockquote_without_blank_line_still_aligns(self):
+        base = (
+            "# Restore\n\n## Cloud storage\n\n"
+            "> **Note:**\n>\n> Existing restriction.\n\n"
+            "#### Steps\n\nOld steps.\n"
+        )
+        head = base.replace("Old steps.", "Updated steps.")
+        target = (
+            "# 恢复\n\n## 云存储\n\n"
+            "> **注意：**\n>\n> 现有限制。\n"
+            "#### 步骤\n\n旧步骤。\n"
+        )
+
+        out = reconcile_restructured_file(
+            "blockquote-heading.md", head, base, target, MockAI(), REPO_CONFIG,
+            source_mode="commit",
+        )
+
+        self.assertIsNotNone(out)
+        self.assertIn("#### 步骤\n\nUpdated steps.", out)
+
     def test_move_with_addition_reuses_unchanged_section_despite_block_drift(self):
         base = (
             "# Title\n\n"

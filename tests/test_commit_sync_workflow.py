@@ -2148,6 +2148,39 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
         self.assertEqual(1, len(stats.structure_errors))
         self.assertEqual("guide.md", stats.structure_errors[0].file_path)
 
+    def test_structure_validation_ignores_filtered_related_resources_section(self):
+        stats = workflow.TranslationStats()
+        stats.mark_success("guide.md")
+        source = (
+            "# Guide\n\n## Content\n\nBody.\n\n"
+            "## Related resources\n\n"
+            "<RelatedResources>\n"
+            '  <ResourceCard title="Video" link="https://example.com" />\n'
+            "</RelatedResources>\n"
+        )
+        target = "# 指南\n\n## 内容\n\n正文。\n"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "guide.md").write_text(target, encoding="utf-8")
+            with mock.patch.object(workflow, "TARGET_REPO_PATH", tmpdir), mock.patch.object(
+                workflow,
+                "get_source_ref_content",
+                return_value=source,
+            ):
+                issues = workflow.validate_successful_translation_structures(
+                    {"guide.md"},
+                    {
+                        "mode": "commit",
+                        "head_ref": "head",
+                        "repo_config": {"ignore_resource_card_section": True},
+                    },
+                    object(),
+                    stats,
+                )
+
+        self.assertEqual([], issues)
+        self.assertEqual([], stats.structure_errors)
+
 
 if __name__ == "__main__":
     unittest.main()
