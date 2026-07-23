@@ -8,10 +8,13 @@ highlighting markdown files whose line-change counts diverge beyond a
 configurable threshold.
 
 Usage:
-    export GITHUB_TOKEN="ghp_..."
-    python verify_translation.py
+    export GITHUB_TOKEN="..."
+    python verify_translation.py \
+        --source-compare https://github.com/owner/repo/compare/base...head \
+        --target-pr https://github.com/owner/repo/pull/123
 """
 
+import argparse
 import os
 import re
 import subprocess
@@ -41,27 +44,18 @@ from translation_structure_validator import (
 )
 
 
-# ── Configuration ────────────────────────────────────────────────────────────
-# Mode: "commit-based" uses a compare URL; "pr" uses a source PR URL.
-MODE = "commit-based"
-
-SOURCE_COMMIT_COMPARE = (
-    "https://github.com/pingcap/docs/compare/2eaf0b7cd9c870d6f25c0dea7c7e1bb64ba2572b...6376b9086871957f4809711c83e021a01b0a8f5d"
-)
+# ── Runtime configuration ────────────────────────────────────────────────────
+# These values are populated from command-line arguments in main(). Keeping
+# neutral defaults makes importing the report helpers safe for tests and tools.
+MODE = ""
+SOURCE_COMMIT_COMPARE = ""
 SOURCE_PR = ""
-TARGET_PR = "https://github.com/pingcap/docs/pull/23099"
-
-# Optional: local clone of the source repo.  When set, `git diff --numstat`
-# is used instead of the GitHub compare API, which avoids the 300-file cap.
-SOURCE_REPO_PATH = "/Users/grcai/Documents/GitHub/docs"
-
+TARGET_PR = ""
+SOURCE_REPO_PATH = ""
 WARNING_THRESHOLD = 5
 
 # Files to exclude from the report entirely (expected artifacts, not translations).
 EXCLUDE_FILES = {"latest_translation_commit.json"}
-
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
-
 
 def _positive_int_env(name, default):
     try:
@@ -1413,13 +1407,75 @@ def write_excel(rows, output_path, source_label, target_label, threshold, headin
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
-def main():
-    if not GITHUB_TOKEN:
-        print("Error: GITHUB_TOKEN environment variable is required.")
-        print("  export GITHUB_TOKEN='ghp_...'")
-        sys.exit(1)
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Compare source and translated GitHub changes and write an Excel report."
+    )
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument(
+        "--source-compare",
+        default=os.getenv("SOURCE_COMMIT_COMPARE", ""),
+        help="GitHub compare URL for commit-based verification.",
+    )
+    source.add_argument(
+        "--source-pr",
+        default=os.getenv("SOURCE_PR", ""),
+        help="GitHub pull request URL for PR-based verification.",
+    )
+    parser.add_argument(
+        "--target-pr",
+        default=os.getenv("TARGET_PR", ""),
+        help="Translated target pull request URL.",
+    )
+    parser.add_argument(
+        "--source-repo-path",
+        default=os.getenv("SOURCE_REPO_PATH", ""),
+        help="Optional local source checkout used to avoid the GitHub compare API file cap.",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=int,
+        default=_positive_int_env("WARNING_THRESHOLD", 5),
+        help="Maximum allowed additions/deletions difference (default: 5).",
+    )
+    parser.add_argument(
+        "--output",
+        default=os.getenv("VERIFY_TRANSLATION_OUTPUT", ""),
+        help="Output .xlsx path. Defaults to a timestamped file in the current directory.",
+    )
+    args = parser.parse_args(argv)
+    if bool(args.source_compare) == bool(args.source_pr):
+        parser.error("one of --source-compare or --source-pr is required")
+    if not args.target_pr:
+        parser.error("--target-pr is required")
+    if args.threshold < 1:
+        parser.error("--threshold must be a positive integer")
+    return args
 
-    github_client = Github(auth=Auth.Token(GITHUB_TOKEN))
+
+def _apply_runtime_config(args):
+    global MODE, SOURCE_COMMIT_COMPARE, SOURCE_PR, TARGET_PR
+    global SOURCE_REPO_PATH, WARNING_THRESHOLD
+
+    MODE = "commit-based" if args.source_compare else "pr"
+    SOURCE_COMMIT_COMPARE = args.source_compare
+    SOURCE_PR = args.source_pr
+    TARGET_PR = args.target_pr
+    SOURCE_REPO_PATH = args.source_repo_path
+    WARNING_THRESHOLD = args.threshold
+
+
+def main(argv=None):
+    args = _parse_args(argv)
+    _apply_runtime_config(args)
+
+    github_token = os.getenv("GITHUB_TOKEN", "")
+    if not github_token:
+        print("Error: GITHUB_TOKEN environment variable is required.")
+        print("  export GITHUB_TOKEN='your-token'")
+        return 1
+
+    github_client = Github(auth=Auth.Token(github_token))
 
     print("\n[1/4] Fetching source file stats...")
     source_stats, source_label = get_source_stats(github_client)
@@ -1492,9 +1548,10 @@ def main():
     else:
         print("\n[4/4] No markdown files — skipping document structure analysis.")
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = os.path.join(script_dir, f"translation_verify_{timestamp}.xlsx")
+    output_path = args.output
+    if not output_path:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = os.path.join(os.getcwd(), f"translation_verify_{timestamp}.xlsx")
 
     write_excel(
         rows,
@@ -1516,6 +1573,8 @@ def main():
     else:
         print(f"\n  ✓  All md files match or are within threshold, and CustomContent tags match.")
 
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

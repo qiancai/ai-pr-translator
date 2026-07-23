@@ -216,19 +216,18 @@ cd scripts
 python commit_sync_workflow.py
 ```
 
-For local PR verification, edit the configuration at the top of `scripts/main_workflow_local.py`, provide credentials through environment variables, and run:
+### Translation verification
+
+Compare a source commit range with a translated pull request and write an Excel report:
 
 ```bash
-cd scripts
-python main_workflow_local.py
+export GITHUB_TOKEN="your_github_token"
+python scripts/verify_translation.py \
+  --source-compare "https://github.com/owner/repo/compare/base...head" \
+  --target-pr "https://github.com/owner/repo/pull/123"
 ```
 
-For local commit-range verification, edit `TEST_OPTION` and the corresponding configuration in `scripts/commit_sync_workflow_local.py`. Set `SOURCE_BASE_REF` and `SOURCE_HEAD_REF` explicitly before running:
-
-```bash
-cd scripts
-python commit_sync_workflow_local.py
-```
+For PR-based source changes, pass `--source-pr` instead of `--source-compare`. Use `--source-repo-path` with a local checkout to avoid the GitHub compare API file limit. Run `python scripts/verify_translation.py --help` for all options.
 
 ### GitHub actions
 

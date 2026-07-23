@@ -5,6 +5,8 @@ gh-util.user.js
 .DS_Store
 research.md
 scripts/temp_output/
+translation_verify_*.xlsx
+~$*.xlsx
 .env
 .env.*
 !.env.example
