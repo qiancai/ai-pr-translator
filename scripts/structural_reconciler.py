@@ -489,6 +489,49 @@ def _protect_custom_content_tags(content):
     return "".join(pieces), tags, placeholders, prefix
 
 
+def _restore_markdown_indentation(source_content, translated_content):
+    """Restore source-owned horizontal indentation in a translated run.
+
+    Structural reconciliation translates changed Markdown blocks as standalone
+    runs. Their leading spaces can be nested-list syntax rather than
+    presentation. When source and target line counts match, restore every
+    non-blank line's exact prefix. If a translation legitimately changes the
+    line count, only the first line can be paired safely, which still repairs
+    outer-whitespace stripping without guessing how translated lines align.
+    """
+    if not source_content or not translated_content:
+        return translated_content
+
+    def restore_line(source_line, translated_line):
+        source_match = re.match(r"^[ \t]*(?=\S)", source_line)
+        translated_match = re.match(r"^[ \t]*(?=\S)", translated_line)
+        if not source_match or not translated_match:
+            return translated_line
+        source_indent = source_match.group(0)
+        translated_indent = translated_match.group(0)
+        if source_indent == translated_indent:
+            return translated_line
+        return source_indent + translated_line[translated_match.end() :]
+
+    source_body = _strip_trailing_newlines(source_content)
+    translated_body = _strip_trailing_newlines(translated_content)
+    translated_trailing_newlines = _trailing_newlines(translated_content)
+    source_lines = source_body.splitlines(keepends=True)
+    translated_lines = translated_body.splitlines(keepends=True)
+    if len(source_lines) == len(translated_lines):
+        return (
+            "".join(
+                restore_line(source_line, translated_line)
+                for source_line, translated_line in zip(
+                    source_lines,
+                    translated_lines,
+                )
+            )
+            + translated_trailing_newlines
+        )
+    return restore_line(source_content, translated_content)
+
+
 def _translate_preserving_custom_content(content, *args, **kwargs):
     """Translate text while keeping every CustomContent tag byte-for-byte.
 
@@ -503,6 +546,7 @@ def _translate_preserving_custom_content(content, *args, **kwargs):
         # Preserve the translation failure as-is. Reporting a placeholder
         # mutation here would hide the actual API/client failure from callers.
         return None
+    translated = _restore_markdown_indentation(protected, translated)
     if not tags:
         return translated
 

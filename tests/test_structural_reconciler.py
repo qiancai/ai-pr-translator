@@ -9,6 +9,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from structural_reconciler import (
     _deterministic_version_mark_inner,
+    _restore_markdown_indentation,
     _section_similarity_text,
     _split_into_heading_sections,
     _translate_preserving_custom_content,
@@ -302,6 +303,127 @@ class ReconcileWrappingTest(unittest.TestCase):
                 for call in print_mock.call_args_list
             )
         )
+
+    def test_nested_note_keeps_indentation_after_client_or_model_strip(self):
+        base = (
+            "# Title\n\n"
+            "3. Choose a resource type:\n\n"
+            "    - Create a TiDB X instance.\n\n"
+            "        > **Note:**\n"
+            "        >\n"
+            "        > Premium settings apply per instance.\n\n"
+            "    - Create a Dedicated cluster.\n"
+        )
+        head = (
+            "# Title\n\n"
+            "3. Choose a resource type:\n\n"
+            "    - Create a TiDB X instance.\n\n"
+            '        <CustomContent plan="premium">\n\n'
+            "        > **Note:**\n"
+            "        >\n"
+            "        > Premium settings apply per instance.\n\n"
+            "        </CustomContent>\n\n"
+            '        <CustomContent plan="byoc">\n\n'
+            "        > **Note:**\n"
+            "        >\n"
+            "        > - For BYOC instances, projects are optional.\n"
+            "        > - Premium settings apply per instance.\n\n"
+            "        </CustomContent>\n\n"
+            "    - Create a Dedicated cluster.\n"
+        )
+        target = (
+            "# 标题\n\n"
+            "3. 选择资源类型：\n\n"
+            "    - 创建 TiDB X 实例。\n\n"
+            "        > **Note:**\n"
+            "        >\n"
+            "        > Premium 设置按实例生效。\n\n"
+            "    - 创建 Dedicated 集群。\n"
+        )
+
+        class StrippingAI(MockAI):
+            def chat_completion(self, messages, temperature=0.1):
+                self.calls.append(messages)
+                return self._content_portion(messages[0]["content"]).strip()
+
+        class EveryLineStrippingAI(MockAI):
+            def chat_completion(self, messages, temperature=0.1):
+                self.calls.append(messages)
+                content = self._content_portion(messages[0]["content"]).strip()
+                return "\n".join(line.lstrip() for line in content.splitlines())
+
+        for ai in (StrippingAI(), EveryLineStrippingAI()):
+            with self.subTest(ai=type(ai).__name__):
+                out = reconcile_restructured_file(
+                    "nested-note.md",
+                    head,
+                    base,
+                    target,
+                    ai,
+                    REPO_CONFIG,
+                    source_mode="commit",
+                )
+
+                self.assertIsNotNone(out)
+                self.assertIn(
+                    "        > - For BYOC instances, projects are optional.",
+                    out,
+                )
+                self.assertNotIn("\n> **Note:**", out)
+                self.assertEqual(2, out.count("        > **Note:**"))
+
+    def test_translation_does_not_duplicate_preserved_first_line_indentation(self):
+        content = "        > **Note:**\n        >\n        > Body.\n"
+
+        with patch(
+            "structural_reconciler.translate_file_batch",
+            return_value=content,
+        ):
+            translated = _translate_preserving_custom_content(content, MockAI())
+
+        self.assertEqual(content, translated)
+
+    def test_top_level_translation_is_unchanged_by_indentation_restore(self):
+        content = "> **Note:**\n>\n> Body.\n"
+
+        with patch(
+            "structural_reconciler.translate_file_batch",
+            return_value=content,
+        ):
+            translated = _translate_preserving_custom_content(content, MockAI())
+
+        self.assertEqual(content, translated)
+
+    def test_restore_markdown_indentation_replaces_different_line_prefixes(self):
+        source = "        > **Note:**\n        > Body.\n"
+        translated = "    > **Note:**\n> 正文。\n"
+
+        self.assertEqual(
+            "        > **Note:**\n        > 正文。\n",
+            _restore_markdown_indentation(source, translated),
+        )
+
+    def test_restore_markdown_indentation_leaves_leading_newline_unmapped(self):
+        source = "        > **Note:**\n"
+        translated = "\n> **Note:**\n"
+
+        self.assertEqual(
+            translated,
+            _restore_markdown_indentation(source, translated),
+        )
+
+    def test_restore_markdown_indentation_only_pairs_first_line_on_count_drift(self):
+        source = "        > First.\n        > Second.\n"
+        translated = "> 第一行。\n> 新增行。\n> 第二行。\n"
+
+        self.assertEqual(
+            "        > 第一行。\n> 新增行。\n> 第二行。\n",
+            _restore_markdown_indentation(source, translated),
+        )
+
+    def test_restore_markdown_indentation_handles_empty_content(self):
+        self.assertEqual("", _restore_markdown_indentation("", ""))
+        self.assertEqual("", _restore_markdown_indentation("    source", ""))
 
 
 class ReconcileCodeBlockTest(unittest.TestCase):
