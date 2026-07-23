@@ -57,6 +57,7 @@ from diff_analyzer import (
     analyze_source_changes,
     filter_related_resources_resource_card_diff,
     is_yes_option_enabled,
+    preserve_base_related_resources_resource_card_sections,
     remove_related_resources_resource_card_sections,
 )
 from file_adder import process_added_files
@@ -535,16 +536,21 @@ def validate_successful_translation_structures(
             )
         return source_content
 
+    def load_target_for_structure_validation(file_path):
+        target_content = read_target_file_content(TARGET_REPO_PATH, file_path)
+        if should_filter_related_resources and target_content:
+            target_content, _ = remove_related_resources_resource_card_sections(
+                target_content
+            )
+        return target_content
+
     issues = validate_markdown_heading_structures(
         markdown_file_paths,
         # Validate the same canonical source view that commit-mode translation
         # uses. Otherwise an intentionally skipped RelatedResources section is
         # incorrectly reported as a missing target heading.
         source_content_loader=load_source_for_structure_validation,
-        target_content_loader=lambda file_path: read_target_file_content(
-            TARGET_REPO_PATH,
-            file_path,
-        ),
+        target_content_loader=load_target_for_structure_validation,
     )
 
     if not issues:
@@ -1340,10 +1346,7 @@ def reconcile_restructured_files(
     source_mode = (
         diff_context.get("mode", "commit") if isinstance(diff_context, dict) else "commit"
     )
-    # Mirror analyze_source_changes: RelatedResources ResourceCard sections are
-    # only stripped in commit mode, so the reconciled base/head stay aligned
-    # with how the existing target translation was originally generated.
-    rr_strip = source_mode == "commit" and should_ignore_resource_card_section(repo_config)
+    rr_ignore = source_mode == "commit" and should_ignore_resource_card_section(repo_config)
 
     for file_path in sorted(restructured_files):
         existing_target = read_target_file_content(TARGET_REPO_PATH, file_path)
@@ -1371,11 +1374,44 @@ def reconcile_restructured_files(
             )
             continue
 
-        if rr_strip:
-            if head_source:
-                head_source, _ = remove_related_resources_resource_card_sections(head_source)
-            if base_source:
-                base_source, _ = remove_related_resources_resource_card_sections(base_source)
+        missing_snapshots = [
+            label
+            for label, content in (("HEAD", head_source), ("BASE", base_source))
+            if content is None
+        ]
+        if missing_snapshots:
+            if len(missing_snapshots) == 1:
+                missing_detail = f"{missing_snapshots[0]} source snapshot is unavailable"
+            else:
+                missing_detail = (
+                    f"{' and '.join(missing_snapshots)} source snapshots are unavailable"
+                )
+            mark_reconciliation_failure(
+                f"{missing_detail} for {file_path}"
+            )
+            continue
+
+        if rr_ignore:
+            # A localized target can legitimately retain this ignored section.
+            # Keep full documents aligned and make the section immutable by
+            # restoring its BASE source form in the effective HEAD snapshot.
+            head_source, preserved_sections = (
+                preserve_base_related_resources_resource_card_sections(
+                    base_source,
+                    head_source,
+                )
+            )
+            if head_source is None:
+                mark_reconciliation_failure(
+                    "RelatedResources section count changed between source BASE "
+                    f"and HEAD for {file_path}"
+                )
+                continue
+            if preserved_sections:
+                thread_safe_print(
+                    f"   🧹 Reconciler: ignored changes in "
+                    f"{len(preserved_sections)} RelatedResources section(s)"
+                )
 
         try:
             reconciled = reconcile_restructured_file(

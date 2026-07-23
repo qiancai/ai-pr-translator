@@ -49,6 +49,25 @@ def _custom_content_data(file_path, source_content, target_content, match=True, 
 
 
 class VerifyTranslationReportTest(unittest.TestCase):
+    def test_cli_configuration_has_no_repository_specific_defaults(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            args = verify_translation._parse_args(
+                [
+                    "--source-pr",
+                    "https://github.com/acme/docs/pull/1",
+                    "--target-pr",
+                    "https://github.com/acme/docs-cn/pull/2",
+                ]
+            )
+
+        verify_translation._apply_runtime_config(args)
+
+        self.assertEqual("pr", verify_translation.MODE)
+        self.assertEqual("", verify_translation.SOURCE_COMMIT_COMPARE)
+        self.assertEqual("https://github.com/acme/docs/pull/1", verify_translation.SOURCE_PR)
+        self.assertEqual("https://github.com/acme/docs-cn/pull/2", verify_translation.TARGET_PR)
+        self.assertEqual("", verify_translation.SOURCE_REPO_PATH)
+
     def test_noop_line_change_pairs_ignore_eof_newline_noise(self):
         patch = "\n".join(
             [

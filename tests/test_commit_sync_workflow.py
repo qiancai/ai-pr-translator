@@ -13,7 +13,6 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import commit_sync_workflow as workflow
-import commit_sync_workflow_local
 from translation_structure_validator import StructureValidationIssue
 
 
@@ -51,52 +50,163 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
         self.assertEqual(1, len(stats.failed))
         self.assertIn("declined", stats.failed[0][1])
 
-    def test_local_commit_sync_falls_back_to_trans_env_for_azure(self):
-        config = {
-            "AI_PROVIDER": "azure",
-            "SOURCE_BASE_REF": "abc123",
-            "SOURCE_HEAD_REF": "def456",
-        }
+    def test_restructured_reconciliation_preserves_ignored_target_related_resources(self):
+        stats = workflow.TranslationStats()
+        added_files = {"guide.md": "filtered source used only by full-translation fallback"}
+        full_translation_paths = {"guide.md"}
+        successful_paths = set()
+        base_source = (
+            "# Guide\n\n## Content\n\nOld body.\n\n"
+            "## Related resources\n\n"
+            "<RelatedResources>\n"
+            '  <ResourceCard title="Old source card" />\n'
+            "</RelatedResources>\n"
+        )
+        head_source = (
+            "# Guide\n\n## Content\n\nNew body.\n\n"
+            "## Related resources\n\n"
+            "<RelatedResources>\n"
+            '  <ResourceCard title="New source card that must be ignored" />\n'
+            "</RelatedResources>\n"
+        )
+        existing_target = (
+            "# ガイド\n\n## 内容\n\n古い本文。\n\n"
+            "## 関連リソース\n\n"
+            "<RelatedResources>\n"
+            '  <ResourceCard title="既存の翻訳済みカード" />\n'
+            "</RelatedResources>\n"
+        )
 
-        with mock.patch.dict(
-            commit_sync_workflow_local.os.environ,
-            {
-                "GITHUB_TOKEN": "token",
-                "AZURE_OPENAI_KEY": "",
-                "AZURE_OPENAI_BASE_URL": "",
-                "OPENAI_BASE_URL": "",
-                "TRANS_KEY": "trans-key",
-                "TRANS_URL": "https://trans.example/v1",
-            },
-            clear=False,
-        ), mock.patch.object(
-            commit_sync_workflow_local, "build_config", return_value=config
-        ), mock.patch.object(
-            commit_sync_workflow_local, "resolve_toc_source_files_for_local", return_value=(config, True)
-        ), mock.patch.object(
-            workflow, "main", return_value=0
+        def source_at_ref(_file_path, _context, _github, ref_name):
+            return head_source if ref_name == "head_ref" else base_source
+
+        def assert_canonical_inputs(
+            _file_path,
+            effective_head,
+            effective_base,
+            target,
+            *_args,
+            **_kwargs,
         ):
-            self.assertEqual(commit_sync_workflow_local.main(), 0)
-            self.assertEqual(
-                commit_sync_workflow_local.os.environ["AZURE_OPENAI_KEY"],
-                "trans-key",
-            )
-            self.assertEqual(
-                commit_sync_workflow_local.os.environ["OPENAI_BASE_URL"],
-                "https://trans.example/v1",
+            self.assertEqual(base_source, effective_base)
+            self.assertIn('title="Old source card"', effective_head)
+            self.assertNotIn("New source card that must be ignored", effective_head)
+            self.assertEqual(existing_target, target)
+            return existing_target
+
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.object(
+            workflow, "TARGET_REPO_PATH", tmpdir
+        ), mock.patch.object(
+            workflow, "read_target_file_content", return_value=existing_target
+        ), mock.patch.object(
+            workflow, "get_source_ref_content", side_effect=source_at_ref
+        ), mock.patch.object(
+            workflow, "reconcile_restructured_file", side_effect=assert_canonical_inputs
+        ), mock.patch.object(
+            workflow, "git_add_changes"
+        ):
+            reconciled = workflow.reconcile_restructured_files(
+                {"guide.md"},
+                added_files,
+                full_translation_paths,
+                {"mode": "commit"},
+                object(),
+                object(),
+                {"ignore_resource_card_section": True},
+                None,
+                stats,
+                successful_paths,
             )
 
-    def test_local_config_exposes_source_files_translation_mode(self):
-        config = commit_sync_workflow_local.build_config("ai")
+            written = Path(tmpdir, "guide.md").read_text(encoding="utf-8")
 
-        self.assertEqual(
-            config["SOURCE_FILES_TRANSLATION_MODE"],
-            commit_sync_workflow_local.SOURCE_FILES_TRANSLATION_MODE,
+        self.assertEqual({"guide.md"}, reconciled)
+        self.assertEqual(existing_target, written)
+        self.assertEqual({"guide.md"}, successful_paths)
+        self.assertNotIn("guide.md", added_files)
+        self.assertNotIn("guide.md", full_translation_paths)
+        self.assertEqual([], stats.failed)
+
+    def test_restructured_reconciliation_rejects_missing_source_snapshot(self):
+        stats = workflow.TranslationStats()
+        added_files = {"guide.md": "# Head\n"}
+        full_translation_paths = {"guide.md"}
+
+        def source_at_ref(_file_path, _context, _github, ref_name):
+            return "# Head\n" if ref_name == "head_ref" else None
+
+        with mock.patch.object(
+            workflow, "TARGET_REPO_PATH", "/tmp/target"
+        ), mock.patch.object(
+            workflow, "read_target_file_content", return_value="# 既存\n"
+        ), mock.patch.object(
+            workflow, "get_source_ref_content", side_effect=source_at_ref
+        ), mock.patch.object(
+            workflow, "reconcile_restructured_file"
+        ) as reconcile:
+            reconciled = workflow.reconcile_restructured_files(
+                {"guide.md"},
+                added_files,
+                full_translation_paths,
+                {"mode": "commit"},
+                object(),
+                object(),
+                {"ignore_resource_card_section": True},
+                None,
+                stats,
+                set(),
+            )
+
+        self.assertEqual(set(), reconciled)
+        reconcile.assert_not_called()
+        self.assertNotIn("guide.md", added_files)
+        self.assertNotIn("guide.md", full_translation_paths)
+        self.assertEqual(1, len(stats.failed))
+        self.assertIn("BASE source snapshot is unavailable", stats.failed[0][1])
+
+    def test_restructured_reconciliation_rejects_related_resources_count_drift(self):
+        stats = workflow.TranslationStats()
+        added_files = {"guide.md": "# Head\n"}
+        full_translation_paths = {"guide.md"}
+        base_source = (
+            "# Guide\n\n## Related resources\n\n"
+            "<RelatedResources>\n"
+            '  <ResourceCard title="Base card" />\n'
+            "</RelatedResources>\n"
         )
-        self.assertEqual(
-            config["COMMIT_SYNC_RUN_TYPE"],
-            commit_sync_workflow_local.COMMIT_SYNC_RUN_TYPE,
-        )
+        head_source = "# Guide\n\n## Content\n\nNew.\n"
+
+        def source_at_ref(_file_path, _context, _github, ref_name):
+            return head_source if ref_name == "head_ref" else base_source
+
+        with mock.patch.object(
+            workflow, "TARGET_REPO_PATH", "/tmp/target"
+        ), mock.patch.object(
+            workflow, "read_target_file_content", return_value="# 既存\n"
+        ), mock.patch.object(
+            workflow, "get_source_ref_content", side_effect=source_at_ref
+        ), mock.patch.object(
+            workflow, "reconcile_restructured_file"
+        ) as reconcile:
+            reconciled = workflow.reconcile_restructured_files(
+                {"guide.md"},
+                added_files,
+                full_translation_paths,
+                {"mode": "commit"},
+                object(),
+                object(),
+                {"ignore_resource_card_section": True},
+                None,
+                stats,
+                set(),
+            )
+
+        self.assertEqual(set(), reconciled)
+        reconcile.assert_not_called()
+        self.assertNotIn("guide.md", added_files)
+        self.assertNotIn("guide.md", full_translation_paths)
+        self.assertEqual(1, len(stats.failed))
+        self.assertIn("section count changed", stats.failed[0][1])
 
     def test_normalize_source_files_prefixes_folder(self):
         normalized = workflow.normalize_source_files("foo.md, ai/bar.md ,baz/qux.md", "ai")
@@ -2158,7 +2268,13 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
             '  <ResourceCard title="Video" link="https://example.com" />\n'
             "</RelatedResources>\n"
         )
-        target = "# 指南\n\n## 内容\n\n正文。\n"
+        target = (
+            "# 指南\n\n## 内容\n\n正文。\n\n"
+            "## 相关资源\n\n"
+            "<RelatedResources>\n"
+            '  <ResourceCard title="本地化视频" link="https://example.com" />\n'
+            "</RelatedResources>\n"
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             Path(tmpdir, "guide.md").write_text(target, encoding="utf-8")

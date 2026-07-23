@@ -621,7 +621,11 @@ def analyze_normalized_snapshot_diff_operations(base_content, head_content):
         )
     )
     patch = "\n".join(patch_lines)
-    return analyze_diff_operations(DiffFile(filename="", status="modified", patch=patch))
+    return analyze_diff_operations(
+        DiffFile(filename="", status="modified", patch=patch),
+        base_content=base_content,
+        head_content=head_content,
+    )
 
 
 def maybe_use_normalized_snapshot_operations(operations, base_content, head_content):
@@ -643,7 +647,7 @@ def maybe_use_normalized_snapshot_operations(operations, base_content, head_cont
     return operations
 
 
-def analyze_diff_operations(file):
+def analyze_diff_operations(file, base_content=None, head_content=None):
     """Analyze diff to categorize operations as added, modified, or deleted (improved GitHub-like approach)"""
     operations = {
         'added_lines': [],      # Lines that were added
@@ -663,6 +667,12 @@ def analyze_diff_operations(file):
     # Parse diff and keep track of sequence order for better modification detection
     diff_sequence = []  # Track the order of operations in diff
     in_hunk = False  # Track whether we've seen the first @@ hunk header
+    base_heading_lines = (
+        set(build_hierarchy_dict(base_content)) if base_content is not None else None
+    )
+    head_heading_lines = (
+        set(build_hierarchy_dict(head_content)) if head_content is not None else None
+    )
     
     for i, line in enumerate(lines):
         if line.startswith('@@'):
@@ -677,21 +687,31 @@ def analyze_diff_operations(file):
             # Skip file-level headers (--- a/file, +++ b/file) before first hunk
             continue
         elif line.startswith('+'):
+            is_header = (
+                current_line in head_heading_lines
+                if head_heading_lines is not None
+                else line[1:].strip().startswith('#')
+            )
             added_entry = {
                 'line_number': current_line,
                 'content': line[1:],  # Remove the '+' prefix
-                'is_header': line[1:].strip().startswith('#'),
+                'is_header': is_header,
                 'diff_index': i  # Track position in diff
             }
             operations['added_lines'].append(added_entry)
             diff_sequence.append(('added', added_entry))
             current_line += 1
         elif line.startswith('-'):
+            is_header = (
+                deleted_line in base_heading_lines
+                if base_heading_lines is not None
+                else line[1:].strip().startswith('#')
+            )
             deleted_entry = {
                 'line_number': deleted_line,
                 'head_line_number': current_line,
                 'content': line[1:],  # Remove the '-' prefix
-                'is_header': line[1:].strip().startswith('#'),
+                'is_header': is_header,
                 'diff_index': i  # Track position in diff
             }
             operations['deleted_lines'].append(deleted_entry)
@@ -1544,6 +1564,54 @@ def remove_related_resources_resource_card_sections(file_content):
         stripped_content += "\n"
 
     return stripped_content, matching_sections
+
+
+def preserve_base_related_resources_resource_card_sections(base_content, head_content):
+    """Keep ignored RelatedResources sections at their BASE source state.
+
+    Structural reconciliation needs the complete document on both source and
+    target sides. Removing these sections only from the source snapshots makes
+    an existing localized target look structurally incompatible. Replacing the
+    HEAD source sections with their BASE counterparts expresses the actual
+    policy instead: ignore changes to these sections while preserving them.
+
+    Returns ``(None, [])`` when either snapshot is unavailable or the number of
+    matching sections changes. Those inputs cannot be paired safely by position
+    and must be declined rather than risking reuse of the wrong localized
+    section.
+    """
+    if not isinstance(base_content, str) or not isinstance(head_content, str):
+        return None, []
+
+    base_sections = find_related_resources_resource_card_sections(base_content)
+    head_sections = find_related_resources_resource_card_sections(head_content)
+    if len(base_sections) != len(head_sections):
+        return None, []
+    if not base_sections:
+        return head_content, []
+
+    base_lines = split_normalized_lines(base_content)
+    effective_head_lines = split_normalized_lines(head_content)
+    preserved_sections = []
+
+    for base_section, head_section in reversed(
+        list(zip(base_sections, head_sections))
+    ):
+        effective_head_lines[head_section["start"] : head_section["end"]] = (
+            base_lines[base_section["start"] : base_section["end"]]
+        )
+        preserved_sections.append(
+            {
+                "base": base_section,
+                "head": head_section,
+            }
+        )
+
+    preserved_sections.reverse()
+    # split_normalized_lines retains the terminal empty element, so joining
+    # preserves whether HEAD had a trailing newline. Appending another newline
+    # here would introduce an extra blank line.
+    return "\n".join(effective_head_lines), preserved_sections
 
 
 def build_related_resources_resource_card_line_ranges(file_content):
@@ -3091,8 +3159,6 @@ def analyze_source_changes(
             # --- keywords.md: keyword-specific processor ---
             if is_keyword_file:
                 print(f"   📋 Detected keyword file: {file.filename}")
-                operations = analyze_diff_operations(file)
-
                 source_head_lines = split_normalized_lines(file_content)
                 try:
                     base_file_content_preloaded = repository.get_contents(file.filename, ref=base_ref).decoded_content.decode('utf-8')
@@ -3101,6 +3167,12 @@ def analyze_source_changes(
                         f"   ⚠️  Could not get base keywords.md content: {sanitize_exception_message(e)}"
                     )
                     base_file_content_preloaded = file_content
+
+                operations = analyze_diff_operations(
+                    file,
+                    base_content=base_file_content_preloaded,
+                    head_content=file_content,
+                )
 
                 source_base_lines = split_normalized_lines(base_file_content_preloaded)
 
@@ -3368,7 +3440,15 @@ def analyze_source_changes(
             base_file_content = file_content  # Fallback to current content
 
         operations = maybe_use_normalized_snapshot_operations(
-            operations,
+            (
+                operations
+                if keyword_regular_only
+                else analyze_diff_operations(
+                    file,
+                    base_content=base_file_content,
+                    head_content=file_content,
+                )
+            ),
             base_file_content,
             file_content,
         )

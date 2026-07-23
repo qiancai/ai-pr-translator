@@ -32,6 +32,7 @@ from diff_analyzer import (
     maybe_use_normalized_snapshot_operations,
     parse_pr_commit_range_url,
     parse_pr_url,
+    preserve_base_related_resources_resource_card_sections,
 )
 
 
@@ -178,6 +179,172 @@ class DiffAnalyzerContextTest(unittest.TestCase):
         source_diff = self.generated_file.read_text(encoding="utf-8")
         self.assertIn('"operation": "modified"', source_diff)
         self.assertIn("New text", source_diff)
+
+    def test_fenced_hash_comments_are_regular_section_content_changes(self):
+        base_content = (
+            "# Guide\n\n"
+            "## Configuration file description\n\n"
+            "```toml\n"
+            "# Old explanatory comment.\n"
+            "value = 1\n"
+            "```\n\n"
+            "## End\n\nStable.\n"
+        )
+        head_content = (
+            "# Guide\n\n"
+            "## Configuration file description\n\n"
+            "```toml\n"
+            "# New explanatory comment.\n"
+            "# Additional explanatory comment.\n"
+            "value = 1\n"
+            "```\n\n"
+            "## End\n\nStable.\n"
+        )
+        patch = "\n".join(
+            [
+                "@@ -3,7 +3,8 @@",
+                " ## Configuration file description",
+                " ",
+                " ```toml",
+                "-# Old explanatory comment.",
+                "+# New explanatory comment.",
+                "+# Additional explanatory comment.",
+                " value = 1",
+                " ```",
+                " ",
+            ]
+        )
+        changed_file = SimpleNamespace(
+            filename="guide.md",
+            status="modified",
+            patch=patch,
+            previous_filename=None,
+        )
+        repository = FakeRepository(
+            {
+                ("guide.md", "base-fence"): base_content,
+                ("guide.md", "head-fence"): head_content,
+            },
+            FakePR([changed_file], "Update config comments", "base-fence", "head-fence"),
+            {("base-fence", "head-fence"): [changed_file]},
+        )
+        github = FakeGithub({"acme/docs": repository})
+        context = build_commit_diff_context(
+            "acme/docs",
+            "acme/docs-cn",
+            "base-fence",
+            "head-fence",
+            github,
+            self.repo_configs,
+        )
+
+        analyze_source_changes(
+            context,
+            github,
+            special_files=["TOC.md", "keywords.md"],
+            ignore_files=[],
+            repo_configs=self.repo_configs,
+        )
+
+        source_diff = json.loads(self.generated_file.read_text(encoding="utf-8"))
+        configuration_changes = [
+            change
+            for change in source_diff.values()
+            if change.get("original_hierarchy") == "## Configuration file description"
+        ]
+        self.assertEqual(1, len(configuration_changes))
+        self.assertEqual("modified", configuration_changes[0]["operation"])
+        self.assertIn(
+            "# Additional explanatory comment.",
+            configuration_changes[0]["new_content"],
+        )
+
+    def test_preserve_base_related_resources_replaces_only_ignored_section(self):
+        base = (
+            "# Guide\n\n## Content\n\nOld.\n\n"
+            "## Related resources\n\n"
+            "<RelatedResources>\n"
+            '  <ResourceCard title="Base card" />\n'
+            "</RelatedResources>\n"
+        )
+        head = (
+            "# Guide\n\n## Content\n\nNew.\n\n"
+            "## Related resources\n\n"
+            "<RelatedResources>\n"
+            '  <ResourceCard title="Changed card" />\n'
+            "</RelatedResources>\n"
+        )
+
+        effective_head, preserved_sections = (
+            preserve_base_related_resources_resource_card_sections(base, head)
+        )
+
+        self.assertIn("New.", effective_head)
+        self.assertIn('title="Base card"', effective_head)
+        self.assertNotIn("Changed card", effective_head)
+        self.assertEqual(1, len(preserved_sections))
+        self.assertTrue(effective_head.endswith("\n"))
+        self.assertFalse(effective_head.endswith("\n\n"))
+
+        without_trailing_newline, _ = (
+            preserve_base_related_resources_resource_card_sections(
+                base.rstrip("\n"),
+                head.rstrip("\n"),
+            )
+        )
+        self.assertFalse(without_trailing_newline.endswith("\n"))
+
+    def test_preserve_base_related_resources_rejects_missing_snapshot(self):
+        content = "# Guide\n"
+
+        self.assertEqual(
+            (None, []),
+            preserve_base_related_resources_resource_card_sections(None, content),
+        )
+        self.assertEqual(
+            (None, []),
+            preserve_base_related_resources_resource_card_sections(content, None),
+        )
+
+    def test_snapshot_heading_scope_does_not_pair_fenced_comment_with_real_heading(self):
+        base = (
+            "# Guide\n\n```toml\n# Removed code comment.\n```\n\nBody.\n"
+        )
+        head = (
+            "# Guide\n\n```toml\n```\n\n## Added section\n\nBody.\n"
+        )
+        patch = "\n".join(
+            [
+                "@@ -1,7 +1,8 @@",
+                " # Guide",
+                " ",
+                " ```toml",
+                "-# Removed code comment.",
+                " ```",
+                " ",
+                "+## Added section",
+                "+",
+                " Body.",
+            ]
+        )
+        changed_file = SimpleNamespace(filename="guide.md", patch=patch)
+
+        operations = analyze_diff_operations(
+            changed_file,
+            base_content=base,
+            head_content=head,
+        )
+
+        self.assertEqual([], operations["modified_lines"])
+        self.assertEqual(["## Added section", ""], [
+            entry["content"] for entry in operations["added_lines"]
+        ])
+        self.assertTrue(operations["added_lines"][0]["is_header"])
+        self.assertEqual(
+            ["# Removed code comment."],
+            [entry["content"] for entry in operations["deleted_lines"]],
+        )
+        self.assertFalse(operations["deleted_lines"][0]["is_header"])
 
     def test_parse_pr_url_accepts_plain_and_files_range_urls(self):
         plain_url = "https://github.com/acme/docs/pull/123/"
